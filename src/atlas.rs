@@ -6,6 +6,7 @@
 //! frames: [[page, x, y, w, h, source_w, source_h, x_offset, y_offset], ...]}]}`; page -1 is
 //! an empty frame, and page `i` is the image `<prefix><i><ext>` in the same folder.
 
+use crate::doc::MAX_DIM;
 use crate::engine::guarded;
 use crate::io;
 use eframe::egui::{self, pos2, vec2, Color32, Rect, Sense, Stroke, StrokeKind};
@@ -145,7 +146,8 @@ pub fn parse(v: &Value, pages: &[(u32, u32)]) -> Result<Vec<Object>, String> {
         labels.sort_by_key(|l| l.1);
         let mut seqs = vec![];
         for (i, (label, start)) in labels.iter().enumerate() {
-            if label.ends_with("_end") && labels.iter().any(|(s, at)| *s == label[..label.len() - 4] && at <= start) {
+            // An "_end" closes the sequence it is named after; one with nothing to close is left out.
+            if label.ends_with("_end") {
                 continue;
             }
             let closing = labels.iter().find(|(s, at)| s.strip_suffix("_end") == Some(label.as_str()) && at >= start).map(|l| l.1);
@@ -164,7 +166,7 @@ pub fn parse(v: &Value, pages: &[(u32, u32)]) -> Result<Vec<Object>, String> {
 }
 
 /// Decode one page to RGBA. `budget` is the number of pixels still allowed; the size is
-/// checked against it from the header, before anything is allocated.
+/// read from the file's header and checked against it before the pixels are decoded.
 pub fn decode_page(bytes: &[u8], webp: bool, budget: &mut u64) -> Result<Page, String> {
     let mut claim = |w: u32, h: u32| {
         if w == 0 || h == 0 || w > PAGE_DIM || h > PAGE_DIM {
@@ -178,9 +180,14 @@ pub fn decode_page(bytes: &[u8], webp: bool, budget: &mut u64) -> Result<Page, S
         Ok(())
     };
     if !webp {
-        // The PNG reader has its own size limit (the document limit), checked before it decodes.
-        let img = io::decode_png(bytes)?;
-        claim(img.w, img.h)?;
+        let bad = || "not a readable PNG image".to_string();
+        let (w, h) = png::Decoder::new(bytes).read_info().map(|r| (r.info().width, r.info().height)).map_err(|_| bad())?;
+        // PNG pages go through the document's PNG reader, which stops at the document size.
+        if w > MAX_DIM || h > MAX_DIM {
+            return Err(format!("it is {w}x{h}; PNG pages can be up to {MAX_DIM}x{MAX_DIM} (WebP pages up to {PAGE_DIM}x{PAGE_DIM})"));
+        }
+        claim(w, h)?;
+        let img = io::decode_png(bytes).map_err(|_| bad())?;
         let rgba = match img.pixels {
             io::PngPixels::Rgba(px) => px.into_iter().flatten().collect(),
             io::PngPixels::Indexed { data, palette, trns } => data
@@ -234,7 +241,16 @@ pub fn load(json: &Path) -> Result<Atlas, String> {
     if !json.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")) {
         return Err(format!("{}: an atlas is opened by its .json file", json.display()));
     }
-    let v: Value = serde_json::from_slice(&read_plain(json, JSON_MAX)?).map_err(|_| format!("{}: not valid JSON", json.display()))?;
+    let text = read_plain(json, JSON_MAX)?;
+    // Some editors put a byte-order mark in front of the text.
+    let text = text.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&text);
+    let v: Value = serde_json::from_slice(text).map_err(|_| format!("{}: not valid JSON", json.display()))?;
+    if v.get("format").and_then(|f| f.as_str()) == Some(io::ANIM_FORMAT) {
+        return Err(format!("{}: this is a Jon Motion animations file, not a sprite atlas; use Import... on the Animation tab", json.display()));
+    }
+    if !v.is_object() || v.get("pages").is_none() || v.get("objects").is_none() {
+        return Err(format!("{}: not a sprite atlas description (it has no \"pages\" and \"objects\")", json.display()));
+    }
     let (prefix, ext, count) = header(&v).map_err(|e| format!("{}: {e}", json.display()))?;
     let dir = json.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut budget = PIXELS_MAX;
@@ -267,6 +283,8 @@ pub struct View {
     filter: String,
     animated_only: bool,
     clock: f64,
+    /// Something the user should know about how the atlas is shown.
+    note: String,
     /// Where the window was last drawn, for the Left / Right / Space keys.
     pub rect: Rect,
 }
@@ -274,7 +292,7 @@ pub struct View {
 impl View {
     pub fn new(atlas: Atlas) -> View {
         let object = atlas.objects.iter().position(|o| o.frames.len() > 1).unwrap_or(0);
-        View { atlas, tex: vec![], object, frame: 0, playing: true, fps: 30.0, seq: None, filter: String::new(), animated_only: false, clock: 0.0, rect: Rect::NOTHING }
+        View { atlas, tex: vec![], object, frame: 0, playing: true, fps: 30.0, seq: None, filter: String::new(), animated_only: false, clock: 0.0, note: String::new(), rect: Rect::NOTHING }
     }
 
     /// First and last frame of what is playing.
@@ -316,7 +334,8 @@ pub fn window(ctx: &egui::Context, v: &mut View) -> bool {
             let img = if p.w <= side && p.h <= side {
                 egui::ColorImage::from_rgba_unmultiplied([p.w as usize, p.h as usize], &std::mem::take(&mut p.rgba))
             } else {
-                // Larger than this machine can draw: shown as a blank page.
+                // Larger than this machine can draw: shown as a blank page, and said so.
+                v.note = format!("Page {i} is {}x{}, larger than this computer can draw ({side}x{side}); its frames are blank.", p.w, p.h);
                 egui::ColorImage::new([1, 1], Color32::TRANSPARENT)
             };
             let opts = egui::TextureOptions { magnification: egui::TextureFilter::Nearest, minification: egui::TextureFilter::Linear, ..Default::default() };
@@ -352,11 +371,14 @@ pub fn window(ctx: &egui::Context, v: &mut View) -> bool {
             ui.label("This atlas has no objects.");
             return;
         };
+        if !v.note.is_empty() {
+            ui.colored_label(Color32::from_rgb(255, 170, 90), &v.note);
+        }
         let (first, last) = v.range();
         v.frame = v.frame.clamp(first, last);
         // Playback: move on by however many frames are due.
         let now = ui.input(|i| i.time);
-        let (n, fps) = (last - first + 1, v.fps as f64);
+        let (n, fps) = (last - first + 1, if v.fps.is_finite() { v.fps.clamp(1.0, 60.0) as f64 } else { 30.0 });
         if v.playing && n > 1 {
             let due = ((now - v.clock) * fps).floor();
             if due >= 1.0 {

@@ -198,6 +198,8 @@ pub struct View {
     /// setup lives in the document (`Doc::anim`); this playback position does not.
     pub anim_frame: u32,
     pub anim_playing: bool,
+    /// Which of the document's animations is on show.
+    pub anim_index: usize,
     /// Draw the animation's frame cuts on the canvas.
     pub anim_guides: bool,
 }
@@ -336,6 +338,7 @@ impl Engine {
                 cycling: false,
                 anim_frame: 0,
                 anim_playing: false,
+                anim_index: 0,
                 anim_guides: true,
             },
             clipboard: None,
@@ -452,6 +455,11 @@ impl Engine {
         old
     }
 
+    /// The animation on show, if the document has any.
+    pub fn anim(&self) -> Option<&Anim> {
+        self.doc.anims.get(self.view.anim_index)
+    }
+
     /// Clamp editor state that refers into the document.
     pub fn fix_state(&mut self) {
         let d = &self.doc;
@@ -472,11 +480,13 @@ impl Engine {
         if self.doc.active >= self.doc.layers.len() {
             self.doc.active = self.doc.layers.len() - 1;
         }
-        // An animation whose frames no longer lie inside the image (after a crop or resize) is dropped.
-        if self.doc.anim.is_some_and(|a| !a.fits(self.doc.w, self.doc.h)) {
-            self.doc.anim = None;
+        // Animations whose frames no longer lie inside the image (after a crop or resize) are dropped.
+        let (w, h) = (self.doc.w, self.doc.h);
+        if self.doc.anims.iter().any(|a| !a.fits(w, h)) {
+            self.doc.anims.retain(|a| a.fits(w, h));
         }
-        let frames = self.doc.anim.map(|a| a.count()).unwrap_or(0);
+        self.view.anim_index = self.view.anim_index.min(self.doc.anims.len().saturating_sub(1));
+        let frames = self.anim().map(|a| a.count()).unwrap_or(0);
         self.view.anim_frame = self.view.anim_frame.min(frames.saturating_sub(1));
         if frames == 0 {
             self.view.anim_playing = false;

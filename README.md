@@ -46,9 +46,27 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
   tile set PNG and map CSV export.
 - **Animation** - select a strip of frames, give the size of one frame, and the Animation tab plays them
   (left to right, then top to bottom) while you keep drawing. Left / Right step and Space plays or pauses while
-  the pointer is over the tab. The setup (region, frame size, frame count, speed) is saved in the project.
-  The region is a fixed rectangle: it does not follow a resize, scale or flip, and is removed if it no longer
+  the pointer is over the tab. A document can hold many named animations (up to 256): pick one in the tab, **New** makes
+  another from the selection. An animation is either a *grid* (a region cut into equal frames) or a *frame list*,
+  where every frame is its own rectangle with an optional offset so trimmed frames of different sizes line up;
+  frame lists are set by script, AI client or JSON (`anim_frames`). All of it is saved in the project.
+  An animation is a set of fixed rectangles: it does not follow a resize, scale or flip, and is removed if it no longer
   fits the image (undo brings it back). View > Animation Frames hides the frame lines on the canvas.
+  **Import... / Export...** in the tab (`anim_import_json`, `anim_export_json`) read and write the animations as JSON:
+
+  ```json
+  { "format": "jon-motion-animations", "version": 1, "image": { "width": 128, "height": 64 },
+    "animations": [
+      { "name": "walk", "fps": 8, "grid": { "x": 0, "y": 0, "w": 64, "h": 16, "frame_w": 16, "frame_h": 16, "frames": 0 } },
+      { "name": "jump", "fps": 12, "frames": [ { "x": 0, "y": 32, "w": 10, "h": 20 },
+                                                { "x": 10, "y": 32, "w": 14, "h": 24, "offset_x": -2, "offset_y": -4 } ] } ] }
+  ```
+
+  A frame may also be written `[x, y, w, h]` or `[x, y, w, h, offset_x, offset_y]`. Import checks every animation
+  against the image and imports nothing if one is refused; one with the name of an existing animation replaces it.
+  Export only overwrites a file that is itself an animations file. Versions 0.1.4 and older open these projects
+  but know one grid animation at most: 0.1.4 shows the first grid animation, and saving from an old version
+  drops the rest.
 - **Files** - native `.jmn` projects (everything), PNG in and out. Exports are always indexed PNGs. An indexed
   PNG opens with its own palette; a true-colour PNG is converted to a generated palette of up to 256 colours.
 
@@ -78,7 +96,8 @@ print(jm.get_info().width)
 
 A script is atomic and one undo step: if it raises an error, the document is rolled back. Scripts are
 sandboxed: no `io`/`os` libraries, a 60 s time limit and a 256 MB memory limit. The only files a script
-can touch are through the document commands, which read `.jmn`/`.png` and write `.jmn`/`.png`/`.csv`.
+can touch are through the document commands, which read `.jmn`/`.png`/`.json` and write `.jmn`/`.png`/`.csv`,
+plus `.json` for animations (never over a file that is not an animations file).
 Scripts run on a working copy of the document, off the UI thread, and a long one shows a **Stop script**
 button. A script that will not stop after its limit is abandoned: the document is untouched and the
 script can no longer run commands, though it may keep using CPU until you quit. Headless: `jon_motion run script.lua [file]`.

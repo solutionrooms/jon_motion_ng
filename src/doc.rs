@@ -276,10 +276,10 @@ pub struct Float {
     pub restore: Option<(Arc<Vec<Cell>>, Option<Arc<Vec<u8>>>)>,
 }
 
-/// A sprite-sheet animation: a rectangle of the image cut into equal frames, read left to
-/// right, then top to bottom. Part of the document, so it is saved, undone and redone with it.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-pub struct Anim {
+/// The frames of a grid animation: a rectangle of the image cut into equal cells, read left
+/// to right, then top to bottom.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Grid {
     pub x: u32,
     pub y: u32,
     pub w: u32,
@@ -289,11 +289,9 @@ pub struct Anim {
     pub fh: u32,
     /// Frames to play; 0 plays every whole frame in the region.
     pub limit: u32,
-    pub fps: f32,
 }
 
-impl Anim {
-    pub const FPS: std::ops::RangeInclusive<f32> = 1.0..=60.0;
+impl Grid {
     pub fn cols(&self) -> u32 {
         self.w / self.fw.max(1)
     }
@@ -323,6 +321,108 @@ impl Anim {
     }
 }
 
+/// One frame of an animation: a rectangle of the image, and where its top-left corner is
+/// drawn relative to the animation's origin (so trimmed frames of different sizes line up).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Frame {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub ox: i32,
+    pub oy: i32,
+}
+
+impl Frame {
+    pub fn fits(&self, w: u32, h: u32) -> bool {
+        self.w >= 1 && self.h >= 1 && self.x as u64 + self.w as u64 <= w as u64 && self.y as u64 + self.h as u64 <= h as u64 && self.ox.unsigned_abs() <= MAX_DIM && self.oy.unsigned_abs() <= MAX_DIM
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum Frames {
+    Grid(Grid),
+    /// Each frame given as its own rectangle. Shared, so undo steps do not copy the list.
+    List(Arc<Vec<Frame>>),
+}
+
+/// A named animation: frames cut from the image and a speed. Part of the document, so it is
+/// saved, undone and redone with it. No pixels belong to it; it only says where to look.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Anim {
+    pub name: String,
+    pub fps: f32,
+    pub frames: Frames,
+}
+
+impl Anim {
+    pub const FPS: std::ops::RangeInclusive<f32> = 1.0..=60.0;
+    /// Most animations in one document.
+    pub const MAX: usize = 256;
+    /// Most frames in one frame list.
+    pub const MAX_FRAMES: usize = 4096;
+    pub const NAME_MAX: usize = 64;
+
+    pub fn grid(&self) -> Option<Grid> {
+        match &self.frames {
+            Frames::Grid(g) => Some(*g),
+            Frames::List(_) => None,
+        }
+    }
+    /// Frames that play.
+    pub fn count(&self) -> u32 {
+        match &self.frames {
+            Frames::Grid(g) => g.count(),
+            Frames::List(l) => l.len() as u32,
+        }
+    }
+    pub fn frame(&self, i: u32) -> Option<Frame> {
+        match &self.frames {
+            Frames::Grid(g) => (i < g.count()).then(|| {
+                let (x, y) = g.origin(i);
+                Frame { x, y, w: g.fw, h: g.fh, ox: 0, oy: 0 }
+            }),
+            Frames::List(l) => l.get(i as usize).copied(),
+        }
+    }
+    /// The box that holds every frame at its offset: left, top, width, height.
+    pub fn bounds(&self) -> (i32, i32, u32, u32) {
+        match &self.frames {
+            Frames::Grid(g) => (0, 0, g.fw, g.fh),
+            Frames::List(l) => {
+                let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+                for f in l.iter() {
+                    (x0, y0) = (x0.min(f.ox as i64), y0.min(f.oy as i64));
+                    (x1, y1) = (x1.max(f.ox as i64 + f.w as i64), y1.max(f.oy as i64 + f.h as i64));
+                }
+                if x1 <= x0 || y1 <= y0 {
+                    return (0, 0, 1, 1);
+                }
+                (x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32)
+            }
+        }
+    }
+    /// True when every frame lies inside a `w` x `h` image and there is at least one.
+    pub fn fits(&self, w: u32, h: u32) -> bool {
+        match &self.frames {
+            Frames::Grid(g) => g.fits(w, h),
+            Frames::List(l) => !l.is_empty() && l.len() <= Self::MAX_FRAMES && l.iter().all(|f| f.fits(w, h)),
+        }
+    }
+    /// A name that can be shown and listed as it is: not blank, not padded, a sensible length,
+    /// and with no control characters or characters that reorder text.
+    pub fn name_ok(s: &str) -> bool {
+        !s.is_empty()
+            && s.trim() == s
+            && s.chars().count() <= Self::NAME_MAX
+            && !s.chars().any(|c| c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+    }
+    /// True when the animation is sound for a `w` x `h` image.
+    pub fn valid(&self, w: u32, h: u32) -> bool {
+        Self::name_ok(&self.name) && Self::FPS.contains(&self.fps) && self.fits(w, h)
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Doc {
     pub w: u32,
@@ -337,9 +437,9 @@ pub struct Doc {
     #[serde(skip)]
     pub float: Option<Float>,
     pub next_id: u32,
-    /// Not in the serialised layout (which published builds read): `io` stores it after the document.
+    /// Not in the serialised layout (which published builds read): `io` stores them after the document.
     #[serde(skip)]
-    pub anim: Option<Anim>,
+    pub anims: Vec<Anim>,
 }
 
 impl Doc {
@@ -355,7 +455,7 @@ impl Doc {
             selection: None,
             float: None,
             next_id: 1,
-            anim: None,
+            anims: vec![],
         };
         let l = d.new_layer("Layer 1");
         d.layers.push(l);

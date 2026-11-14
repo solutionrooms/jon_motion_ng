@@ -2,7 +2,6 @@
 //! if it raises an error the document is left exactly as it was.
 
 use crate::commands;
-use crate::doc::*;
 use crate::engine::Engine;
 use mlua::{ChunkMode, HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, SerializeOptions, StdLib, Value as LV, Variadic, VmState};
 use serde_json::Value;
@@ -33,8 +32,8 @@ Every editor command is a function on the global `jm` taking one table of named 
     local info = jm.get_info()            -- commands return tables
     jm.layer_add{ name='Shadows' }
 Fast pixel access on the active layer:
-    jm.get(x, y)            -> palette index (-1 = transparent), or r, g, b, a in RGBA documents
-    jm.set(x, y, color)     -- color: palette index, -1 to erase, '#rrggbb', or jm.set(x, y, r, g, b [, a])
+    jm.get(x, y)            -> palette index (-1 = transparent)
+    jm.set(x, y, color)     -- color: palette index, -1 to erase, or '#rrggbb' / jm.set(x, y, r, g, b) for the nearest palette colour
     jm.size()               -> width, height
     jm.help('text')         -> command reference, optionally filtered
 print(...) output and the script's return value are returned to the caller.
@@ -250,10 +249,7 @@ fn run_inner(eng: &RefCell<&mut Engine>, out: &RefCell<String>, code: &str, limi
                 let mut ret = Variadic::new();
                 match e.raw_get(x.floor() as i64, y.floor() as i64) {
                     None => ret.push(LV::Nil),
-                    Some(c) => match e.doc.mode {
-                        ColorMode::Indexed => ret.push(LV::Integer(if c >= 256 { -1 } else { c as i64 })),
-                        ColorMode::Rgba => ret.extend(unpack(c).map(|v| LV::Integer(v as i64))),
-                    },
+                    Some(c) => ret.push(LV::Integer(if c >= 256 { -1 } else { c as i64 })),
                 }
                 Ok(ret)
             })?,

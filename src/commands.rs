@@ -303,9 +303,9 @@ fn write_file(p: &PathBuf, bytes: &[u8]) -> Result<(), String> {
 pub fn info(e: &Engine) -> Value {
     let d = &e.doc;
     json!({
-        "width": d.w, "height": d.h, "mode": d.mode.name(),
+        "width": d.w, "height": d.h, "mode": "indexed",
         "layers": d.layers.iter().enumerate().map(|(i, l)| json!({
-            "index": i, "name": l.name, "visible": l.visible, "opacity": l.opacity,
+            "index": i, "name": l.name, "visible": l.visible,
             "locked": l.locked, "alpha_lock": l.alpha_lock, "tile_mapped": l.map.is_some() })).collect::<Vec<_>>(),
         "active_layer": d.active,
         "palette_count": d.palette.colors.len(),
@@ -351,7 +351,7 @@ pub fn doc_from_png(img: io::PngImage) -> Doc {
             while palette.len() > 1 && trns.get(palette.len() - 1).is_some_and(|a| *a < 128) {
                 palette.pop();
             }
-            let mut d = Doc::new(img.w, img.h, ColorMode::Indexed, Palette { colors: palette, ramps: vec![] });
+            let mut d = Doc::new(img.w, img.h, Palette { colors: palette, ramps: vec![] });
             let n = d.palette.colors.len();
             d.layers[0].data = Arc::new(
                 data.iter()
@@ -360,9 +360,10 @@ pub fn doc_from_png(img: io::PngImage) -> Doc {
             );
             d
         }
+        // A true-colour image gets a palette made for it (up to 256 colours).
         io::PngPixels::Rgba(px) => {
-            let mut d = Doc::new(img.w, img.h, ColorMode::Rgba, Palette::default_256());
-            d.layers[0].data = Arc::new(px.into_iter().map(pack).collect());
+            let mut d = Doc::new(img.w, img.h, quant::palette_for(px.iter(), 256));
+            d.layers[0].data = Arc::new(quant::to_indexed(&px, img.w as usize, img.h as usize, &d.palette, Dither::None));
             d
         }
     }
@@ -371,7 +372,7 @@ pub fn doc_from_png(img: io::PngImage) -> Doc {
 /// Rebuild every layer by pulling each destination pixel from a source position.
 fn transform(e: &mut Engine, nw: u32, nh: u32, src: impl Fn(i32, i32) -> (i32, i32)) {
     let (ow, oh) = (e.doc.w as i32, e.doc.h as i32);
-    let empty = e.doc.empty();
+    let empty = TRANSP;
     for l in &mut e.doc.layers {
         let mut data = vec![empty; (nw * nh) as usize];
         for y in 0..nh as i32 {
@@ -392,74 +393,50 @@ fn transform(e: &mut Engine, nw: u32, nh: u32, src: impl Fn(i32, i32) -> (i32, i
     e.doc.selection = None;
 }
 
-fn convert(e: &mut Engine, target: ColorMode, colors: usize, dither: Dither, generate: bool) {
+/// Remap every pixel onto a smaller generated palette, or onto the current one.
+fn reduce(e: &mut Engine, colors: usize, dither: Dither, generate: bool) {
     let (fg, bg) = (e.doc.to_rgba(e.o.fg), e.doc.to_rgba(e.o.bg));
     let d = &mut e.doc;
     let (w, h) = (d.w as usize, d.h as usize);
     let layers: Vec<Vec<[u8; 4]>> = d.layers.iter().map(|l| l.data.iter().map(|&c| d.to_rgba(c)).collect()).collect();
     let tiles: Option<Vec<Vec<[u8; 4]>>> =
         d.tileset.as_ref().map(|t| t.tiles.iter().map(|t| t.iter().map(|&c| d.to_rgba(c)).collect()).collect());
-    match target {
-        ColorMode::Rgba => {
-            for (l, px) in d.layers.iter_mut().zip(&layers) {
-                l.data = Arc::new(px.iter().map(|&c| pack(c)).collect());
-            }
-            if let (Some(ts), Some(tp)) = (d.tileset.as_mut(), &tiles) {
-                for (t, px) in ts.tiles.iter_mut().zip(tp) {
-                    *t = Arc::new(px.iter().map(|&c| pack(c)).collect());
-                }
-            }
-        }
-        ColorMode::Indexed => {
-            if generate {
-                let mut hist: HashMap<[u8; 3], u32> = HashMap::new();
-                for px in layers.iter().flatten().filter(|p| p[3] >= 128) {
-                    *hist.entry([px[0], px[1], px[2]]).or_insert(0) += 1;
-                }
-                let mut colors = quant::median_cut(&hist, colors.clamp(1, 256));
-                if colors.is_empty() {
-                    colors.push([0, 0, 0]);
-                }
-                d.palette = Palette { colors, ramps: vec![] };
-            }
-            for (l, px) in d.layers.iter_mut().zip(&layers) {
-                l.data = Arc::new(quant::to_indexed(px, w, h, &d.palette, dither));
-            }
-            if let (Some(ts), Some(tp)) = (d.tileset.as_mut(), &tiles) {
-                let (tw, th) = (ts.tw as usize, ts.th as usize);
-                for (t, px) in ts.tiles.iter_mut().zip(tp) {
-                    *t = Arc::new(quant::to_indexed(px, tw, th, &d.palette, Dither::None));
-                }
-            }
+    if generate {
+        d.palette = quant::palette_for(layers.iter().flatten(), colors);
+    }
+    for (l, px) in d.layers.iter_mut().zip(&layers) {
+        l.data = Arc::new(quant::to_indexed(px, w, h, &d.palette, dither));
+    }
+    if let (Some(ts), Some(tp)) = (d.tileset.as_mut(), &tiles) {
+        let (tw, th) = (ts.tw as usize, ts.th as usize);
+        for (t, px) in ts.tiles.iter_mut().zip(tp) {
+            *t = Arc::new(quant::to_indexed(px, tw, th, &d.palette, Dither::None));
         }
     }
-    d.mode = target;
     e.o.fg = e.doc.from_rgba(fg);
     e.o.bg = e.doc.from_rgba(bg);
     e.o.custom_brush = None;
 }
 
-/// Renumber palette indices everywhere they are stored (indexed documents only).
+/// Renumber palette indices everywhere they are stored.
 fn remap_indices(e: &mut Engine, map: &[Cell]) {
     let f = |c: Cell| if c < 256 { map.get(c as usize).copied().unwrap_or(c) } else { c };
-    if e.doc.mode == ColorMode::Indexed {
-        for l in &mut e.doc.layers {
-            if l.data.iter().any(|&c| f(c) != c) {
-                Arc::make_mut(&mut l.data).iter_mut().for_each(|c| *c = f(*c));
+    for l in &mut e.doc.layers {
+        if l.data.iter().any(|&c| f(c) != c) {
+            Arc::make_mut(&mut l.data).iter_mut().for_each(|c| *c = f(*c));
+        }
+    }
+    if let Some(ts) = &mut e.doc.tileset {
+        for t in &mut ts.tiles {
+            if t.iter().any(|&c| f(c) != c) {
+                Arc::make_mut(t).iter_mut().for_each(|c| *c = f(*c));
             }
         }
-        if let Some(ts) = &mut e.doc.tileset {
-            for t in &mut ts.tiles {
-                if t.iter().any(|&c| f(c) != c) {
-                    Arc::make_mut(t).iter_mut().for_each(|c| *c = f(*c));
-                }
-            }
-        }
-        e.o.fg = f(e.o.fg);
-        e.o.bg = f(e.o.bg);
-        if let Some(cells) = e.o.custom_brush.as_mut().and_then(|b| b.cells.as_mut()) {
-            cells.iter_mut().for_each(|c| *c = f(*c));
-        }
+    }
+    e.o.fg = f(e.o.fg);
+    e.o.bg = f(e.o.bg);
+    if let Some(cells) = e.o.custom_brush.as_mut().and_then(|b| b.cells.as_mut()) {
+        cells.iter_mut().for_each(|c| *c = f(*c));
     }
     for r in &mut e.doc.palette.ramps {
         r.indices = r.indices.iter().map(|&i| f(i as Cell)).filter(|&n| n < 256).map(|n| n as u8).collect();
@@ -468,9 +445,6 @@ fn remap_indices(e: &mut Engine, map: &[Cell]) {
 
 fn usage(e: &Engine) -> Vec<u64> {
     let mut u = vec![0u64; e.doc.palette.colors.len()];
-    if e.doc.mode != ColorMode::Indexed {
-        return u;
-    }
     let tiles = e.doc.tileset.iter().flat_map(|t| t.tiles.iter());
     for data in e.doc.layers.iter().map(|l| &l.data).chain(tiles) {
         for &c in data.iter() {
@@ -670,24 +644,20 @@ fn cell_arg(a: &Args, cols: usize, rows: usize) -> Result<usize, String> {
 
 fn document_cmds(b: &mut B) {
     use Kind::*;
-    b.add("document", "get_info", Read, "", "Document summary: size, colour mode, layers, tile set, selection, colours, file path.", |e, _| Ok(info(e)));
+    b.add("document", "get_info", Read, "", "Document summary: size, layers, tile set, selection, colours, file path.", |e, _| Ok(info(e)));
     b.add(
         "document",
         "new_document",
         Edit,
-        "width:int Width in pixels; height:int Height in pixels; mode:str? indexed (default) or rgba; \
+        "width:int Width in pixels; height:int Height in pixels; \
          palette:str? Palette preset name (default 'default'); force:bool? Discard unsaved changes",
         "Replace the open document with a blank one. Clears undo history.",
         |e, a| {
             check_discard(e, a)?;
             let (w, h) = (dim(a.i("width")?)?, dim(a.i("height")?)?);
-            let mode = match a.os("mode")? {
-                Some(m) => ColorMode::parse(m).ok_or_else(|| format!("unknown mode '{m}'"))?,
-                None => ColorMode::Indexed,
-            };
             let name = a.os("palette")?.unwrap_or("default");
             let pal = Palette::preset(name).ok_or_else(|| format!("unknown palette preset '{name}' ({})", PRESETS.join(", ")))?;
-            install_doc(e, Doc::new(w, h, mode, pal), None);
+            install_doc(e, Doc::new(w, h, pal), None);
             Ok(info(e))
         },
     );
@@ -696,7 +666,7 @@ fn document_cmds(b: &mut B) {
         "open_document",
         Edit,
         "path:str A .jmn project or a .png image; force:bool? Discard unsaved changes",
-        "Open a project file, or a PNG as a new document (indexed PNGs keep their palette). Clears undo history.",
+        "Open a project file, or a PNG as a new document. An indexed PNG keeps its palette; a true-colour PNG is converted to a generated palette of up to 256 colours. Clears undo history.",
         |e, a| {
             check_discard(e, a)?;
             let p = PathBuf::from(a.s("path")?);
@@ -744,7 +714,7 @@ fn document_cmds(b: &mut B) {
         "import_png_layer",
         Edit,
         "path:str PNG file; x:int? Left offset (default 0); y:int? Top offset (default 0); name:str? Layer name",
-        "Add a PNG as a new layer, converted to the document's colour mode and palette.",
+        "Add a PNG as a new layer, mapped onto the document's palette.",
         |e, a| {
             let p = PathBuf::from(a.s("path")?);
             let src = doc_from_png(io::load_png(&p)?);
@@ -850,14 +820,12 @@ fn document_cmds(b: &mut B) {
     });
     b.add(
         "document",
-        "convert_mode",
+        "reduce_colors",
         Edit,
-        "mode:str Target: indexed or rgba; colors:int? Palette size when generating (default 256); \
-         dither:str? none (default), bayer or floyd; palette:str? generate (default) builds a palette from the image, current maps onto the existing palette",
-        "Convert between indexed and true colour, or reduce an indexed image to fewer colours.",
+        "colors:int? Palette size when generating (default 256); dither:str? none (default), bayer or floyd; \
+         palette:str? generate (default) builds a palette from the image, current remaps onto the existing palette",
+        "Reduce the image to fewer colours, or remap it onto the current palette, with optional dithering.",
         |e, a| {
-            let m = a.s("mode")?;
-            let mode = ColorMode::parse(m).ok_or_else(|| format!("unknown mode '{m}'"))?;
             let d = a.os("dither")?.unwrap_or("none");
             let dither = Dither::parse(d).ok_or_else(|| format!("unknown dither '{d}' (none, bayer, floyd)"))?;
             let generate = match a.os("palette")?.unwrap_or("generate") {
@@ -865,8 +833,8 @@ fn document_cmds(b: &mut B) {
                 "current" => false,
                 o => return Err(format!("unknown palette option '{o}' (generate or current)")),
             };
-            convert(e, mode, a.oi("colors")?.unwrap_or(256).clamp(1, 256) as usize, dither, generate);
-            Ok(json!({"mode": e.doc.mode.name(), "palette_count": e.doc.palette.colors.len()}))
+            reduce(e, a.oi("colors")?.unwrap_or(256).clamp(1, 256) as usize, dither, generate);
+            Ok(json!({"palette_count": e.doc.palette.colors.len()}))
         },
     );
     b.add("document", "undo", Read, "steps:int? How many steps (default 1)", "Undo. Each command, batch, script or user stroke is one step.", |e, a| {
@@ -933,7 +901,7 @@ fn layer_cmds(b: &mut B) {
         "layer",
         "layer_set",
         Edit,
-        "layer:layer? Layer index or name (default: active); name:str? New name; visible:bool? Show or hide; opacity:int? 0-255; \
+        "layer:layer? Layer index or name (default: active); name:str? New name; visible:bool? Show or hide; \
          locked:bool? Protect from edits; alpha_lock:bool? Only allow painting on existing pixels",
         "Change layer properties.",
         |e, a| {
@@ -944,9 +912,6 @@ fn layer_cmds(b: &mut B) {
             }
             if let Some(v) = a.ob("visible")? {
                 l.visible = v;
-            }
-            if let Some(o) = a.oi("opacity")? {
-                l.opacity = o.clamp(0, 255) as u8;
             }
             if let Some(v) = a.ob("locked")? {
                 l.locked = v;
@@ -972,20 +937,10 @@ fn layer_cmds(b: &mut B) {
             return Err("there is no layer below to merge into".into());
         }
         let upper = e.doc.layers.remove(li);
-        let mode = e.doc.mode;
         let lower = layer_data(e, li - 1)?;
         for (d, &s) in lower.iter_mut().zip(upper.data.iter()) {
-            match mode {
-                ColorMode::Indexed => {
-                    if s < 256 {
-                        *d = s;
-                    }
-                }
-                ColorMode::Rgba => {
-                    let mut px = unpack(*d);
-                    blend(&mut px, unpack(s), upper.opacity as u32);
-                    *d = pack(px);
-                }
+            if s < 256 {
+                *d = s;
             }
         }
         e.doc.active = li - 1;
@@ -1001,7 +956,7 @@ fn layer_cmds(b: &mut B) {
     });
     b.add("layer", "layer_clear", Paint, "layer:layer? Layer index or name (default: active)", "Erase every pixel on a layer.", |e, a| {
         let li = layer_arg(e, a)?;
-        let empty = e.doc.empty();
+        let empty = TRANSP;
         layer_data(e, li)?.fill(empty);
         ok()
     });
@@ -1016,7 +971,7 @@ fn draw_cmds(b: &mut B) {
         "get_pixel",
         Read,
         "x:int X; y:int Y; layer:layer? Layer to read (default: active); merged:bool? Read the topmost visible pixel across all layers",
-        "Read one pixel. Indexed documents return a palette index (-1 = transparent); RGBA documents return '#rrggbbaa'.",
+        "Read one pixel: its palette index (-1 = transparent) and its colour as '#rrggbbaa'.",
         |e, a| {
             let (x, y) = (a.i("x")?, a.i("y")?);
             if x < 0 || y < 0 || x >= e.doc.w as i64 || y >= e.doc.h as i64 {
@@ -1139,13 +1094,13 @@ fn draw_cmds(b: &mut B) {
     );
     b.paint(
         "fill",
-        "x:int Seed X; y:int Seed Y; contiguous:bool? Only the connected area (default true); tolerance:int? Colour tolerance 0-255, RGBA only (default 0)",
+        "x:int Seed X; y:int Seed Y; contiguous:bool? Only the connected area (default true)",
         "Flood fill from a point. With mode=dither it fills with a dither pattern.",
         |e, a| {
             let li = layer_arg(e, a)?;
             let (x, y) = (a.c("x")?, a.c("y")?);
             let d = &e.doc;
-            let mask = flood_mask(&d.layers[li].data, d.w as i32, d.h as i32, d.mode, x, y, a.ob("contiguous")?.unwrap_or(true), a.oi("tolerance")?.unwrap_or(0).clamp(0, 255) as u8);
+            let mask = flood_mask(&d.layers[li].data, d.w as i32, d.h as i32, x, y, a.ob("contiguous")?.unwrap_or(true));
             let o = paint_args(e, a)?;
             draw(e, a, o, |e| e.stroke_mask(&mask))
         },
@@ -1216,7 +1171,7 @@ fn draw_cmds(b: &mut B) {
             }
             let i = (y * e.doc.w as i64 + x) as usize;
             let c = if a.ob("merged")?.unwrap_or(true) { e.doc.flat_cells()[i] } else { e.doc.layers[e.doc.active].data[i] };
-            if !e.doc.is_empty(c) {
+            if !cell_empty(c) {
                 match a.os("target")?.unwrap_or("fg") {
                     "bg" => e.o.bg = c,
                     _ => e.o.fg = c,
@@ -1248,12 +1203,12 @@ fn selection_cmds(b: &mut B) {
         "selection",
         "select_wand",
         Edit,
-        &format!("x:int Seed X; y:int Seed Y; contiguous:bool? Only the connected area (default true); tolerance:int? 0-255, RGBA only; layer:layer? Layer to sample (default: active); {OP}"),
+        &format!("x:int Seed X; y:int Seed Y; contiguous:bool? Only the connected area (default true); layer:layer? Layer to sample (default: active); {OP}"),
         "Select pixels matching the colour at a point (magic wand). contiguous=false selects that colour everywhere.",
         |e, a| {
             let li = layer_arg(e, a)?;
             let d = &e.doc;
-            let mask = flood_mask(&d.layers[li].data, d.w as i32, d.h as i32, d.mode, a.c("x")?, a.c("y")?, a.ob("contiguous")?.unwrap_or(true), a.oi("tolerance")?.unwrap_or(0).clamp(0, 255) as u8);
+            let mask = flood_mask(&d.layers[li].data, d.w as i32, d.h as i32, a.c("x")?, a.c("y")?, a.ob("contiguous")?.unwrap_or(true));
             sel_op(e, mask, a.os("op")?)?;
             ok()
         },
@@ -1274,7 +1229,7 @@ fn selection_cmds(b: &mut B) {
         ok()
     });
     b.add("selection", "selection_delete", Paint, "", "Erase the selected pixels on the active layer (the whole layer if nothing is selected).", |e, _| {
-        let (sel, empty, li) = (e.doc.selection.clone(), e.doc.empty(), e.doc.active);
+        let (sel, empty, li) = (e.doc.selection.clone(), TRANSP, e.doc.active);
         for (i, c) in layer_data(e, li)?.iter_mut().enumerate() {
             if sel.as_ref().is_none_or(|s| s[i] != 0) {
                 *c = empty;
@@ -1302,7 +1257,7 @@ fn selection_cmds(b: &mut B) {
     });
     b.add("selection", "cut", Paint, "", "Copy the selection to the clipboard and erase it.", |e, _| {
         e.copy()?;
-        let (sel, empty, li) = (e.doc.selection.clone(), e.doc.empty(), e.doc.active);
+        let (sel, empty, li) = (e.doc.selection.clone(), TRANSP, e.doc.active);
         for (i, c) in layer_data(e, li)?.iter_mut().enumerate() {
             if sel.as_ref().is_none_or(|s| s[i] != 0) {
                 *c = empty;
@@ -1365,8 +1320,7 @@ fn selection_cmds(b: &mut B) {
         if c.w > 256 || c.h > 256 {
             return Err("custom brushes are limited to 256x256".into());
         }
-        let mode = e.doc.mode;
-        let mask: Vec<bool> = c.data.iter().map(|&v| !cell_empty(mode, v)).collect();
+        let mask: Vec<bool> = c.data.iter().map(|&v| !cell_empty(v)).collect();
         if !mask.iter().any(|m| *m) {
             return Err("the selection has no pixels to grab".into());
         }
@@ -1508,9 +1462,6 @@ fn palette_cmds(b: &mut B) {
             remap_indices(e, &map);
         }
         if a.b("unused")? {
-            if e.doc.mode != ColorMode::Indexed {
-                return Err("removing unused colours needs an indexed document".into());
-            }
             let u = usage(e);
             let mut map = vec![0 as Cell; u.len()];
             let mut cols = vec![];
@@ -1532,7 +1483,7 @@ fn palette_cmds(b: &mut B) {
         }
         Ok(json!({"before": before, "after": e.doc.palette.colors.len()}))
     });
-    b.add("palette", "palette_usage", Read, "", "Count how many pixels use each palette index (indexed documents).", |e, _| {
+    b.add("palette", "palette_usage", Read, "", "Count how many pixels use each palette index.", |e, _| {
         let u = usage(e);
         Ok(json!({"counts": u, "used": u.iter().filter(|n| **n > 0).count()}))
     });
@@ -1604,7 +1555,7 @@ fn tile_cmds(b: &mut B) {
         if tw < 2 || th < 2 || tw > e.doc.w as i64 || th > e.doc.h as i64 || tw > 256 || th > 256 {
             return Err(format!("tile size {tw}x{th} must be between 2x2 and the canvas size (max 256)"));
         }
-        e.doc.tileset = Some(TileSet { tw: tw as u32, th: th as u32, tiles: vec![Arc::new(vec![e.doc.empty(); (tw * th) as usize])] });
+        e.doc.tileset = Some(TileSet { tw: tw as u32, th: th as u32, tiles: vec![Arc::new(vec![TRANSP; (tw * th) as usize])] });
         e.view.grid_w = tw as u32;
         e.view.grid_h = th as u32;
         ok()
@@ -1637,7 +1588,7 @@ fn tile_cmds(b: &mut B) {
     });
     b.add("tiles", "tile_add", Edit, "copy_of:int? Tile to duplicate (default: a blank tile)", "Add a tile to the tile set and make it the active tile.", |e, a| {
         let src = if a.get("copy_of").is_some() { Some(tile_arg(e, a, "copy_of")?) } else { None };
-        let empty = e.doc.empty();
+        let empty = TRANSP;
         let ts = e.doc.tileset.as_mut().ok_or("this document has no tile set; call tileset_create first")?;
         if ts.tiles.len() >= u16::MAX as usize {
             return Err("the tile set is full".into());
@@ -1796,7 +1747,7 @@ fn tile_cmds(b: &mut B) {
         let (tw, th) = (ts.tw as usize, ts.th as usize);
         let rows = ts.tiles.len().div_ceil(cols);
         let (w, h) = (cols.min(ts.tiles.len()) * tw, rows * th);
-        let mut cells = vec![e.doc.empty(); w * h];
+        let mut cells = vec![TRANSP; w * h];
         for (i, t) in ts.tiles.iter().enumerate() {
             let (ox, oy) = ((i % cols) * tw, (i / cols) * th);
             for y in 0..th {
@@ -1827,7 +1778,7 @@ fn options_json(e: &Engine) -> Value {
         "mode": o.mode.name(), "dither": o.dither, "dither_bg": o.dither_bg, "filled": o.filled,
         "pixel_perfect": o.pixel_perfect,
         "symmetry": format!("{}{}", if o.sym_x { "x" } else { "" }, if o.sym_y { "y" } else { "" }),
-        "tolerance": o.tolerance, "contiguous": o.contiguous,
+        "contiguous": o.contiguous,
         "tile_mode": if o.tile_mode == TileMode::Sync { "sync" } else { "auto" }, "active_tile": o.active_tile,
         "active_ramp": o.active_ramp.map(|r| r as i64).unwrap_or(-1),
         "gradient_radial": o.gradient_radial, "gradient_dither": o.gradient_dither,
@@ -1844,7 +1795,7 @@ fn editor_cmds(b: &mut B) {
         "tool:str? pencil, eraser, line, rect, ellipse, fill, gradient, picker, select, wand, move, tile_stamp, pan; \
          brush_size:int? 1-128; brush_shape:str? round or square; mode:str? Paint mode; dither:int? 0-16; dither_bg:bool? Paint background in dither gaps; \
          filled:bool? Filled shapes; pixel_perfect:bool? Remove corner pixels from 1px freehand strokes; symmetry:str? none, x, y or xy; \
-         tolerance:int? Fill/wand tolerance 0-255; contiguous:bool? Fill/wand connected area only; \
+         contiguous:bool? Fill/wand connected area only; \
          tile_mode:str? auto (edited cells become new/matching tiles) or sync (editing a cell edits its tile everywhere); \
          active_tile:int? Tile used by the tile stamp; active_ramp:int? Ramp used by gradient and shading, -1 for none; \
          gradient_radial:bool? Radial gradients; gradient_dither:bool? Dithered gradients",
@@ -1879,9 +1830,6 @@ fn editor_cmds(b: &mut B) {
             if let Some(s) = a.os("symmetry")? {
                 e.o.sym_x = s.contains('x');
                 e.o.sym_y = s.contains('y');
-            }
-            if let Some(t) = a.oi("tolerance")? {
-                e.o.tolerance = t.clamp(0, 255) as u8;
             }
             if let Some(v) = a.ob("contiguous")? {
                 e.o.contiguous = v;

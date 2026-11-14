@@ -1,6 +1,6 @@
 # Jon Motion
 
-A fast, scriptable pixel art editor in Rust for macOS and Windows: indexed-palette and true-colour
+A fast, scriptable pixel art editor in Rust for macOS and Windows: indexed-palette
 painting, layers, colour ramps and cycling, paint modes, and tile mapping - in the spirit of the
 classic palette-first pixel tools, with a modern dark UI.
 
@@ -30,16 +30,17 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
   Right mouse button paints with the background colour.
 - **Paint modes** - normal, dither (ordered, 15 densities, optional two-colour), lighten/darken
   (steps pixels along their colour ramp), smooth, smear, replace-colour, behind.
-- **Palette** - 256-colour indexed documents or RGBA. Blend, sort, swap, de-duplicate, remove unused,
+- **Palette** - every document is indexed, with up to 256 colours (there is no true-colour mode). Blend, sort, swap, de-duplicate, remove unused,
   11 presets, colour ramps, live colour-cycling preview, quantise/reduce colours with ordered or
   Floyd-Steinberg dithering. Palette edits renumber pixels so the image keeps its look.
-- **Layers** - opacity, visibility, lock, transparency lock, reorder, merge, flatten.
+- **Layers** - visibility, lock, transparency lock, reorder, merge, flatten. Layers are fully opaque where they have pixels.
 - **Selections** - rectangle, magic wand, add/subtract, move as floating pixels, cut/copy/paste,
   system clipboard images.
 - **Tile mapping** - turn a layer into a tile map; identical cells share one tile. *Auto* mode makes
   or matches tiles as you draw; *Sync* mode edits a tile everywhere it is used, live. Tile stamp tool,
   tile set PNG and map CSV export.
-- **Files** - native `.jmn` projects (everything), PNG in and out (indexed PNGs stay indexed).
+- **Files** - native `.jmn` projects (everything), PNG in and out. Exports are always indexed PNGs. An indexed
+  PNG opens with its own palette; a true-colour PNG is converted to a generated palette of up to 256 colours.
 
 Help > Keyboard Shortcuts lists the keys.
 

@@ -51,7 +51,9 @@ eq(jm.get(63, 46), 60, "x symmetry")
 local l = jm.layer_add{ name = "Top" }.layer
 eq(l, 1); eq(jm.get(2, 2), -1, "new layer is empty")
 jm.set(2, 2, 99)
-jm.layer_set{ layer = "Top", opacity = 128, locked = true }
+jm.layer_set{ layer = "Top", locked = true }
+fails(function() jm.layer_set{ opacity = 128 } end, "layers have no opacity")
+eq(jm.get_info().layers[2].opacity, nil)
 fails(function() jm.draw_line{ x0 = 0, y0 = 0, x1 = 5, y1 = 5 } end, "drawing on a locked layer")
 jm.layer_set{ locked = false }
 jm.layer_duplicate{}
@@ -157,15 +159,16 @@ jm.tiles_remove_unused{}
 eq(jm.tiles_info{}.count <= before, true)
 jm.layer_detach_tiles{}; jm.tileset_delete{}
 
--- colour modes
-jm.new_document{ width = 16, height = 16, mode = "rgba", force = true }
-jm.set(0, 0, 255, 0, 0); jm.set(1, 0, "#00ff0080")
-local r1, g1, b1, a1 = jm.get(1, 0); eq(g1, 255); eq(a1, 128)
+-- indexed only: colours snap to the palette, and the image can be reduced to fewer
+fails(function() jm.new_document{ width = 16, height = 16, mode = "rgba", force = true } end, "no true-colour documents")
+fails(function() jm.convert_mode{ mode = "rgba" } end, "no mode conversion")
+jm.new_document{ width = 16, height = 16, force = true }
+jm.palette_set{ index = 1, color = "#ff0000" }
+jm.set(0, 0, 255, 0, 0); eq(jm.get(0, 0), 1, "rgb snaps to the nearest palette colour")
+jm.set(1, 0, "#ff0000"); eq(jm.get(1, 0), 1)
 jm.gradient{ x0 = 0, y0 = 4, x1 = 15, y1 = 4, colors = { "#000000", "#ffffff" }, dither = false }
-jm.convert_mode{ mode = "indexed", colors = 8, dither = "bayer" }
+jm.reduce_colors{ colors = 8, dither = "bayer" }
 eq(jm.get_info().mode, "indexed"); eq(jm.palette_get{}.count <= 8, true, "quantised")
-jm.convert_mode{ mode = "rgba" }
-eq(jm.get_info().mode, "rgba")
 
 -- editor state
 jm.set_options{ tool = "line", brush_size = 5, mode = "smooth", symmetry = "xy" }

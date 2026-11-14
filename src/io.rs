@@ -1,6 +1,8 @@
 //! Native project files (.jmn) and PNG import/export.
 
 use crate::doc::*;
+use crate::quant;
+use std::sync::Arc;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -38,7 +40,30 @@ pub fn load_doc(path: &Path) -> Result<Doc, String> {
     }
     let mut d: Doc = bincode::deserialize(&raw).map_err(|e| format!("corrupt project file: {e}"))?;
     validate(&mut d)?;
+    if d.mode == ColorMode::Rgba {
+        to_indexed(&mut d);
+    }
     Ok(d)
+}
+
+/// Convert a true-colour project written by 0.1.x: its cells are packed RGBA
+/// (little-endian r, g, b, a). It gets a generated palette of up to 256 colours.
+fn to_indexed(d: &mut Doc) {
+    let px = |cells: &[Cell]| -> Vec<[u8; 4]> { cells.iter().map(|c| c.to_le_bytes()).collect() };
+    let layers: Vec<Vec<[u8; 4]>> = d.layers.iter().map(|l| px(&l.data)).collect();
+    let tiles: Vec<Vec<[u8; 4]>> = d.tileset.iter().flat_map(|t| t.tiles.iter()).map(|t| px(t)).collect();
+    d.palette = quant::palette_for(layers.iter().chain(&tiles).flatten(), 256);
+    let (w, h) = (d.w as usize, d.h as usize);
+    for (l, p) in d.layers.iter_mut().zip(&layers) {
+        l.data = Arc::new(quant::to_indexed(p, w, h, &d.palette, quant::Dither::None));
+    }
+    if let Some(ts) = &mut d.tileset {
+        let (tw, th) = (ts.tw as usize, ts.th as usize);
+        for (t, p) in ts.tiles.iter_mut().zip(&tiles) {
+            *t = Arc::new(quant::to_indexed(p, tw, th, &d.palette, quant::Dither::None));
+        }
+    }
+    d.mode = ColorMode::Indexed;
 }
 
 fn validate(d: &mut Doc) -> Result<(), String> {
@@ -53,6 +78,7 @@ fn validate(d: &mut Doc) -> Result<(), String> {
         return Err("corrupt project file: bad palette".into());
     }
     d.active = d.active.min(d.layers.len() - 1);
+    d.layers.iter_mut().for_each(|l| l.opacity = 255);
     let colors = d.palette.colors.len();
     for r in &mut d.palette.ramps {
         r.indices.retain(|&i| (i as usize) < colors);
@@ -173,32 +199,46 @@ pub fn upscale(rgba: &[u8], w: usize, h: usize, s: usize) -> Vec<u8> {
     out
 }
 
-/// Encode cells in the document's colour mode: an indexed PNG when possible, else RGBA.
-pub fn encode_cells(doc: &Doc, w: u32, h: u32, cells: &[Cell]) -> Result<Vec<u8>, String> {
-    if doc.mode == ColorMode::Indexed {
-        let has_transp = cells.iter().any(|&c| c >= 256);
-        let mut pal = doc.palette.colors.clone();
-        // Transparency needs a palette slot: a spare entry, or failing that one the image never uses.
-        let t = if !has_transp {
-            None
-        } else if pal.len() < 256 {
-            pal.push([0, 0, 0]);
-            Some((pal.len() - 1) as u8)
-        } else {
-            let mut used = [false; 256];
-            cells.iter().filter(|&&c| c < 256).for_each(|&c| used[c as usize] = true);
-            used.iter().position(|u| !u).map(|i| i as u8)
-        };
-        if !has_transp || t.is_some() {
-            let idx: Vec<u8> = cells.iter().map(|&c| if c >= 256 { t.unwrap_or(0) } else { c as u8 }).collect();
-            return encode_png_indexed(w, h, &idx, &pal, t);
-        }
+/// Nearest-neighbour integer upscale of cells.
+fn upscale_cells(src: &[Cell], w: usize, h: usize, s: usize) -> Vec<Cell> {
+    if s <= 1 {
+        return src.to_vec();
     }
-    let rgba: Vec<u8> = cells.iter().flat_map(|&c| doc.to_rgba(c)).collect();
-    encode_png_rgba(w, h, &rgba)
+    let mut out = Vec::with_capacity(w * s * h * s);
+    for y in 0..h * s {
+        let row = &src[(y / s) * w..(y / s + 1) * w];
+        out.extend(row.iter().flat_map(|&c| std::iter::repeat_n(c, s)));
+    }
+    out
 }
 
-/// Encode the document (or one layer). Indexed documents stay indexed when nothing forces RGBA.
+/// Encode cells as an indexed PNG carrying the document's palette.
+pub fn encode_cells(doc: &Doc, w: u32, h: u32, cells: &[Cell]) -> Result<Vec<u8>, String> {
+    let has_transp = cells.iter().any(|&c| c >= 256);
+    let mut pal = doc.palette.colors.clone();
+    // Transparency needs a palette slot: a spare entry, or failing that one the image never uses.
+    let t = if !has_transp {
+        None
+    } else if pal.len() < 256 {
+        pal.push([0, 0, 0]);
+        Some((pal.len() - 1) as u8)
+    } else {
+        let mut used = [false; 256];
+        cells.iter().filter(|&&c| c < 256).for_each(|&c| used[c as usize] = true);
+        match used.iter().position(|u| !u) {
+            Some(i) => Some(i as u8),
+            None => {
+                return Err("this image uses all 256 palette colours and also has transparent pixels, which an indexed PNG \
+                            cannot hold; fill the transparent areas or free one colour (Palette > remove unused / reduce colours)"
+                    .into())
+            }
+        }
+    };
+    let idx: Vec<u8> = cells.iter().map(|&c| if c >= 256 { t.unwrap_or(0) } else { c as u8 }).collect();
+    encode_png_indexed(w, h, &idx, &pal, t)
+}
+
+/// Encode the document (or one layer) as an indexed PNG.
 pub fn export_png(doc: &Doc, layer: Option<usize>, scale: u32) -> Result<Vec<u8>, String> {
     let scale = scale.clamp(1, 64);
     let (ow, oh) = (doc.w as u64 * scale as u64, doc.h as u64 * scale as u64);
@@ -207,15 +247,10 @@ pub fn export_png(doc: &Doc, layer: Option<usize>, scale: u32) -> Result<Vec<u8>
     }
     let mut d = doc.clone();
     d.float_commit();
-    let plain = d.layers.iter().all(|l| !l.visible || l.opacity == 255);
-    if d.mode == ColorMode::Indexed && scale == 1 && (plain || layer.is_some()) {
-        let cells = match layer {
-            Some(li) => d.layers[li].data.to_vec(),
-            None => d.flat_cells(),
-        };
-        return encode_cells(&d, d.w, d.h, &cells);
-    }
-    let rgba = d.composite(&d.palette.colors, layer, false);
-    let big = upscale(&rgba, d.w as usize, d.h as usize, scale as usize);
-    encode_png_rgba(d.w * scale, d.h * scale, &big)
+    let cells = match layer {
+        Some(li) => d.layers[li].data.to_vec(),
+        None => d.flat_cells(),
+    };
+    let big = upscale_cells(&cells, d.w as usize, d.h as usize, scale as usize);
+    encode_cells(&d, d.w * scale, d.h * scale, &big)
 }

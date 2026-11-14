@@ -145,7 +145,6 @@ pub struct Opts {
     pub pixel_perfect: bool,
     pub sym_x: bool,
     pub sym_y: bool,
-    pub tolerance: u8,
     pub contiguous: bool,
     pub tile_mode: TileMode,
     pub active_tile: u16,
@@ -176,7 +175,7 @@ pub struct Clip {
     pub w: u32,
     pub h: u32,
     pub data: Vec<Cell>,
-    pub mode: ColorMode,
+    /// The palette the cells were copied under, so a paste into another palette keeps its look.
     pub pal: Vec<[u8; 3]>,
 }
 
@@ -264,7 +263,7 @@ fn blit_tile(data: &mut [Cell], w: usize, cx: usize, cy: usize, tw: usize, th: u
 impl Engine {
     pub fn new(host: &'static str) -> Engine {
         Engine {
-            doc: Doc::new(320, 240, ColorMode::Indexed, Palette::default_256()),
+            doc: Doc::new(320, 240, Palette::default_256()),
             undo: vec![],
             redo: vec![],
             o: Opts {
@@ -281,7 +280,6 @@ impl Engine {
                 pixel_perfect: false,
                 sym_x: false,
                 sym_y: false,
-                tolerance: 0,
                 contiguous: true,
                 tile_mode: TileMode::Auto,
                 active_tile: 0,
@@ -369,21 +367,18 @@ impl Engine {
             Value::Number(n) => {
                 let i = n.as_f64().unwrap_or(0.0).floor() as i64;
                 if i < 0 {
-                    return Ok(self.doc.empty());
+                    return Ok(TRANSP);
                 }
                 if i as usize >= self.doc.palette.colors.len() {
                     return Err(format!("palette index {i} out of range (palette has {} colours)", self.doc.palette.colors.len()));
                 }
-                Ok(match self.doc.mode {
-                    ColorMode::Indexed => i as Cell,
-                    ColorMode::Rgba => pack(self.doc.palette.rgba(i as usize)),
-                })
+                Ok(i as Cell)
             }
             Value::String(s) => match s.as_str() {
-                "transparent" | "none" | "clear" => Ok(self.doc.empty()),
+                "transparent" | "none" | "clear" => Ok(TRANSP),
                 "fg" => Ok(self.o.fg),
                 "bg" => Ok(self.o.bg),
-                _ => parse_hex(s).map(|c| self.doc.from_rgba(c)).ok_or_else(|| format!("bad colour '{s}' (use a palette index, '#rrggbb', '#rrggbbaa', 'transparent', 'fg' or 'bg')")),
+                _ => parse_hex(s).map(|c| self.doc.from_rgba(c)).ok_or_else(|| format!("bad colour '{s}' (use a palette index, '#rrggbb' for the nearest palette colour, 'transparent', 'fg' or 'bg')")),
             },
             Value::Array(a) if a.len() == 3 || a.len() == 4 => {
                 let ch = |i: usize| a.get(i).and_then(|v| v.as_f64()).map(|v| v.clamp(0.0, 255.0) as u8);
@@ -395,24 +390,22 @@ impl Engine {
     }
 
     pub fn cell_json(&self, c: Cell) -> Value {
-        match self.doc.mode {
-            ColorMode::Indexed if c >= 256 => Value::from(-1),
-            ColorMode::Indexed => Value::from(c),
-            ColorMode::Rgba => Value::from(hex8(unpack(c))),
+        if c >= 256 {
+            Value::from(-1)
+        } else {
+            Value::from(c)
         }
     }
 
-    /// Swap in a different document, carrying FG/BG across colour modes.
+    /// Swap in a different document, carrying FG/BG across to its palette.
     pub fn replace_doc(&mut self, new: Doc) -> Doc {
         let (fg, bg) = (self.doc.to_rgba(self.o.fg), self.doc.to_rgba(self.o.bg));
         let old = std::mem::replace(&mut self.doc, new);
-        if old.mode != self.doc.mode || old.palette.colors != self.doc.palette.colors {
+        if old.palette.colors != self.doc.palette.colors {
             self.o.fg = self.doc.from_rgba(fg);
             self.o.bg = self.doc.from_rgba(bg);
             // The custom brush keeps its look too (undoing a palette sort or swap renumbers it).
-            if old.mode != self.doc.mode {
-                self.o.custom_brush = None;
-            } else if let Some(cells) = self.o.custom_brush.as_mut().and_then(|b| b.cells.as_mut()) {
+            if let Some(cells) = self.o.custom_brush.as_mut().and_then(|b| b.cells.as_mut()) {
                 let map: Vec<Cell> = (0..old.palette.colors.len()).map(|i| self.doc.from_rgba(old.palette.rgba(i))).collect();
                 cells.iter_mut().for_each(|c| *c = map.get(*c as usize).copied().unwrap_or(*c));
             }
@@ -424,14 +417,12 @@ impl Engine {
     /// Clamp editor state that refers into the document.
     pub fn fix_state(&mut self) {
         let d = &self.doc;
-        if d.mode == ColorMode::Indexed {
-            let n = d.palette.colors.len() as Cell;
-            if self.o.fg != TRANSP && self.o.fg >= n {
-                self.o.fg = n - 1;
-            }
-            if self.o.bg != TRANSP && self.o.bg >= n {
-                self.o.bg = 0;
-            }
+        let n = d.palette.colors.len() as Cell;
+        if self.o.fg != TRANSP && self.o.fg >= n {
+            self.o.fg = n - 1;
+        }
+        if self.o.bg != TRANSP && self.o.bg >= n {
+            self.o.bg = 0;
         }
         if self.o.active_ramp.is_some_and(|r| r >= d.palette.ramps.len()) {
             self.o.active_ramp = None;
@@ -700,7 +691,7 @@ impl Engine {
         let mut brush = self.o.custom_brush.clone().unwrap_or_else(|| Brush::new(self.o.brush_size, self.o.brush_shape));
         let mut mode = self.o.mode;
         if erase {
-            color = self.doc.empty();
+            color = TRANSP;
             brush.cells = None;
             mode = PaintMode::Normal;
         }
@@ -751,7 +742,6 @@ impl Engine {
         let mut p = Painter {
             w: doc.w as i32,
             h: doc.h as i32,
-            mode: doc.mode,
             pal: &doc.palette,
             data,
             base: &st.base.layers[li].data,
@@ -865,14 +855,12 @@ impl Engine {
 
     /// Colours the gradient tool runs through with the current settings.
     pub fn gradient_stops(&self, secondary: bool) -> Vec<Cell> {
-        if self.doc.mode == ColorMode::Indexed {
-            if let Some(r) = self.o.active_ramp.and_then(|r| self.doc.palette.ramps.get(r)) {
-                let mut v: Vec<Cell> = r.indices.iter().map(|&i| i as Cell).collect();
-                if secondary {
-                    v.reverse();
-                }
-                return v;
+        if let Some(r) = self.o.active_ramp.and_then(|r| self.doc.palette.ramps.get(r)) {
+            let mut v: Vec<Cell> = r.indices.iter().map(|&i| i as Cell).collect();
+            if secondary {
+                v.reverse();
             }
+            return v;
         }
         if secondary {
             vec![self.o.bg, self.o.fg]
@@ -892,7 +880,7 @@ impl Engine {
     pub fn grab(&self) -> Result<Clip, String> {
         let d = &self.doc;
         if let Some(f) = &d.float {
-            return Ok(Clip { x: f.x, y: f.y, w: f.w, h: f.h, data: f.data.to_vec(), mode: d.mode, pal: d.palette.colors.clone() });
+            return Ok(Clip { x: f.x, y: f.y, w: f.w, h: f.h, data: f.data.to_vec(), pal: d.palette.colors.clone() });
         }
         let li = d.active;
         let (x0, y0, x1, y1) = match d.sel_bounds() {
@@ -901,7 +889,7 @@ impl Engine {
             None => (0, 0, d.w as i32 - 1, d.h as i32 - 1),
         };
         let (cw, ch) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
-        let mut data = vec![d.empty(); cw * ch];
+        let mut data = vec![TRANSP; cw * ch];
         for y in 0..ch {
             for x in 0..cw {
                 let (sx, sy) = (x0 + x as i32, y0 + y as i32);
@@ -910,29 +898,18 @@ impl Engine {
                 }
             }
         }
-        Ok(Clip { x: x0, y: y0, w: cw as u32, h: ch as u32, data, mode: d.mode, pal: d.palette.colors.clone() })
+        Ok(Clip { x: x0, y: y0, w: cw as u32, h: ch as u32, data, pal: d.palette.colors.clone() })
     }
 
-    /// Clipboard cells converted to this document's colour mode and palette.
+    /// Clipboard cells converted to this document's palette.
     pub fn clip_cells(&self) -> Option<Vec<Cell>> {
         let c = self.clipboard.as_ref()?;
         let d = &self.doc;
-        if c.mode == d.mode && (c.mode == ColorMode::Rgba || c.pal == d.palette.colors) {
+        if c.pal == d.palette.colors {
             return Some(c.data.clone());
         }
-        Some(
-            c.data
-                .iter()
-                .map(|&cell| {
-                    let rgba = match c.mode {
-                        ColorMode::Indexed if cell >= 256 => [0, 0, 0, 0],
-                        ColorMode::Indexed => c.pal.get(cell as usize).map(|p| [p[0], p[1], p[2], 255]).unwrap_or([0, 0, 0, 255]),
-                        ColorMode::Rgba => unpack(cell),
-                    };
-                    d.from_rgba(rgba)
-                })
-                .collect(),
-        )
+        let map: Vec<Cell> = c.pal.iter().map(|p| d.from_rgba([p[0], p[1], p[2], 255])).collect();
+        Some(c.data.iter().map(|&cell| map.get(cell as usize).copied().unwrap_or(TRANSP)).collect())
     }
 
     // ------------------------------------------------------------ tiles
@@ -1091,7 +1068,7 @@ impl Engine {
 
     /// Renumber tiles: `remap[old] = new`. Tiles mapped to the same id are merged.
     pub fn remap_tiles(&mut self, remap: &[u16], new_count: usize) {
-        let empty = self.doc.empty();
+        let empty = TRANSP;
         let Some(ts) = self.doc.tileset.as_mut() else { return };
         let mut tiles: Vec<Option<Arc<Vec<Cell>>>> = vec![None; new_count];
         for (old, t) in ts.tiles.iter().enumerate() {

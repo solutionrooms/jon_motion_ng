@@ -60,7 +60,6 @@ fn save_and_reload_round_trips() {
     assert!(e.doc == saved, "project file did not round-trip");
     // An indexed PNG comes back with the same pixels and palette indices.
     e.exec("open_document", &json!({"path": png.display().to_string()})).unwrap();
-    assert_eq!(e.doc.mode, crate::doc::ColorMode::Indexed);
     assert_eq!(e.doc.layers[0].data[20 * 320 + 20], 44);
     assert_eq!(e.doc.layers[0].data[320 + 1], 7);
     std::fs::remove_dir_all(dir).ok();
@@ -176,7 +175,7 @@ fn wild_coordinates_are_harmless() {
 #[test]
 fn crafted_project_files_are_sanitised() {
     use crate::doc::*;
-    let mut d = Doc::new(8, 8, ColorMode::Indexed, Palette::preset("pico8").unwrap());
+    let mut d = Doc::new(8, 8, Palette::preset("pico8").unwrap());
     d.palette.ramps.push(Ramp { name: "bad".into(), indices: vec![3, 200, 201], cycle: true, speed: 8.0 });
     d.tileset = Some(TileSet { tw: 4, th: 4, tiles: vec![std::sync::Arc::new(vec![TRANSP; 16])] });
     d.layers[0].map = Some(std::sync::Arc::new(vec![900; 3]));
@@ -188,6 +187,68 @@ fn crafted_project_files_are_sanitised() {
     assert_eq!(e.doc.layers[0].map.as_ref().unwrap().as_slice(), &[0u16; 4], "the tile map was rebuilt");
     e.exec("palette_cleanup", &json!({"unused": true})).unwrap();
     e.exec("tile_make_unique", &json!({"col": 0, "row": 0})).unwrap();
+}
+
+#[test]
+fn everything_is_indexed() {
+    use crate::doc::*;
+    use crate::io::{self, PngPixels};
+    let is_indexed = |p: &str| matches!(io::load_png(std::path::Path::new(p)).unwrap().pixels, PngPixels::Indexed { .. });
+
+    // A true-colour PNG opens as an indexed document with a palette made for it.
+    let (w, h) = (20u32, 20u32);
+    let rgba: Vec<u8> = (0..w * h).flat_map(|i| if i % 7 == 0 { [0, 0, 0, 0] } else { [(i % w % 10 * 25) as u8, (i / w * 12) as u8, 90, 255] }).collect();
+    let src = tmp("truecolour.png");
+    std::fs::write(&src, io::encode_png_rgba(w, h, &rgba).unwrap()).unwrap();
+    let mut e = Engine::new("headless");
+    e.exec("open_document", &json!({"path": src})).unwrap();
+    assert_eq!(e.doc.mode, ColorMode::Indexed);
+    assert!(e.doc.palette.colors.len() <= 256);
+    let cells = &e.doc.layers[0].data;
+    assert_eq!(cells[0], TRANSP, "transparent pixels stay transparent");
+    assert!(cells.iter().all(|&c| c == TRANSP || (c as usize) < e.doc.palette.colors.len()));
+    // The image has 200 colours, so every one fits in the palette exactly.
+    assert_eq!(e.doc.to_rgba(cells[45]), [125, 24, 90, 255]);
+    // ... and as a layer it maps onto the palette already there.
+    e.exec("new_document", &json!({"width": 20, "height": 20, "palette": "pico8", "force": true})).unwrap();
+    e.exec("import_png_layer", &json!({"path": src})).unwrap();
+    assert!(e.doc.layers[1].data.iter().all(|&c| c == TRANSP || c < 16));
+
+    // Exports are indexed PNGs, scaled or not, hidden layers or not.
+    e.exec("layer_set", &json!({"layer": 0, "visible": false})).unwrap();
+    for (name, params) in [("plain.png", json!({})), ("scaled.png", json!({"scale": 3})), ("layer.png", json!({"layer": 1, "scale": 2}))] {
+        let mut p = params;
+        p["path"] = json!(tmp(name));
+        e.exec("export_png", &p).unwrap();
+        assert!(is_indexed(&tmp(name)), "{name} is not an indexed PNG");
+    }
+    let scaled = io::load_png(std::path::Path::new(&tmp("scaled.png"))).unwrap();
+    assert_eq!((scaled.w, scaled.h), (60, 60));
+    let back = crate::commands::doc_from_png(scaled);
+    assert_eq!(back.to_rgba(back.layers[0].data[4 * 60 + 5]), e.doc.to_rgba(e.doc.layers[1].data[20 + 1]), "scaled pixels keep their colour");
+
+    // All 256 colours in use plus transparency cannot be an indexed PNG: say so rather than write RGBA.
+    e.exec("new_document", &json!({"width": 32, "height": 16, "force": true})).unwrap();
+    assert_eq!(script::run_lua(&mut e, "for i = 0, 255 do jm.set(i % 32, i // 32, i) end").error, None);
+    let err = e.exec("export_png", &json!({"path": tmp("full.png")})).unwrap_err();
+    assert!(err.contains("256 palette colours"), "{err}");
+    e.exec("draw_rect", &json!({"x": 0, "y": 8, "w": 32, "h": 8, "color": 0, "filled": true})).unwrap();
+    e.exec("export_png", &json!({"path": tmp("full.png")})).unwrap();
+    assert!(is_indexed(&tmp("full.png")));
+
+    // A true-colour project written by 0.1.x is converted when it is opened, and
+    // layer opacity (also gone) is reset.
+    let mut d = Doc::new(4, 4, Palette::preset("pico8").unwrap());
+    d.mode = ColorMode::Rgba;
+    d.layers[0].opacity = 100;
+    d.layers[0].data = std::sync::Arc::new((0..16u32).map(|i| if i == 0 { 0 } else { u32::from_le_bytes([200, (i * 10) as u8, 30, 255]) }).collect());
+    let old = tmp("old_rgba.jmn");
+    io::save_doc(&d, std::path::Path::new(&old)).unwrap();
+    e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    assert_eq!((e.doc.mode, e.doc.layers[0].opacity), (ColorMode::Indexed, 255));
+    assert_eq!(e.doc.layers[0].data[0], TRANSP);
+    assert_eq!(e.doc.to_rgba(e.doc.layers[0].data[5]), [200, 50, 30, 255]);
+    assert_eq!(e.exec("get_info", &json!({})).unwrap()["mode"], "indexed");
 }
 
 #[test]

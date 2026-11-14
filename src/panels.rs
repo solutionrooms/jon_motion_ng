@@ -446,7 +446,7 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             e.rev += 1;
         }
     });
-    let mut action: Option<(&str, serde_json::Value)> = None;
+    let mut action: Option<(&str, serde_json::Value, Option<String>)> = None;
     for (ri, r) in e.doc.palette.ramps.iter().enumerate() {
         ui.horizontal(|ui| {
             let on = e.o.active_ramp == Some(ri);
@@ -464,19 +464,24 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             }
             let mut cycle = r.cycle;
             if ui.checkbox(&mut cycle, "").on_hover_text("Colour cycling").changed() {
-                action = Some(("ramp_set", json!({ "ramp": ri, "cycle": cycle })));
+                action = Some(("ramp_set", json!({ "ramp": ri, "cycle": cycle }), None));
             }
             let mut speed = r.speed;
             if ui.add(egui::DragValue::new(&mut speed).range(0.5..=60.0).speed(0.1).max_decimals(1)).on_hover_text("Cycle steps per second").changed() {
-                action = Some(("ramp_set", json!({ "ramp": ri, "speed": speed })));
+                action = Some(("ramp_set", json!({ "ramp": ri, "speed": speed }), Some(format!("ramp{ri}speed"))));
             }
             if ui.small_button("x").on_hover_text("Delete ramp").clicked() {
-                action = Some(("ramp_delete", json!({ "ramp": ri })));
+                action = Some(("ramp_delete", json!({ "ramp": ri }), None));
             }
         });
     }
-    if let Some((name, params)) = action {
-        if let Err(err) = e.exec_coalesced(name, &params, &format!("ramp{params}")) {
+    if let Some((name, params, key)) = action {
+        // Only a continuous drag (speed) shares one undo step; clicks are a step each.
+        let r = match key {
+            Some(k) => e.exec_coalesced(name, &params, &k),
+            None => e.exec(name, &params),
+        };
+        if let Err(err) = r {
             g.error(err);
         }
     }
@@ -749,12 +754,12 @@ pub fn preview(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
 
 // ------------------------------------------------------------------ script
 
-pub fn script(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
+pub fn script(ui: &mut egui::Ui, _e: &mut Engine, g: &mut Gui) {
     let run_key = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.add(egui::Button::new(RichText::new("Run").color(Color32::WHITE)).fill(Color32::from_rgb(58, 104, 196))).on_hover_text("Cmd/Ctrl + Enter").clicked() || run_key {
-            g.run_script(e);
+            g.script_req = true;
         }
         if ui.button("Open...").clicked() {
             if let Some(p) = rfd::FileDialog::new().add_filter("Lua", &["lua"]).pick_file() {

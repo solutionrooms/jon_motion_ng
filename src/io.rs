@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 6] = b"JMNG\x01\n";
+const MAX_EXPORT_PIXELS: u64 = 8192 * 8192;
 
 pub fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
     let mut d = doc.clone();
@@ -44,6 +45,10 @@ fn validate(d: &mut Doc) -> Result<(), String> {
         return Err("corrupt project file: bad palette".into());
     }
     d.active = d.active.min(d.layers.len() - 1);
+    let colors = d.palette.colors.len();
+    for r in &mut d.palette.ramps {
+        r.indices.retain(|&i| (i as usize) < colors);
+    }
     match &d.tileset {
         Some(ts) => {
             let tn = (ts.tw * ts.th) as usize;
@@ -188,6 +193,10 @@ pub fn encode_cells(doc: &Doc, w: u32, h: u32, cells: &[Cell]) -> Result<Vec<u8>
 /// Encode the document (or one layer). Indexed documents stay indexed when nothing forces RGBA.
 pub fn export_png(doc: &Doc, layer: Option<usize>, scale: u32) -> Result<Vec<u8>, String> {
     let scale = scale.clamp(1, 64);
+    let (ow, oh) = (doc.w as u64 * scale as u64, doc.h as u64 * scale as u64);
+    if ow * oh > MAX_EXPORT_PIXELS {
+        return Err(format!("scale {scale} would make a {ow}x{oh} image; use a smaller scale (the limit is 8192x8192 pixels in area)"));
+    }
     let mut d = doc.clone();
     d.float_commit();
     let plain = d.layers.iter().all(|l| !l.visible || l.opacity == 255);

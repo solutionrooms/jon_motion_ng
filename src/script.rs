@@ -4,16 +4,27 @@
 use crate::commands;
 use crate::doc::*;
 use crate::engine::Engine;
-use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, SerializeOptions, StdLib, Value as LV, Variadic, VmState};
+use mlua::{ChunkMode, HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, SerializeOptions, StdLib, Value as LV, Variadic, VmState};
 use serde_json::Value;
-use std::cell::RefCell;
+use std::cell::{Cell as Flag, RefCell};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const TIME_LIMIT: Duration = Duration::from_secs(60);
+const MEMORY_LIMIT: usize = 256 << 20;
 const MAX_OUTPUT: usize = 64 * 1024;
 
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Ask the running script (if any) to stop; it ends with an error and is rolled back.
+pub fn cancel() {
+    CANCEL.store(true, Ordering::Relaxed);
+}
+
 pub const LUA_HELP: &str = "\
-Lua 5.4 scripting (sandboxed: math, string, table, utf8, coroutine; no file or OS access).
+Lua 5.4 scripting (sandboxed: math, string, table, utf8, coroutine; no io/os libraries - files are only reached \
+through the document commands, which read .jmn/.png and write .jmn/.png/.csv; 60 s and 256 MB limits).
 Every editor command is a function on the global `jm` taking one table of named parameters:
     jm.draw_line{ x0=0, y0=0, x1=31, y1=31, color=15 }
     local info = jm.get_info()            -- commands return tables
@@ -26,7 +37,26 @@ Fast pixel access on the active layer:
 print(...) output and the script's return value are returned to the caller.
 A script is atomic and is one undo step; an error rolls everything back.";
 
+// The wrappers keep the sandbox's limits firm: `load` only takes source text (Lua does
+// not verify bytecode), and pcall/xpcall/coroutine.resume re-raise the time-limit or
+// cancel error, so a script cannot swallow it and carry on.
 const PRELUDE: &str = r#"
+do
+  local load_, pcall_, xpcall_, resume_, error_, select_, dead = load, pcall, xpcall, coroutine.resume, error, select, __jm_dead
+  load = function(chunk, name, mode, ...)
+    if select_('#', ...) > 0 then return load_(chunk, name, 't', (...)) end
+    return load_(chunk, name, 't')
+  end
+  local function pass(ok, ...)
+    if not ok and dead() then error_((...), 0) end
+    return ok, ...
+  end
+  pcall = function(f, ...) return pass(pcall_(f, ...)) end
+  xpcall = function(f, h, ...) return pass(xpcall_(f, h, ...)) end
+  coroutine.resume = function(co, ...) return pass(resume_(co, ...)) end
+  string.dump = nil
+  __jm_dead = nil
+end
 jm = setmetatable({}, { __index = function(t, k)
   local f = function(p) return __jm_exec(k, p) end
   rawset(t, k, f)
@@ -50,22 +80,35 @@ fn rt(e: String) -> mlua::Error {
 }
 
 pub fn run_lua(engine: &mut Engine, code: &str) -> ScriptOut {
+    run_lua_limited(engine, code, TIME_LIMIT)
+}
+
+pub fn run_lua_limited(engine: &mut Engine, code: &str, limit: Duration) -> ScriptOut {
     let out = RefCell::new(String::new());
     let mut result = Value::Null;
     let r = engine.group(|e| {
         let cell = RefCell::new(e);
-        run_inner(&cell, &out, code).map(|v| result = v)
+        run_inner(&cell, &out, code, limit).map(|v| result = v)
     });
     ScriptOut { output: out.into_inner(), result, error: r.err() }
 }
 
-fn run_inner(eng: &RefCell<&mut Engine>, out: &RefCell<String>, code: &str) -> Result<Value, String> {
+fn run_inner(eng: &RefCell<&mut Engine>, out: &RefCell<String>, code: &str, limit: Duration) -> Result<Value, String> {
     let libs = StdLib::MATH | StdLib::STRING | StdLib::TABLE | StdLib::UTF8 | StdLib::COROUTINE;
     let lua = Lua::new_with(libs, LuaOptions::default()).map_err(|e| e.to_string())?;
+    lua.set_memory_limit(MEMORY_LIMIT).map_err(|e| e.to_string())?;
     let start = Instant::now();
+    CANCEL.store(false, Ordering::Relaxed);
+    // Once set, the script is over: every later check fails too.
+    let dead = Rc::new(Flag::new(false));
+    let hook_dead = dead.clone();
     lua.set_hook(HookTriggers::new().every_nth_instruction(20_000), move |_, _| {
-        if start.elapsed() > TIME_LIMIT {
-            Err(mlua::Error::runtime("script exceeded the 60 second time limit"))
+        if CANCEL.load(Ordering::Relaxed) {
+            hook_dead.set(true);
+            Err(mlua::Error::runtime("script cancelled"))
+        } else if start.elapsed() > limit {
+            hook_dead.set(true);
+            Err(mlua::Error::runtime(format!("script exceeded the {} second time limit", limit.as_secs())))
         } else {
             Ok(VmState::Continue)
         }
@@ -75,6 +118,7 @@ fn run_inner(eng: &RefCell<&mut Engine>, out: &RefCell<String>, code: &str) -> R
         for k in ["dofile", "loadfile", "collectgarbage"] {
             g.set(k, LV::Nil)?;
         }
+        g.set("__jm_dead", scope.create_function(|_, ()| Ok(dead.get()))?)?;
         g.set(
             "__jm_exec",
             scope.create_function(|lua, (name, params): (String, LV)| {
@@ -129,7 +173,7 @@ fn run_inner(eng: &RefCell<&mut Engine>, out: &RefCell<String>, code: &str) -> R
             })?,
         )?;
         lua.load(PRELUDE).set_name("prelude").exec()?;
-        let vals: MultiValue = lua.load(code).set_name("script").eval()?;
+        let vals: MultiValue = lua.load(code).set_name("script").set_mode(ChunkMode::Text).eval()?;
         Ok(match vals.into_iter().next() {
             Some(v) if !v.is_nil() => lua.from_value::<Value>(v).unwrap_or(Value::Null),
             _ => Value::Null,

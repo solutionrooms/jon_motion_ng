@@ -133,7 +133,13 @@ pub struct Painter<'a> {
     pub o: &'a PaintOpts,
 }
 
+/// Coordinates are clamped to this, far beyond the largest canvas, so shape
+/// arithmetic cannot overflow and a wild value cannot ask for a gigantic line.
+pub const COORD: i32 = 1 << 15;
+
 pub fn line_points(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+    let lim = |v: i32| v.clamp(-2 * COORD, 2 * COORD);
+    let (x0, y0, x1, y1) = (lim(x0), lim(y0), lim(x1), lim(y1));
     let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
     let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
     let (mut x, mut y, mut err) = (x0, y0, dx + dy);
@@ -395,6 +401,10 @@ impl Painter<'_> {
         let o = self.o;
         let b = &o.brush;
         let (x0, y0) = (x - b.w / 2, y - b.h / 2);
+        // Wholly off the canvas (mirrored copies would be too): nothing to do.
+        if x0 >= self.w || y0 >= self.h || x0 + b.w <= 0 || y0 + b.h <= 0 {
+            return;
+        }
         for by in 0..b.h {
             for bx in 0..b.w {
                 let i = (by * b.w + bx) as usize;
@@ -474,6 +484,9 @@ impl Painter<'_> {
             let ((ax, ay), (bx, by)) = (pair[0], pair[1]);
             let (dx, dy) = (bx - ax, by - ay);
             let (tx, ty) = (bx - b.w / 2, by - b.h / 2);
+            if tx >= self.w || ty >= self.h || tx + b.w <= 0 || ty + b.h <= 0 {
+                continue;
+            }
             let mut writes = vec![];
             for my in 0..b.h {
                 for mx in 0..b.w {

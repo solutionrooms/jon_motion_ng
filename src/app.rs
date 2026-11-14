@@ -11,7 +11,8 @@ use eframe::egui::{self, Color32, CornerRadius, Key, KeyboardShortcut, Modifiers
 use egui_dock::{DockArea, DockState, NodeIndex};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 pub const ACCENT: Color32 = Color32::from_rgb(92, 148, 252);
 pub const PANEL: Color32 = Color32::from_rgb(30, 31, 36);
@@ -71,8 +72,13 @@ pub struct Gui {
     pub usage_rev: u64,
     pub ants: Vec<[i32; 4]>,
     pub ants_key: (usize, usize, i32, i32),
+    /// Keeps the buffers `ants_key` points at alive, so their addresses cannot be reused.
+    pub ants_hold: (Option<Arc<Vec<Cell>>>, Option<Arc<Vec<u8>>>),
     pub script: String,
     pub script_out: String,
+    /// Set by the Script tab's Run button; the frame loop starts the script on a worker thread.
+    pub script_req: bool,
+    pub script_job: Option<mpsc::Receiver<script::ScriptOut>>,
     pub cmd_filter: String,
     pub rename: Option<(u32, String)>,
     pub dialog: Dialog,
@@ -104,6 +110,9 @@ impl Gui {
             usage_rev: 0,
             ants: vec![],
             ants_key: (0, 0, 0, 0),
+            ants_hold: (None, None),
+            script_req: false,
+            script_job: None,
             script: "-- Lua: every editor command is jm.<name>{ params }\n-- e.g. checkerboard on the active layer:\nlocal w, h = jm.size()\nfor y = 0, h - 1 do\n  for x = 0, w - 1 do\n    if (x // 8 + y // 8) % 2 == 0 then jm.set(x, y, 4) end\n  end\nend\n".into(),
             script_out: String::new(),
             cmd_filter: String::new(),
@@ -135,12 +144,25 @@ impl Gui {
             }
         }
     }
-    pub fn run_script(&mut self, e: &mut Engine) {
-        let out = script::run_lua(e, &self.script);
+    /// Run a selection command the way a hand-made selection should behave:
+    /// a result with no pixels means nothing is selected.
+    pub fn run_select(&mut self, e: &mut Engine, name: &str, params: Value) {
+        let r = e.group(|e| {
+            e.exec(name, &params)?;
+            if e.doc.selection.is_some() && e.doc.sel_bounds().is_none() {
+                e.exec("select_none", &Value::Null)?;
+            }
+            Ok(())
+        });
+        if let Err(err) = r {
+            self.error(err);
+        }
+    }
+    pub fn script_done(&mut self, out: script::ScriptOut) {
         let mut s = out.output;
         match out.error {
             Some(err) => {
-                s.push_str(&format!("error (nothing was applied): {err}\n"));
+                s.push_str(&format!("error (the document was rolled back): {err}\n"));
                 self.error("Script failed");
             }
             None => {
@@ -407,7 +429,7 @@ fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
         g.run(e, "select_none", json!({}));
     }
     if hit(cmd_shift, Key::I) {
-        g.run(e, "select_invert", json!({}));
+        g.run_select(e, "select_invert", json!({}));
     }
     if hit(cmd, Key::B) {
         if g.run(e, "grab_brush", json!({})).is_some() {
@@ -594,7 +616,7 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
                 g.run(e, "select_none", json!({}));
             }
             if item(ui, "Invert", "Cmd+Shift+I") {
-                g.run(e, "select_invert", json!({}));
+                g.run_select(e, "select_invert", json!({}));
             }
             ui.separator();
             if item(ui, "Lift Selection (Move)", "") && g.run(e, "float_lift", json!({})).is_some() {
@@ -933,7 +955,8 @@ fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             if let Some(port) = g.mcp_port {
                 ui.add_space(6.0);
                 ui.strong("Or HTTP, direct to this window");
-                let http = format!("claude mcp add --transport http jon-motion http://127.0.0.1:{port}/mcp");
+                let http = format!("claude mcp add --transport http jon-motion http://127.0.0.1:{port}/mcp --header \"Authorization: Bearer {}\"", remote::auth_token());
+                ui.weak("The token keeps other users and web pages out; it is stored in ~/.jon_motion/token.");
                 ui.add(egui::Label::new(egui::RichText::new(&http).monospace()).wrap());
                 if ui.button("Copy command ").clicked() {
                     ui.ctx().copy_text(http);
@@ -980,11 +1003,61 @@ fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
 
 // ------------------------------------------------------------------ frame
 
+/// Lock the engine, giving a short-lived MCP call time to finish.
+fn lock_soon(m: &Mutex<Engine>, wait: Duration) -> Option<MutexGuard<'_, Engine>> {
+    let start = Instant::now();
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            Err(TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) if start.elapsed() > wait => return None,
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+}
+
+/// Shown while a script or a long AI request has the document: the window stays
+/// responsive and the script can be stopped.
+fn busy_screen(ctx: &egui::Context) {
+    if ctx.input(|i| i.viewport().close_requested()) {
+        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+    }
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.4);
+            ui.spinner();
+            ui.add_space(8.0);
+            ui.label("A script or AI request is working on the document...");
+            ui.add_space(8.0);
+            if ui.button("Stop script").on_hover_text("Stops a running Lua script; its changes are rolled back").clicked() {
+                script::cancel();
+            }
+        });
+    });
+    ctx.request_repaint_after(Duration::from_millis(50));
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // The engine is locked for the whole frame; MCP calls run between frames.
+        if let Some(out) = self.gui.script_job.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.gui.script_job = None;
+            self.gui.script_done(out);
+        }
+        if std::mem::take(&mut self.gui.script_req) && self.gui.script_job.is_none() {
+            // Scripts run off the UI thread so a slow one cannot freeze the window.
+            let (tx, rx) = mpsc::channel();
+            let (engine, code, ctx2) = (self.engine.clone(), self.gui.script.clone(), ctx.clone());
+            self.gui.script_job = Some(rx);
+            std::thread::spawn(move || {
+                let out = script::run_lua(&mut engine.lock().unwrap_or_else(|p| p.into_inner()), &code);
+                let _ = tx.send(out);
+                ctx2.request_repaint();
+            });
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The engine is locked for the whole frame; MCP calls and scripts run between frames.
         let arc = self.engine.clone();
-        let mut guard = arc.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(mut guard) = lock_soon(&arc, Duration::from_millis(200)) else { return busy_screen(ctx) };
         let e = &mut *guard;
         let g = &mut self.gui;
         g.flash_now = g.flash.take();

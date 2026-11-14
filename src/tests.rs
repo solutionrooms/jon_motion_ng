@@ -100,6 +100,215 @@ fn mcp_protocol() {
     assert_eq!(r["error"]["code"], -32601);
 }
 
+// ---------------------------------------------------------------- audit regressions
+
+fn eng(w: u32, h: u32) -> Engine {
+    let mut e = Engine::new("headless");
+    e.exec("new_document", &json!({"width": w, "height": h, "force": true})).unwrap();
+    e
+}
+
+fn pixel(e: &mut Engine, x: i64, y: i64) -> i64 {
+    e.exec("get_pixel", &json!({"x": x, "y": y})).unwrap()["color"].as_i64().unwrap()
+}
+
+fn tmp(name: &str) -> String {
+    let d = std::env::temp_dir().join(format!("jmn_audit_{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d.join(name).display().to_string()
+}
+
+#[test]
+fn sync_mode_never_draws_into_the_blank_tile() {
+    let mut e = eng(32, 32);
+    e.exec("tileset_create", &json!({"tile_w": 8, "tile_h": 8})).unwrap();
+    e.exec("layer_to_tiles", &json!({})).unwrap();
+    e.exec("set_options", &json!({"tile_mode": "sync"})).unwrap();
+    e.exec("draw_line", &json!({"x0": 1, "y0": 1, "x1": 1, "y1": 1, "color": 44})).unwrap();
+    assert_eq!(pixel(&mut e, 1, 1), 44);
+    assert_eq!(pixel(&mut e, 25, 25), -1, "other blank cells stay blank");
+    assert_eq!(e.exec("tile_get_pixels", &json!({"tile": 0})).unwrap()["rows"][1][1], -1, "tile 0 stays blank");
+    assert_eq!(e.exec("tile_get_cell", &json!({"col": 0, "row": 0})).unwrap()["tile"], 1, "the cell got its own tile");
+    // Drawing again in that cell edits tile 1 rather than making another.
+    e.exec("draw_line", &json!({"x0": 2, "y0": 2, "x1": 2, "y1": 2, "color": 45})).unwrap();
+    assert_eq!(e.doc.tileset.as_ref().unwrap().tiles.len(), 2);
+}
+
+#[test]
+fn a_panic_inside_a_command_is_an_error_and_the_engine_recovers() {
+    let mut e = eng(16, 16);
+    let before = e.doc.clone();
+    let r: Result<(), String> = e.group(|e| {
+        e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4}))?;
+        e.stroke_begin(e.paint_opts(false, false))?;
+        panic!("boom")
+    });
+    assert!(r.unwrap_err().contains("internal error: boom"));
+    assert!(e.group == 0 && e.stroke.is_none() && !e.busy() && e.doc == before);
+    e.exec("layer_add", &json!({})).unwrap();
+    assert_eq!(e.exec("undo", &json!({})).unwrap()["undone"], 1);
+}
+
+#[test]
+fn wild_coordinates_are_harmless() {
+    let mut e = eng(16, 16);
+    let big = 2147483647i64;
+    let t = std::time::Instant::now();
+    e.exec("draw_line", &json!({"x0": -10, "y0": 0, "x1": big, "y1": 0, "color": 3})).unwrap();
+    assert_eq!(pixel(&mut e, 15, 0), 3);
+    e.exec("draw_line", &json!({"x0": 0, "y0": 5, "x1": 20_000_000, "y1": 5, "size": 128, "shape": "round"})).unwrap();
+    e.exec("draw_rect", &json!({"x": -big, "y": -big, "w": 9e18, "h": 9e18, "color": 4})).unwrap();
+    e.exec("draw_ellipse", &json!({"x": -big, "y": 1, "w": big, "h": big, "filled": true})).unwrap();
+    e.exec("draw_stroke", &json!({"points": [0, 0, 1e300, -1e300], "mode": "smear", "size": 64})).unwrap();
+    e.exec("select_rect", &json!({"x": 9e18, "y": 9e18, "w": 9e18, "h": 9e18})).unwrap();
+    e.exec("select_none", &json!({})).unwrap();
+    e.exec("copy", &json!({})).unwrap();
+    e.exec("paste", &json!({"x": big, "y": -big, "float": true})).unwrap();
+    e.exec("float_move", &json!({"dx": big, "dy": big})).unwrap();
+    e.exec("float_commit", &json!({})).unwrap();
+    e.exec("put_pixels", &json!({"x": 9e18, "y": 9e18, "rows": [[1, 2]]})).unwrap();
+    assert!(e.exec("export_png", &json!({"path": tmp("huge.png"), "scale": 64})).is_ok());
+    let mut big_doc = eng(4096, 4096);
+    assert!(big_doc.exec("export_png", &json!({"path": tmp("huge.png"), "scale": 64})).unwrap_err().contains("smaller scale"));
+    assert!(t.elapsed().as_secs() < 20, "took {:?}", t.elapsed());
+}
+
+#[test]
+fn crafted_project_files_are_sanitised() {
+    use crate::doc::*;
+    let mut d = Doc::new(8, 8, ColorMode::Indexed, Palette::preset("pico8").unwrap());
+    d.palette.ramps.push(Ramp { name: "bad".into(), indices: vec![3, 200, 201], cycle: true, speed: 8.0 });
+    d.tileset = Some(TileSet { tw: 4, th: 4, tiles: vec![std::sync::Arc::new(vec![TRANSP; 16])] });
+    d.layers[0].map = Some(std::sync::Arc::new(vec![900; 3]));
+    let p = tmp("crafted.jmn");
+    crate::io::save_doc(&d, std::path::Path::new(&p)).unwrap();
+    let mut e = Engine::new("headless");
+    e.exec("open_document", &json!({"path": p})).unwrap();
+    assert_eq!(e.doc.palette.ramps[0].indices, vec![3]);
+    assert_eq!(e.doc.layers[0].map.as_ref().unwrap().as_slice(), &[0u16; 4], "the tile map was rebuilt");
+    e.exec("palette_cleanup", &json!({"unused": true})).unwrap();
+    e.exec("tile_make_unique", &json!({"col": 0, "row": 0})).unwrap();
+}
+
+#[test]
+fn lua_sandbox_limits_hold() {
+    let mut e = eng(8, 8);
+    let out = script::run_lua(&mut e, "return load(string.dump(function() return 42 end))()");
+    assert!(out.error.is_some(), "string.dump is gone: {:?}", out.result);
+    let out = script::run_lua(&mut e, "local f, err = load('\\27Lua') return tostring(f) .. ' ' .. tostring(err)");
+    assert!(out.result.as_str().unwrap().starts_with("nil "), "bytecode must not load: {}", out.result);
+    assert!(script::run_lua(&mut e, "\x1bLua").error.is_some(), "a bytecode script must not load");
+    let out = script::run_lua(&mut e, "return load('return 1 + 1')() + load('return x', 'c', 't', {x = 5})()");
+    assert_eq!(out.result, json!(7), "load still works for source text: {:?}", out.error);
+    let out = script::run_lua(&mut e, "return #string.rep('x', 300 * 1024 * 1024)");
+    assert!(out.error.unwrap().contains("memory"));
+    // pcall, xpcall and coroutines cannot swallow the time limit.
+    let t = std::time::Instant::now();
+    let code = "jm.set(0, 0, 5)
+        while true do
+          pcall(function() while true do end end)
+          xpcall(function() while true do end end, function(m) return m end)
+          coroutine.resume(coroutine.create(function() while true do end end))
+        end";
+    let out = script::run_lua_limited(&mut e, code, std::time::Duration::from_millis(300));
+    assert!(out.error.unwrap().contains("time limit"));
+    assert!(t.elapsed().as_secs() < 10);
+    assert_eq!(pixel(&mut e, 0, 0), -1, "a timed-out script is rolled back");
+    let out = script::run_lua(&mut e, "local ok, err = pcall(error, 'x') return {ok, err, pcall(function() return 1, 2 end)}");
+    assert_eq!(out.result, json!([false, "x", true, 1, 2]), "pcall still behaves normally");
+}
+
+#[test]
+fn a_failed_command_under_pcall_leaves_nothing_behind() {
+    let mut e = eng(8, 8);
+    let out = script::run_lua(
+        &mut e,
+        "jm.layer_add{name='Top'} jm.layer_set{layer=0, locked=true}
+         local ok = pcall(jm.layer_merge_down, {layer=1}) return {ok=ok, layers=#jm.get_info().layers}",
+    );
+    assert_eq!(out.error, None);
+    assert_eq!(out.result, json!({"ok": false, "layers": 2}));
+    assert_eq!(e.doc.layers.len(), 2);
+}
+
+#[test]
+fn an_empty_selection_selects_nothing() {
+    let mut e = eng(32, 32);
+    e.exec("select_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4})).unwrap();
+    e.exec("select_rect", &json!({"x": 10, "y": 10, "w": 4, "h": 4, "op": "intersect"})).unwrap();
+    e.exec("selection_fill", &json!({"color": 5})).unwrap();
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 32, "h": 32, "color": 6, "filled": true})).unwrap();
+    assert_eq!((pixel(&mut e, 20, 20), pixel(&mut e, 1, 1)), (-1, -1));
+    assert_eq!(e.exec("get_info", &json!({})).unwrap()["selection"]["w"], 0);
+    e.exec("select_all", &json!({})).unwrap();
+    e.exec("select_invert", &json!({})).unwrap();
+    e.exec("selection_fill", &json!({"color": 5})).unwrap();
+    assert_eq!(pixel(&mut e, 20, 20), -1);
+    e.exec("select_none", &json!({})).unwrap();
+    assert_eq!(e.exec("get_info", &json!({})).unwrap()["selection"], Value::Null);
+}
+
+#[test]
+fn coalesced_edits_share_one_undo_step_without_eating_history() {
+    let mut e = eng(16, 16);
+    for i in 0..100 {
+        e.exec("set_pixels", &json!({"pixels": [[i % 16, i / 16, 5]]})).unwrap();
+    }
+    let (second, original) = (e.undo[1].clone(), e.doc.palette.colors[1]);
+    for i in 0..60 {
+        e.exec_coalesced("palette_set", &json!({"index": 1, "color": [i, 0, 0]}), "slider").unwrap();
+    }
+    assert_eq!(e.undo.len(), 100);
+    assert!(e.undo[0] == second, "a whole drag costs one step of a full history, not sixty");
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!(e.doc.palette.colors[1], original, "the drag is one undo step");
+
+    // A stale key must not merge a later drag with an unrelated edit made in between.
+    let mut e = eng(16, 16);
+    e.exec_coalesced("palette_set", &json!({"index": 1, "color": [10, 0, 0]}), "slider").unwrap();
+    e.exec("undo", &json!({})).unwrap();
+    e.exec("set_pixels", &json!({"pixels": [[3, 3, 7]]})).unwrap();
+    e.exec_coalesced("palette_set", &json!({"index": 1, "color": [20, 0, 0]}), "slider").unwrap();
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!(pixel(&mut e, 3, 3), 7);
+}
+
+#[test]
+fn brush_clipboard_selection_and_png_round_trip_details() {
+    let mut e = eng(16, 16);
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4, "color": 5, "filled": true})).unwrap();
+    e.exec("select_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4})).unwrap();
+    e.exec("copy", &json!({})).unwrap();
+    e.exec("paste", &json!({"x": 8, "y": 8})).unwrap();
+    assert_eq!(e.exec("get_info", &json!({})).unwrap()["selection"]["w"], 4, "paste keeps the selection");
+    e.exec("select_rect", &json!({"x": 0, "y": 0, "w": 2, "h": 2})).unwrap();
+    e.exec("grab_brush", &json!({})).unwrap();
+    assert_eq!(e.clipboard.as_ref().unwrap().w, 4, "grab_brush leaves the clipboard alone");
+    e.exec("select_none", &json!({})).unwrap();
+    e.exec("palette_swap", &json!({"a": 5, "b": 6})).unwrap();
+    e.exec("draw_line", &json!({"x0": 13, "y0": 2, "x1": 13, "y1": 2, "brush": "custom"})).unwrap();
+    assert_eq!((pixel(&mut e, 0, 0), pixel(&mut e, 13, 2)), (6, 6), "the custom brush follows palette renumbering");
+
+    let mut e = eng(8, 8);
+    e.exec("palette_load_preset", &json!({"name": "pico8"})).unwrap();
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 2, "h": 2, "color": 3})).unwrap();
+    let p = tmp("round.png");
+    e.exec("export_png", &json!({"path": p})).unwrap();
+    let info = e.exec("open_document", &json!({"path": p, "force": true})).unwrap();
+    assert_eq!(info["palette_count"], 16, "export then open keeps the palette size");
+    assert_eq!((pixel(&mut e, 0, 0), pixel(&mut e, 5, 5)), (3, -1));
+    assert!(e.exec("export_png", &json!({"path": tmp("evil.sh")})).unwrap_err().contains(".png"), "exports only write their own file type");
+    assert!(e.exec("save_document", &json!({"path": tmp("evil.txt")})).unwrap_err().contains(".jmn"));
+}
+
+#[test]
+fn mcp_token_check() {
+    assert!(remote::authorized(Some("Bearer abc123"), "abc123"));
+    assert!(!remote::authorized(Some("Bearer abc124"), "abc123"));
+    assert!(!remote::authorized(Some("abc123"), "abc123"));
+    assert!(!remote::authorized(None, "abc123"));
+}
+
 // ---------------------------------------------------------------- interactive canvas
 
 struct Rig {

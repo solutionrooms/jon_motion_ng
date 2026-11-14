@@ -6,7 +6,7 @@
 //!   running app when there is one, and otherwise works on a headless document.
 
 use crate::commands::{self, Args};
-use crate::engine::Engine;
+use crate::engine::{guarded, Engine};
 use crate::io;
 use crate::script;
 use serde_json::{json, Map, Value};
@@ -80,7 +80,7 @@ pub fn tools() -> Value {
               "command": { "type": "string", "description": "Command name from list_commands" },
               "params": { "type": "object", "description": "Named parameters for the command" } } } },
         { "name": "batch",
-          "description": "Run several commands in order as one atomic change and one undo step. If any command fails nothing is applied.",
+          "description": "Run several commands in order as one atomic change and one undo step. If any command fails the document is rolled back (files already written by save/export commands stay).",
           "inputSchema": { "type": "object", "required": ["commands"], "properties": {
               "commands": { "type": "array", "description": "Commands to run in order", "items": { "type": "object", "required": ["command"], "properties": {
                   "command": { "type": "string" }, "params": { "type": "object" } } } } } } },
@@ -131,7 +131,7 @@ fn screenshot(e: &Engine, m: &Map<String, Value>) -> Result<ToolOut, String> {
 pub fn call_tool(e: &mut Engine, name: &str, args: &Value) -> ToolOut {
     let empty = Map::new();
     let m = args.as_object().unwrap_or(&empty);
-    let r: Result<ToolOut, String> = (|| match name {
+    let r: Result<ToolOut, String> = guarded(|| match name {
         "get_info" => Ok(text(commands::info(e).to_string())),
         "list_commands" => {
             if let Some(c) = m.get("command").and_then(|v| v.as_str()) {
@@ -155,7 +155,7 @@ pub fn call_tool(e: &mut Engine, name: &str, args: &Value) -> ToolOut {
                 let mut out = vec![];
                 for (i, c) in cmds.iter().enumerate() {
                     let name = c.get("command").and_then(|v| v.as_str()).ok_or_else(|| format!("commands[{i}] has no 'command'"))?;
-                    let r = e.exec(name, c.get("params").unwrap_or(&Value::Null)).map_err(|err| format!("commands[{i}] failed, nothing was applied: {err}"))?;
+                    let r = e.exec(name, c.get("params").unwrap_or(&Value::Null)).map_err(|err| format!("commands[{i}] failed, the document was rolled back: {err}"))?;
                     out.push(r);
                 }
                 Ok(out)
@@ -168,7 +168,7 @@ pub fn call_tool(e: &mut Engine, name: &str, args: &Value) -> ToolOut {
             let mut s = out.output;
             match out.error {
                 Some(err) => {
-                    s.push_str(&format!("error (nothing was applied): {err}"));
+                    s.push_str(&format!("error (the document was rolled back): {err}"));
                     Ok(fail(s))
                 }
                 None => {
@@ -181,7 +181,7 @@ pub fn call_tool(e: &mut Engine, name: &str, args: &Value) -> ToolOut {
         }
         "screenshot" => screenshot(e, m),
         _ => Err(format!("unknown tool '{name}'")),
-    })();
+    });
     r.unwrap_or_else(fail)
 }
 
@@ -241,18 +241,76 @@ pub fn scripts_dir() -> Option<PathBuf> {
     state_file().map(|p| p.with_file_name("scripts"))
 }
 
+fn new_token() -> String {
+    // RandomState is keyed from the operating system's random source.
+    use std::hash::{BuildHasher, Hasher};
+    let rs = std::collections::hash_map::RandomState::new();
+    (0..4u64)
+        .map(|i| {
+            let mut h = rs.build_hasher();
+            h.write_u64(i);
+            h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+            format!("{:016x}", h.finish())
+        })
+        .collect()
+}
+
+fn read_token() -> Option<String> {
+    let t = std::fs::read_to_string(state_file()?.with_file_name("token")).ok()?;
+    let t = t.trim();
+    (t.len() >= 32 && t.chars().all(|c| c.is_ascii_alphanumeric())).then(|| t.to_string())
+}
+
+/// The secret an MCP client must present to the app's HTTP endpoint. It lives in
+/// ~/.jon_motion/token (readable only by the user) and is created on first use, so
+/// other users of the machine and web pages cannot drive the editor.
+pub fn auth_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        if let Some(t) = read_token() {
+            return t;
+        }
+        let t = new_token();
+        if let Some(f) = state_file().map(|f| f.with_file_name("token")) {
+            let _ = std::fs::create_dir_all(f.parent().unwrap());
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o600);
+            }
+            let _ = o.open(&f).and_then(|mut file| file.write_all(t.as_bytes()));
+        }
+        t
+    })
+}
+
+/// Does an Authorization header value carry the right token?
+pub fn authorized(header: Option<&str>, token: &str) -> bool {
+    let Some(given) = header.and_then(|h| h.strip_prefix("Bearer ")) else { return false };
+    let (a, b) = (given.trim().as_bytes(), token.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Run `f` on the live engine, waiting for the user to finish any brush stroke first.
 fn with_engine(engine: &Arc<Mutex<Engine>>, f: impl FnOnce(&mut Engine) -> ToolOut) -> ToolOut {
     let start = Instant::now();
     loop {
-        {
-            let mut g = engine.lock().unwrap_or_else(|p| p.into_inner());
+        // try_lock: the window holds the engine while a file dialog is open, and
+        // another request may be running a long script.
+        let g = match engine.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut g) = g {
             if !g.busy() {
                 return f(&mut g);
             }
         }
         if start.elapsed() > Duration::from_secs(20) {
-            return fail("the user has been mid-stroke for 20 seconds; try again shortly");
+            return fail("the editor has been busy for 20 seconds (the user is mid-stroke, has a dialog open, or a script is running); nothing was done - try again shortly");
         }
         std::thread::sleep(Duration::from_millis(4));
     }
@@ -269,6 +327,7 @@ pub fn start_http(engine: Arc<Mutex<Engine>>, wake: impl Fn() + Send + 'static) 
     let (server, port) = (BASE_PORT..BASE_PORT + 20)
         .find_map(|p| tiny_http::Server::http(("127.0.0.1", p)).ok().map(|s| (s, p)))
         .ok_or("no free port for the MCP server")?;
+    let token = auth_token();
     if let Some(f) = state_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let _ = std::fs::write(&f, json!({"port": port, "pid": std::process::id()}).to_string());
@@ -289,19 +348,27 @@ pub fn start_http(engine: Arc<Mutex<Engine>>, wake: impl Fn() + Send + 'static) 
             match (req.method().clone(), path.as_str()) {
                 (tiny_http::Method::Get, "/health") => reply(req, 200, json!({"app": "jon_motion", "pid": std::process::id()}).to_string()),
                 (tiny_http::Method::Post, "/mcp" | "/") => {
+                    let auth = req.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str().to_string());
+                    if !authorized(auth.as_deref(), token) {
+                        reply(req, 401, json!({"error": "missing or wrong token: send 'Authorization: Bearer <contents of ~/.jon_motion/token>'"}).to_string());
+                        continue;
+                    }
                     let mut body = String::new();
                     if req.as_reader().take(64 << 20).read_to_string(&mut body).is_err() {
                         reply(req, 400, "{}".into());
                         continue;
                     }
-                    let resp = handle_body(&body, &mut |name, args| {
-                        let out = with_engine(&engine, |e| call_tool(e, name, args));
-                        wake();
-                        out
+                    let resp = guarded(|| {
+                        Ok(handle_body(&body, &mut |name, args| {
+                            let out = with_engine(&engine, |e| call_tool(e, name, args));
+                            wake();
+                            out
+                        }))
                     });
                     match resp {
-                        Some(v) => reply(req, 200, v.to_string()),
-                        None => {
+                        Err(err) => reply(req, 500, json!({"error": err}).to_string()),
+                        Ok(Some(v)) => reply(req, 200, v.to_string()),
+                        Ok(None) => {
                             let _ = req.respond(tiny_http::Response::empty(202));
                         }
                     }
@@ -337,29 +404,50 @@ fn gui_port() -> Option<u16> {
     serde_json::from_str::<Value>(&s).ok()?["port"].as_u64().map(|p| p as u16)
 }
 
-fn http_post(port: u16, body: &str) -> Option<String> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(400)).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(180))).ok()?;
-    // HTTP/1.0 keeps the reply un-chunked and closes the socket when done.
-    write!(s, "POST /mcp HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).ok()?;
-    s.write_all(body.as_bytes()).ok()?;
-    let mut resp = Vec::new();
-    s.read_to_end(&mut resp).ok()?;
-    let split = resp.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let head = String::from_utf8_lossy(&resp[..split]);
-    if !head.lines().next()?.contains(" 200") {
-        return None;
-    }
-    String::from_utf8(resp[split + 4..].to_vec()).ok()
+enum Forward {
+    /// The app answered.
+    Done(ToolOut),
+    /// Nothing of ours is listening: safe to work headless instead.
+    NotRunning,
+    /// The app took the call but no usable answer came back. It must not be re-run elsewhere.
+    Failed(String),
 }
 
-/// Send a tool call to the running app. None means the app is not reachable.
-fn forward(port: u16, name: &str, args: &Value) -> Option<ToolOut> {
-    let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
-    let v: Value = serde_json::from_str(&http_post(port, &req.to_string())?).ok()?;
-    let r = v.get("result")?;
-    Some(ToolOut { content: r.get("content")?.as_array()?.clone(), is_error: r.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) })
+/// Send a tool call to the running app.
+fn forward(port: u16, name: &str, args: &Value) -> Forward {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(400)) else { return Forward::NotRunning };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(180)));
+    // HTTP/1.0 keeps the reply un-chunked and closes the socket when done.
+    let head = format!(
+        "POST /mcp HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+        auth_token(),
+        body.len()
+    );
+    if s.write_all(head.as_bytes()).and_then(|_| s.write_all(body.as_bytes())).is_err() {
+        return Forward::NotRunning;
+    }
+    let lost = || Forward::Failed("the editor did not answer (it may be showing a dialog or have been closed); the call may or may not have been applied - check with get_info".into());
+    let mut resp = Vec::new();
+    if s.read_to_end(&mut resp).is_err() {
+        return lost();
+    }
+    let Some(split) = resp.windows(4).position(|w| w == b"\r\n\r\n") else { return lost() };
+    let status = String::from_utf8_lossy(&resp[..split]).lines().next().unwrap_or("").to_string();
+    let text = String::from_utf8_lossy(&resp[split + 4..]).to_string();
+    if status.contains(" 401") {
+        return Forward::Failed("the editor refused the token in ~/.jon_motion/token; restart the editor".into());
+    }
+    if !status.contains(" 200") {
+        // 404/405: some other program owns the port (a stale gui.json).
+        return if status.contains(" 500") { Forward::Failed(format!("the editor reported an internal error: {text}")) } else { Forward::NotRunning };
+    }
+    let out = serde_json::from_str::<Value>(&text).ok().and_then(|v| {
+        let r = v.get("result")?;
+        Some(ToolOut { content: r.get("content")?.as_array()?.clone(), is_error: r.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) })
+    });
+    out.map(Forward::Done).unwrap_or_else(lost)
 }
 
 /// MCP over stdin/stdout. Tool calls go to the running app when it is open, so an
@@ -374,10 +462,11 @@ pub fn run_stdio() {
             continue;
         }
         let resp = handle_body(&line, &mut |name, args| {
-            if let Some(out) = gui_port().and_then(|p| forward(p, name, args)) {
-                return out;
+            match gui_port().map(|p| forward(p, name, args)) {
+                Some(Forward::Done(out)) => out,
+                Some(Forward::Failed(err)) => fail(err),
+                Some(Forward::NotRunning) | None => call_tool(local.get_or_insert_with(|| Engine::new("headless")), name, args),
             }
-            call_tool(local.get_or_insert_with(|| Engine::new("headless")), name, args)
         });
         if let Some(r) = resp {
             if writeln!(stdout, "{r}").and_then(|_| stdout.flush()).is_err() {

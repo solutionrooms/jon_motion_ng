@@ -135,6 +135,10 @@ pub fn run_lua(engine: &mut Engine, code: &str) -> ScriptOut {
 /// abandoned: the live document is untouched and the copy refuses further commands.
 pub fn run_lua_limited(engine: &mut Engine, code: &str, limit: Duration) -> ScriptOut {
     let fail = |msg: String| ScriptOut { output: String::new(), result: Value::Null, error: Some(msg) };
+    // Adopting a script's result under an open brush stroke would fold it into that stroke's undo step.
+    if engine.busy() {
+        return fail("busy: a stroke is in progress; finish it and run the script again".into());
+    }
     CANCEL.store(false, Ordering::Relaxed);
     let halt = Arc::new(AtomicBool::new(false));
     let mut copy = engine.fork(halt.clone());

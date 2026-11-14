@@ -383,6 +383,20 @@ fn a_save_followed_by_a_rollback_leaves_the_document_marked_modified() {
 }
 
 #[test]
+fn a_script_does_not_run_under_an_open_stroke() {
+    let mut e = eng(8, 8);
+    e.stroke_begin(e.paint_opts(false, false)).unwrap();
+    e.stroke_to(1, 1);
+    let out = script::run_lua(&mut e, "jm.set(5, 5, 9)");
+    assert!(out.error.unwrap().contains("busy"));
+    e.stroke_end();
+    assert_eq!(script::run_lua(&mut e, "jm.set(5, 5, 9)").error, None);
+    assert_eq!(e.undo.len(), 2, "the stroke and the script are separate undo steps");
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!((pixel(&mut e, 5, 5), pixel(&mut e, 1, 1)), (-1, 15));
+}
+
+#[test]
 fn mcp_token_check() {
     assert!(remote::authorized(Some("Bearer abc123"), "abc123"));
     assert!(!remote::authorized(Some("Bearer abc124"), "abc123"));

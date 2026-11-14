@@ -681,6 +681,7 @@ fn document_cmds(b: &mut B) {
             if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")) {
                 install_doc(e, doc_from_png(io::load_png(&p)?), None, false);
             } else {
+                e.path_free(&p)?;
                 install_doc(e, io::load_doc(&p)?, Some(p), false);
             }
             Ok(info(e))
@@ -697,6 +698,7 @@ fn document_cmds(b: &mut B) {
                 Some(_) => path_arg(a, "jmn")?,
                 None => e.path.clone().ok_or("the document has no file yet; pass 'path'")?,
             };
+            e.path_free(&p)?;
             io::save_doc(&e.doc, &p)?;
             e.path = Some(p.clone());
             e.mark_saved();

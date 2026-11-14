@@ -112,6 +112,8 @@ pub struct Gui {
     pub anim_name: Option<(String, String)>,
     /// While quitting: documents the user chose not to save.
     pub quit_skip: Vec<u32>,
+    /// The document the quit question on screen is about.
+    pub quit_asked: u32,
     /// The document the window last drew, to notice a change of tab.
     pub tab_seen: u32,
     /// A tab to bring to the front.
@@ -170,6 +172,7 @@ impl Gui {
             anim_size: None,
             anim_name: None,
             quit_skip: vec![],
+            quit_asked: 0,
             tab_seen: 0,
             show_tab: None,
             recent: vec![],
@@ -482,6 +485,7 @@ pub fn request(e: &mut Engine, g: &mut Gui, what: Pending) {
         Pending::CloseTab(id) if e.tab(id).is_some_and(|t| t.modified) => {
             // Show the document the question is about.
             if g.run(e, "tab_select", json!({ "id": id })).is_some() {
+                g.tab_seen = e.id;
                 g.pending = Some(what);
             }
         }
@@ -509,6 +513,8 @@ fn proceed(e: &mut Engine, g: &mut Gui, what: Pending) {
                 None => g.allow_close = true,
                 Some(id) => {
                     if g.run(e, "tab_select", json!({ "id": id })).is_some() {
+                        g.tab_seen = e.id;
+                        g.quit_asked = id;
                         g.pending = Some(Pending::Quit);
                     }
                 }
@@ -1445,6 +1451,11 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
 /// 0 saves it first, 1 goes ahead without saving, anything else cancels.
 pub fn answer(e: &mut Engine, g: &mut Gui, choice: u8) {
     let Some(what) = g.pending.take() else { return };
+    if matches!(what, Pending::Quit) && choice <= 1 && e.id != g.quit_asked {
+        // The question was about another document than the one now on show: ask again.
+        proceed(e, g, Pending::Quit);
+        return;
+    }
     match choice {
         0 => {
             if save(e, g, false) {
@@ -1562,6 +1573,15 @@ impl eframe::App for App {
             // Another document is on show: half-typed fields belonged to the last one.
             g.tab_seen = e.id;
             g.anim_name = None;
+            // So did a question or a dialog about it: answering now would act on this one.
+            if g.pending.take().is_some() {
+                g.quit_skip.clear();
+                g.status = "The document on show changed, so the question was cancelled".into();
+            }
+            if matches!(g.dialog, Dialog::Resize { .. } | Dialog::Scale { .. } | Dialog::Reduce { .. } | Dialog::Dropped(_)) {
+                g.dialog = Dialog::None;
+                g.status = "The document on show changed, so the dialog was closed".into();
+            }
         }
         if g.allow_close {
             ctx.send_viewport_cmd(ViewportCommand::Close);

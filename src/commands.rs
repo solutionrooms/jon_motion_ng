@@ -21,6 +21,9 @@ pub enum Kind {
     Paint,
     /// Any other document change.
     Edit,
+    /// Changes which documents are open or which one is active. Runs between commands only:
+    /// never inside a script or batch.
+    Tab,
 }
 
 pub struct Param {
@@ -141,7 +144,7 @@ impl Cmd {
         }
         json!({
             "name": self.name, "category": self.cat, "description": self.desc,
-            "changes_document": self.kind != Kind::Read,
+            "changes_document": matches!(self.kind, Kind::Paint | Kind::Edit),
             "params": { "type": "object", "properties": props,
                         "required": self.params.iter().filter(|p| p.req).map(|p| p.name.clone()).collect::<Vec<_>>() }
         })
@@ -196,6 +199,7 @@ pub fn registry() -> &'static Vec<Cmd> {
         tile_cmds(&mut b);
         editor_cmds(&mut b);
         animation_cmds(&mut b);
+        tab_cmds(&mut b);
         for c in &mut b.0 {
             c.float_ok = matches!(c.name, "float_move" | "float_commit" | "float_cancel" | "float_lift" | "flip" | "anim_set" | "anim_clear" | "anim_frames" | "anim_rename" | "anim_import_json");
         }
@@ -209,7 +213,7 @@ pub fn find(name: &str) -> Option<&'static Cmd> {
     idx.get(name).map(|&i| &registry()[i])
 }
 
-pub const CATEGORIES: &[&str] = &["document", "layer", "draw", "selection", "palette", "tiles", "animation", "editor"];
+pub const CATEGORIES: &[&str] = &["document", "layer", "draw", "selection", "palette", "tiles", "animation", "editor", "tabs"];
 
 /// Human/AI readable command reference.
 pub fn reference(cat: Option<&str>, search: Option<&str>) -> String {
@@ -323,6 +327,8 @@ pub fn info(e: &Engine) -> Value {
         "path": e.path.as_ref().map(|p| p.display().to_string()),
         "modified": e.modified, "undo_steps": e.undo.len(), "redo_steps": e.redo.len(),
         "host": e.host,
+        // Which of the open documents (tabs) this is.
+        "document": {"id": e.id, "name": e.title()}, "open_documents": e.tab_list().len(),
     })
 }
 
@@ -333,8 +339,9 @@ fn check_discard(e: &Engine, a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn install_doc(e: &mut Engine, doc: Doc, path: Option<PathBuf>) {
+fn install_doc(e: &mut Engine, doc: Doc, path: Option<PathBuf>, blank: bool) {
     e.replace_doc(doc);
+    e.blank = blank;
     e.o.custom_brush = None;
     e.o.active_ramp = None;
     e.o.active_tile = 0;
@@ -658,7 +665,7 @@ fn document_cmds(b: &mut B) {
             let (w, h) = (dim(a.i("width")?)?, dim(a.i("height")?)?);
             let name = a.os("palette")?.unwrap_or("default");
             let pal = Palette::preset(name).ok_or_else(|| format!("unknown palette preset '{name}' ({})", PRESETS.join(", ")))?;
-            install_doc(e, Doc::new(w, h, pal), None);
+            install_doc(e, Doc::new(w, h, pal), None, true);
             Ok(info(e))
         },
     );
@@ -672,9 +679,9 @@ fn document_cmds(b: &mut B) {
             check_discard(e, a)?;
             let p = PathBuf::from(a.s("path")?);
             if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")) {
-                install_doc(e, doc_from_png(io::load_png(&p)?), None);
+                install_doc(e, doc_from_png(io::load_png(&p)?), None, false);
             } else {
-                install_doc(e, io::load_doc(&p)?, Some(p));
+                install_doc(e, io::load_doc(&p)?, Some(p), false);
             }
             Ok(info(e))
         },
@@ -2243,6 +2250,83 @@ fn animation_cmds(b: &mut B) {
                 e.view.anim_frame = 0;
             }
             Ok(json!({"ok": true, "imported": list.len(), "count": e.doc.anims.len()}))
+        },
+    );
+}
+
+fn tab_cmds(b: &mut B) {
+    use Kind::*;
+    b.add(
+        "tabs",
+        "tab_list",
+        Read,
+        "",
+        "The open documents (tabs) in order: id, name, path, modified, width, height and which one is active. Every other command works on the active document.",
+        |e, _| Ok(json!({"active": e.id, "tabs": e.tab_list()})),
+    );
+    b.add(
+        "tabs",
+        "tab_new",
+        Tab,
+        "width:int? Width in pixels (default: the active document's); height:int? Height in pixels (default: the active document's); \
+         palette:str? Palette preset name (default 'default'); reuse_blank:bool? Use the active tab instead when it is a blank document nobody has touched",
+        "Open a blank document in a new tab and make it active. Nothing is replaced, so nothing is lost. Up to 32 documents can be open. \
+         Tab commands cannot be used inside a script or batch, which work on one document from start to finish.",
+        |e, a| {
+            let p = json!({"width": a.oi("width")?.unwrap_or(e.doc.w as i64), "height": a.oi("height")?.unwrap_or(e.doc.h as i64),
+                           "palette": a.os("palette")?.unwrap_or("default"), "force": true});
+            if a.b("reuse_blank")? && e.pristine() {
+                e.exec("new_document", &p)?;
+                return Ok(json!({"id": e.id, "reused": true}));
+            }
+            let mut t = Engine::new(e.host);
+            t.exec("new_document", &p)?;
+            Ok(json!({"id": e.tab_add(t)?}))
+        },
+    );
+    b.add(
+        "tabs",
+        "tab_open",
+        Tab,
+        "path:str A .jmn project or a .png image; reuse_blank:bool? Use the active tab instead when it is a blank document nobody has touched",
+        "Open a file in a new tab and make it active. If that project is already open, its tab is made active instead (already_open is true) and it is not reloaded.",
+        |e, a| {
+            let p = PathBuf::from(a.s("path")?);
+            if let Some(id) = e.tab_with_path(&p) {
+                e.tab_select(id)?;
+                return Ok(json!({"id": id, "already_open": true}));
+            }
+            let open = json!({"path": a.s("path")?, "force": true});
+            if a.b("reuse_blank")? && e.pristine() {
+                e.exec("open_document", &open)?;
+                return Ok(json!({"id": e.id, "reused": true}));
+            }
+            if e.order.len() >= MAX_TABS {
+                return Err(format!("{MAX_TABS} documents are open, which is the limit; close one first"));
+            }
+            let mut t = Engine::new(e.host);
+            t.exec("open_document", &open)?;
+            Ok(json!({"id": e.tab_add(t)?}))
+        },
+    );
+    b.add("tabs", "tab_select", Tab, "id:int The document's id (see tab_list)", "Make another open document the active one. Its own undo history, selection, view and colours come with it.", |e, a| {
+        e.tab_select(a.i("id")?.clamp(0, u32::MAX as i64) as u32)?;
+        Ok(json!({"active": e.id}))
+    });
+    b.add(
+        "tabs",
+        "tab_close",
+        Tab,
+        "id:int? The document's id (default: the active one); force:bool? Discard unsaved changes",
+        "Close a document. One with unsaved changes is refused unless force is true. Closing the last one leaves a blank document.",
+        |e, a| {
+            let id = a.oi("id")?.map(|i| i.clamp(0, u32::MAX as i64) as u32).unwrap_or(e.id);
+            let t = e.tab(id).ok_or_else(|| format!("no open document has id {id} (see tab_list)"))?;
+            if t.modified && !a.b("force")? {
+                return Err(format!("document {id} ({}) has unsaved changes; save it first, or pass force=true to discard them", t.title()));
+            }
+            e.tab_close(id)?;
+            Ok(json!({"active": e.id, "open_documents": e.order.len()}))
         },
     );
 }

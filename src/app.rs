@@ -46,6 +46,8 @@ pub enum Pending {
     Open,
     /// Open this file (from File > Open Recent).
     OpenFile(PathBuf),
+    /// Close the document (tab) with this id.
+    CloseTab(u32),
     Quit,
 }
 
@@ -108,6 +110,10 @@ pub struct Gui {
     pub anim_size: Option<(u32, u32)>,
     /// The animation's name while it is being typed in the Animation tab.
     pub anim_name: Option<String>,
+    /// While quitting: documents the user chose not to save.
+    pub quit_skip: Vec<u32>,
+    /// The document the window last drew, to notice a change of tab.
+    pub tab_seen: u32,
     /// A tab to bring to the front.
     pub show_tab: Option<Tab>,
     /// Files opened or saved from this window, newest first. Window state only: no command,
@@ -163,6 +169,8 @@ impl Gui {
             anim_clock: 0.0,
             anim_size: None,
             anim_name: None,
+            quit_skip: vec![],
+            tab_seen: 0,
             show_tab: None,
             recent: vec![],
             recent_dirty: false,
@@ -397,10 +405,11 @@ fn open(e: &mut Engine, g: &mut Gui) {
     }
 }
 
-/// Open a file the user chose; any unsaved changes have already been dealt with.
+/// Open a file the user chose, in a new tab (or in place of an untouched blank document). A
+/// project that is already open is shown instead of being loaded a second time.
 fn open_path(e: &mut Engine, g: &mut Gui, p: &Path) {
-    if g.run(e, "open_document", json!({ "path": p.display().to_string(), "force": true })).is_some() {
-        g.info(format!("Opened {}", p.display()));
+    if let Some(v) = g.run(e, "tab_open", json!({ "path": p.display().to_string(), "reuse_blank": true })) {
+        g.info(if v["already_open"] == true { format!("{} is already open", p.display()) } else { format!("Opened {}", p.display()) });
         g.remember(p);
     }
 }
@@ -465,11 +474,22 @@ fn export(e: &mut Engine, g: &mut Gui, command: &str, ext: &str, suffix: &str, e
     }
 }
 
+/// Something the user asked for that may need a question first. New documents and opened
+/// files go in their own tab, so nothing is lost and nothing is asked; closing a tab or
+/// quitting asks about each document with unsaved changes.
 pub fn request(e: &mut Engine, g: &mut Gui, what: Pending) {
-    if e.modified {
-        g.pending = Some(what);
-    } else {
-        proceed(e, g, what);
+    match what {
+        Pending::CloseTab(id) if e.tab(id).is_some_and(|t| t.modified) => {
+            // Show the document the question is about.
+            if g.run(e, "tab_select", json!({ "id": id })).is_some() {
+                g.pending = Some(what);
+            }
+        }
+        Pending::Quit => {
+            g.quit_skip.clear();
+            proceed(e, g, what);
+        }
+        _ => proceed(e, g, what),
     }
 }
 
@@ -478,7 +498,67 @@ fn proceed(e: &mut Engine, g: &mut Gui, what: Pending) {
         Pending::New => g.dialog = Dialog::New { w: e.doc.w, h: e.doc.h, preset: 0 },
         Pending::Open => open(e, g),
         Pending::OpenFile(p) => open_path(e, g, &p),
-        Pending::Quit => g.allow_close = true,
+        Pending::CloseTab(id) => {
+            g.run(e, "tab_close", json!({ "id": id, "force": true }));
+        }
+        // Quit once no document is left with unsaved changes the user has not waved through;
+        // until then, show the next one and ask.
+        Pending::Quit => {
+            let unsaved = |id: &u32| !g.quit_skip.contains(id) && e.tab(*id).is_some_and(|t| t.modified);
+            match [e.id].iter().chain(e.order.iter()).copied().find(|id| unsaved(id)) {
+                None => g.allow_close = true,
+                Some(id) => {
+                    if g.run(e, "tab_select", json!({ "id": id })).is_some() {
+                        g.pending = Some(Pending::Quit);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Step to the next or previous tab.
+fn tab_step(e: &mut Engine, g: &mut Gui, by: i32) {
+    let n = e.order.len() as i32;
+    if let Some(i) = e.order.iter().position(|&id| id == e.id).filter(|_| n > 1) {
+        let id = e.order[(i as i32 + by).rem_euclid(n) as usize];
+        g.run(e, "tab_select", json!({ "id": id }));
+    }
+}
+
+/// The row of open documents under the tool options.
+fn tab_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui, modal: bool) {
+    let (mut select, mut close, mut add) = (None, None, false);
+    ui.add_enabled_ui(!modal, |ui| {
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                for t in e.tab_list() {
+                    let (id, active) = (t["id"].as_u64().unwrap_or(0) as u32, t["active"] == true);
+                    // A file name can hold anything; the tab shows a short, single-line form of it.
+                    let name: String = t["name"].as_str().unwrap_or("").chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+                    let name = if name.chars().count() > 28 { format!("{}...", name.chars().take(25).collect::<String>()) } else { name };
+                    let label = format!("{name}{}", if t["modified"] == true { " *" } else { "" });
+                    let r = ui.selectable_label(active, label).on_hover_text(t["path"].as_str().unwrap_or("Not saved yet"));
+                    if r.clicked() && !active {
+                        select = Some(id);
+                    }
+                    if r.middle_clicked() || ui.small_button("x").on_hover_text("Close this document (Cmd+W)").clicked() {
+                        close = Some(id);
+                    }
+                    ui.separator();
+                }
+                add = ui.button("+").on_hover_text("New document in a new tab (Cmd+N)").clicked();
+            });
+        });
+    });
+    if let Some(id) = select {
+        g.run(e, "tab_select", json!({ "id": id }));
+    }
+    if let Some(id) = close {
+        request(e, g, Pending::CloseTab(id));
+    }
+    if add {
+        request(e, g, Pending::New);
     }
 }
 
@@ -621,8 +701,16 @@ pub fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     if hit(cmd, Key::O) {
         request(e, g, Pending::Open);
     }
-    if hit(cmd, Key::N) {
+    if hit(cmd, Key::N) || hit(cmd, Key::T) {
         request(e, g, Pending::New);
+    }
+    if hit(cmd, Key::W) {
+        request(e, g, Pending::CloseTab(e.id));
+    }
+    if hit(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab) {
+        tab_step(e, g, -1);
+    } else if hit(Modifiers::CTRL, Key::Tab) {
+        tab_step(e, g, 1);
     }
     if ctx.wants_keyboard_input() || e.busy() {
         return;
@@ -841,6 +929,9 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
                 request(e, g, Pending::Open);
             }
             ui.menu_button("Open Recent", |ui| recent_menu(ui, e, g));
+            if item(ui, "Close Tab", "Cmd+W") {
+                request(e, g, Pending::CloseTab(e.id));
+            }
             ui.separator();
             if item(ui, "Save", "Cmd+S") {
                 save(e, g, false);
@@ -1147,8 +1238,8 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             });
             let (ok, cancel) = buttons(ui, "Create");
             if ok {
-                let p = json!({ "width": *w, "height": *h, "palette": PRESETS[*preset], "force": true });
-                close = g.run(e, "new_document", p).is_some();
+                let p = json!({ "width": *w, "height": *h, "palette": PRESETS[*preset], "reuse_blank": true });
+                close = g.run(e, "tab_new", p).is_some();
             }
             close |= cancel;
         }),
@@ -1258,6 +1349,9 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
                     }
                 }
                 for (a, b) in [
+                    ("New document / open, each in a tab", "Cmd/Ctrl + N (or T) / Cmd/Ctrl + O"),
+                    ("Close tab", "Cmd/Ctrl + W, or middle-click the tab"),
+                    ("Next / previous tab", "Ctrl + Tab / Ctrl + Shift + Tab"),
                     ("Draw with background colour", "Right mouse button"),
                     ("Pick colour while drawing", "Alt + click"),
                     ("Pan", "Space + drag, or middle mouse"),
@@ -1318,6 +1412,11 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
         g.dialog = dialog;
     }
 
+    // The question is about the document on show; if that is no longer the one being closed
+    // (another was opened meanwhile), the request is dropped.
+    if matches!(g.pending, Some(Pending::CloseTab(id)) if id != e.id) {
+        g.pending = None;
+    }
     if let Some(what) = g.pending.take() {
         let mut choice = None;
         window(ctx, "Unsaved Changes", |ui| {
@@ -1335,16 +1434,30 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
                 }
             });
         });
-        match choice {
-            None => g.pending = Some(what),
-            Some(0) => {
-                if save(e, g, false) {
-                    proceed(e, g, what);
-                }
-            }
-            Some(1) => proceed(e, g, what),
-            _ => {}
+        g.pending = Some(what);
+        if let Some(c) = choice {
+            answer(e, g, c);
         }
+    }
+}
+
+/// The user's answer to the unsaved-changes question about the document on show:
+/// 0 saves it first, 1 goes ahead without saving, anything else cancels.
+pub fn answer(e: &mut Engine, g: &mut Gui, choice: u8) {
+    let Some(what) = g.pending.take() else { return };
+    match choice {
+        0 => {
+            if save(e, g, false) {
+                proceed(e, g, what);
+            }
+        }
+        1 => {
+            if matches!(what, Pending::Quit) {
+                g.quit_skip.push(e.id);
+            }
+            proceed(e, g, what);
+        }
+        _ => g.quit_skip.clear(),
     }
 }
 
@@ -1438,9 +1551,17 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
             g.title = title;
         }
-        if ctx.input(|i| i.viewport().close_requested()) && e.modified && !g.allow_close {
+        if ctx.input(|i| i.viewport().close_requested()) && !g.allow_close && (e.modified || e.parked.iter().any(|p| p.modified)) {
+            // Every document with unsaved changes is asked about, not only the one on show.
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            g.pending = Some(Pending::Quit);
+            if matches!(g.dialog, Dialog::None) {
+                request(e, g, Pending::Quit);
+            }
+        }
+        if e.id != g.tab_seen {
+            // Another document is on show: half-typed fields belonged to the last one.
+            g.tab_seen = e.id;
+            g.anim_name = None;
         }
         if g.allow_close {
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -1459,6 +1580,7 @@ impl eframe::App for App {
         }
         egui::TopBottomPanel::top("menu").show(ctx, |ui| menu_bar(ui, e, g));
         egui::TopBottomPanel::top("options").exact_height(34.0).show(ctx, |ui| panels::options(ui, e, g));
+        egui::TopBottomPanel::top("tabs").exact_height(28.0).show(ctx, |ui| tab_bar(ui, e, g, modal));
         egui::TopBottomPanel::bottom("status").exact_height(24.0).show(ctx, |ui| panels::status(ui, e, g));
         egui::SidePanel::left("tools").exact_width(46.0).resizable(false).show(ctx, |ui| panels::toolbar(ui, e, g));
         if let Some(at) = g.show_tab.take().and_then(|t| self.dock.find_tab(&t)) {

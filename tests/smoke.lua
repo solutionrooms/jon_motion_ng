@@ -194,6 +194,12 @@ jm.anim_clear{ name = "jump" }; eq(#jm.anim_list().animations, 1)
 jm.anim_clear{}; eq(jm.anim_info().active, false)
 fails(function() jm.anim_control{ step = 1 } end, "no animation")
 
+-- tabs: a script sees the open documents but works on the one it started on
+local tl = jm.tab_list()
+eq(#tl.tabs >= 1, true); eq(tl.tabs[1].active ~= nil, true); eq(jm.get_info().document.id, tl.active)
+fails(function() jm.tab_new{} end, "a script cannot change tabs")
+fails(function() jm.tab_select{ id = tl.active + 1 } end, "a script cannot change tabs")
+
 -- editor state
 jm.set_options{ tool = "line", brush_size = 5, mode = "smooth", symmetry = "xy" }
 eq(jm.get_options().brush_size, 5)

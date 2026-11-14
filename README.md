@@ -74,8 +74,15 @@ Help > Keyboard Shortcuts lists the keys. Help > Keyboard Preset switches the si
 standard set and **Deluxe Paint** keys (`d` draw, `v` line, `r`/`R` rectangle, `[` `]` colours, `F1`-`F8` modes...);
 the choice is remembered in `~/.jon_motion/settings.json`.
 
-Drag a `.jmn` or `.png` file onto the window (one at a time). A project opens, asking about unsaved changes
-first; for a PNG you choose between opening it and adding it to the current document as a layer.
+**Tabs** - several documents can be open at once (up to 32), each in its own tab with its own undo history,
+file, selection, view, colours and animations; the tool in hand and the clipboard go with you from tab to tab,
+so you can copy in one and paste in another. File > New, Open, Open Recent and a dropped file each open in a new tab
+(an untouched blank document is replaced instead), and a project that is already open is shown rather than loaded
+twice. Cmd/Ctrl+W or the tab's **x** closes a tab; Ctrl+Tab moves between them. Closing a tab, or quitting, asks about
+every document that has unsaved changes. Each open document keeps its own undo history in memory.
+
+Drag a `.jmn` or `.png` file onto the window (one at a time). A project opens in a tab; for a PNG you choose
+between opening it and adding it to the current document as a layer.
 
 File > Open Recent lists the last 10 files opened or saved from the window (not ones a script or AI client
 opened). The list lives in `~/.jon_motion/settings.json` (created private to your account on macOS and Linux;
@@ -94,7 +101,8 @@ for x = 0, 63 do jm.set(x, 0, x % 16) end          -- fast pixel access: jm.get 
 print(jm.get_info().width)
 ```
 
-A script is atomic and one undo step: if it raises an error, the document is rolled back. Scripts are
+A script is atomic and one undo step: if it raises an error, the document is rolled back. It works on one
+document - the tab that was active when it started - and cannot open, close or switch tabs (`jm.tab_list()` shows them). Scripts are
 sandboxed: no `io`/`os` libraries, a 60 s time limit and a 256 MB memory limit. The only files a script
 can touch are through the document commands, which read `.jmn`/`.png`/`.json` and write `.jmn`/`.png`/`.csv`,
 plus `.json` for animations (never over a file that is not an animations file).
@@ -114,6 +122,10 @@ claude mcp add jon-motion -- /path/to/jon_motion mcp
 - If the editor window is open, the AI works on **your live document**. Its calls run between your
   brush strokes (never during one), you see each change as it lands, and each call is one undo step.
 - If the editor is not open, the same command works on a headless document (`save_document` to keep it).
+- With several tabs open, tools work on the **active tab** and each answer says which document that was. Pass
+  `"document": <id>` (ids from `tab_list` / `get_info`) to keep working on one document whatever the user is
+  looking at; their view does not change. `tab_new`, `tab_open`, `tab_select` and `tab_close` manage tabs
+  (not inside `batch` or `run_lua`). `new_document` / `open_document` still replace the active document.
 - The window also serves MCP directly at `http://127.0.0.1:47800/mcp` (port shown in the status bar;
   Help > AI / MCP Setup has copy-paste commands). It listens on localhost only and requires the token
   in `~/.jon_motion/token` as an `Authorization: Bearer` header, so other users of the machine and web

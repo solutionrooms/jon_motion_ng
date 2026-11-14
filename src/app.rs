@@ -29,10 +29,10 @@ pub enum Tab {
 
 pub enum Dialog {
     None,
-    New { w: u32, h: u32, rgba: bool, preset: usize },
+    New { w: u32, h: u32, preset: usize },
     Resize { w: u32, h: u32, anchor: usize },
     Scale { w: u32, h: u32 },
-    Convert { rgba: bool, colors: u32, dither: usize, generate: bool },
+    Reduce { colors: u32, dither: usize, generate: bool },
     Shortcuts,
     Mcp,
 }
@@ -351,7 +351,7 @@ fn request(e: &mut Engine, g: &mut Gui, what: Pending) {
 
 fn proceed(e: &mut Engine, g: &mut Gui, what: Pending) {
     match what {
-        Pending::New => g.dialog = Dialog::New { w: e.doc.w, h: e.doc.h, rgba: e.doc.mode == ColorMode::Rgba, preset: 0 },
+        Pending::New => g.dialog = Dialog::New { w: e.doc.w, h: e.doc.h, preset: 0 },
         Pending::Open => open(e, g),
         Pending::Quit => g.allow_close = true,
     }
@@ -376,7 +376,7 @@ fn paste_from_system(e: &mut Engine, g: &mut Gui) {
         return g.error("clipboard image is too large");
     }
     let data = img.bytes.chunks_exact(4).map(|c| e.doc.from_rgba([c[0], c[1], c[2], c[3]])).collect();
-    e.clipboard = Some(Clip { x: 0, y: 0, w: img.width as u32, h: img.height as u32, data, mode: e.doc.mode, pal: e.doc.palette.colors.clone() });
+    e.clipboard = Some(Clip { x: 0, y: 0, w: img.width as u32, h: img.height as u32, data, pal: e.doc.palette.colors.clone() });
     if g.run(e, "paste", json!({ "float": true })).is_some() {
         e.o.tool = Tool::Move;
         g.info("Pasted from the system clipboard - drag to place, Enter to commit");
@@ -639,8 +639,8 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if item(ui, "Scale Image...", "") {
                 g.dialog = Dialog::Scale { w: e.doc.w, h: e.doc.h };
             }
-            if item(ui, "Colour Mode / Reduce Colours...", "") {
-                g.dialog = Dialog::Convert { rgba: e.doc.mode == ColorMode::Rgba, colors: e.doc.palette.colors.len().min(256) as u32, dither: 0, generate: true };
+            if item(ui, "Reduce Colours...", "") {
+                g.dialog = Dialog::Reduce { colors: e.doc.palette.colors.len().min(256) as u32, dither: 0, generate: true };
             }
             ui.separator();
             if item(ui, "Flip Horizontal", "") {
@@ -820,7 +820,7 @@ fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     let mut close = false;
     match &mut dialog {
         Dialog::None => {}
-        Dialog::New { w, h, rgba, preset } => window(ctx, "New Document", |ui| {
+        Dialog::New { w, h, preset } => window(ctx, "New Document", |ui| {
             size_fields(ui, w, h);
             ui.horizontal(|ui| {
                 for (label, pw, ph) in [("16", 16, 16), ("32", 32, 32), ("64", 64, 64), ("128", 128, 128), ("256", 256, 256), ("320x240", 320, 240)] {
@@ -831,11 +831,6 @@ fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label("Colour");
-                ui.selectable_value(rgba, false, "Indexed (256)");
-                ui.selectable_value(rgba, true, "True colour");
-            });
-            ui.horizontal(|ui| {
                 ui.label("Palette");
                 egui::ComboBox::from_id_salt("preset").selected_text(PRESETS[*preset]).show_ui(ui, |ui| {
                     for (i, p) in PRESETS.iter().enumerate() {
@@ -845,7 +840,7 @@ fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             });
             let (ok, cancel) = buttons(ui, "Create");
             if ok {
-                let p = json!({ "width": *w, "height": *h, "mode": if *rgba { "rgba" } else { "indexed" }, "palette": PRESETS[*preset], "force": true });
+                let p = json!({ "width": *w, "height": *h, "palette": PRESETS[*preset], "force": true });
                 close = g.run(e, "new_document", p).is_some();
             }
             close |= cancel;
@@ -886,28 +881,22 @@ fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             }
             close |= cancel;
         }),
-        Dialog::Convert { rgba, colors, dither, generate } => window(ctx, "Colour Mode", |ui| {
+        Dialog::Reduce { colors, dither, generate } => window(ctx, "Reduce Colours", |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(rgba, false, "Indexed");
-                ui.selectable_value(rgba, true, "True colour");
+                ui.selectable_value(generate, true, "Build palette from image");
+                ui.selectable_value(generate, false, "Use current palette");
             });
-            ui.add_enabled_ui(!*rgba, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(generate, true, "Build palette from image");
-                    ui.selectable_value(generate, false, "Use current palette");
-                });
-                ui.add_enabled(*generate, egui::Slider::new(colors, 2..=256).text("colours"));
-                ui.horizontal(|ui| {
-                    ui.label("Dither");
-                    for (i, d) in ["None", "Ordered", "Floyd-Steinberg"].iter().enumerate() {
-                        ui.selectable_value(dither, i, *d);
-                    }
-                });
+            ui.add_enabled(*generate, egui::Slider::new(colors, 2..=256).text("colours"));
+            ui.horizontal(|ui| {
+                ui.label("Dither");
+                for (i, d) in ["None", "Ordered", "Floyd-Steinberg"].iter().enumerate() {
+                    ui.selectable_value(dither, i, *d);
+                }
             });
-            let (ok, cancel) = buttons(ui, "Convert");
+            let (ok, cancel) = buttons(ui, "Reduce");
             if ok {
-                let p = json!({ "mode": if *rgba { "rgba" } else { "indexed" }, "colors": *colors, "dither": DITHERS[*dither], "palette": if *generate { "generate" } else { "current" } });
-                close = g.run(e, "convert_mode", p).is_some();
+                let p = json!({ "colors": *colors, "dither": DITHERS[*dither], "palette": if *generate { "generate" } else { "current" } });
+                close = g.run(e, "reduce_colors", p).is_some();
             }
             close |= cancel;
         }),

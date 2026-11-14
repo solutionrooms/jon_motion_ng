@@ -3,52 +3,23 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// One pixel. Indexed mode: palette index 0..=255, or `TRANSP`.
-/// RGBA mode: little-endian packed [r, g, b, a]; alpha 0 is stored as 0.
+/// One pixel: a palette index 0..=255, or `TRANSP`.
 pub type Cell = u32;
 pub const TRANSP: Cell = 256;
 pub const MAX_DIM: u32 = 4096;
 
+/// Kept for the project file format only. Documents are always indexed; `Rgba`
+/// appears in files written by 0.1.x true-colour documents, which are converted to
+/// indexed when they are opened (see `io::load_doc`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum ColorMode {
     Indexed,
     Rgba,
 }
 
-impl ColorMode {
-    pub fn name(self) -> &'static str {
-        match self {
-            ColorMode::Indexed => "indexed",
-            ColorMode::Rgba => "rgba",
-        }
-    }
-    pub fn parse(s: &str) -> Option<ColorMode> {
-        match s.to_ascii_lowercase().as_str() {
-            "indexed" | "index" | "palette" => Some(ColorMode::Indexed),
-            "rgba" | "rgb" | "truecolor" | "true" => Some(ColorMode::Rgba),
-            _ => None,
-        }
-    }
-}
-
 #[inline]
-pub fn cell_empty(mode: ColorMode, c: Cell) -> bool {
-    match mode {
-        ColorMode::Indexed => c >= 256,
-        ColorMode::Rgba => c >> 24 == 0,
-    }
-}
-#[inline]
-pub fn pack(c: [u8; 4]) -> Cell {
-    if c[3] == 0 {
-        0
-    } else {
-        u32::from_le_bytes(c)
-    }
-}
-#[inline]
-pub fn unpack(c: Cell) -> [u8; 4] {
-    c.to_le_bytes()
+pub fn cell_empty(c: Cell) -> bool {
+    c >= 256
 }
 pub fn luma(c: [u8; 3]) -> i32 {
     (c[0] as i32 * 299 + c[1] as i32 * 587 + c[2] as i32 * 114) / 1000
@@ -273,6 +244,8 @@ pub struct Layer {
     pub id: u32,
     pub name: String,
     pub visible: bool,
+    /// Kept for the project file format only: layers are always opaque, and this is
+    /// reset to 255 when a file is loaded.
     pub opacity: u8,
     pub locked: bool,
     pub alpha_lock: bool,
@@ -307,6 +280,7 @@ pub struct Float {
 pub struct Doc {
     pub w: u32,
     pub h: u32,
+    /// Always `Indexed` once loaded; see `ColorMode`.
     pub mode: ColorMode,
     pub palette: Palette,
     pub layers: Vec<Layer>,
@@ -318,34 +292,12 @@ pub struct Doc {
     pub next_id: u32,
 }
 
-#[inline]
-pub fn blend(dst: &mut [u8], s: [u8; 4], opacity: u32) {
-    let sa = s[3] as u32 * opacity / 255;
-    if sa == 0 {
-        return;
-    }
-    let da = dst[3] as u32;
-    if sa == 255 || da == 0 {
-        dst[0] = s[0];
-        dst[1] = s[1];
-        dst[2] = s[2];
-        dst[3] = sa as u8;
-        return;
-    }
-    let db = da * (255 - sa) / 255;
-    let oa = sa + db;
-    for i in 0..3 {
-        dst[i] = ((s[i] as u32 * sa + dst[i] as u32 * db) / oa) as u8;
-    }
-    dst[3] = oa as u8;
-}
-
 impl Doc {
-    pub fn new(w: u32, h: u32, mode: ColorMode, palette: Palette) -> Doc {
+    pub fn new(w: u32, h: u32, palette: Palette) -> Doc {
         let mut d = Doc {
             w,
             h,
-            mode,
+            mode: ColorMode::Indexed,
             palette,
             layers: vec![],
             active: 0,
@@ -361,27 +313,19 @@ impl Doc {
     pub fn len(&self) -> usize {
         (self.w * self.h) as usize
     }
-    pub fn empty(&self) -> Cell {
-        match self.mode {
-            ColorMode::Indexed => TRANSP,
-            ColorMode::Rgba => 0,
-        }
-    }
-    pub fn is_empty(&self, c: Cell) -> bool {
-        cell_empty(self.mode, c)
-    }
     pub fn to_rgba(&self, c: Cell) -> [u8; 4] {
-        match self.mode {
-            ColorMode::Indexed if c >= 256 => [0, 0, 0, 0],
-            ColorMode::Indexed => self.palette.rgba(c as usize),
-            ColorMode::Rgba => unpack(c),
+        if c >= 256 {
+            [0, 0, 0, 0]
+        } else {
+            self.palette.rgba(c as usize)
         }
     }
+    /// The nearest palette colour (transparent for mostly transparent input).
     pub fn from_rgba(&self, c: [u8; 4]) -> Cell {
-        match self.mode {
-            ColorMode::Indexed if c[3] < 128 => TRANSP,
-            ColorMode::Indexed => self.palette.nearest([c[0], c[1], c[2]]) as Cell,
-            ColorMode::Rgba => pack(c),
+        if c[3] < 128 {
+            TRANSP
+        } else {
+            self.palette.nearest([c[0], c[1], c[2]]) as Cell
         }
     }
     pub fn new_layer(&mut self, name: &str) -> Layer {
@@ -394,15 +338,14 @@ impl Doc {
             opacity: 255,
             locked: false,
             alpha_lock: false,
-            data: Arc::new(vec![self.empty(); self.len()]),
+            data: Arc::new(vec![TRANSP; self.len()]),
             map: None,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn blend_cells(&self, out: &mut [u8], cells: &[Cell], ox: i32, oy: i32, cw: i32, ch: i32, op: u8, pal: &[[u8; 3]]) {
+    fn put_cells(&self, out: &mut [u8], cells: &[Cell], ox: i32, oy: i32, cw: i32, ch: i32, pal: &[[u8; 3]]) {
         let (w, h) = (self.w as i32, self.h as i32);
-        let op = op as u32;
         for cy in 0..ch {
             let y = oy + cy;
             if y < 0 || y >= h {
@@ -414,18 +357,12 @@ impl Doc {
                     continue;
                 }
                 let c = cells[(cy * cw + cx) as usize];
-                let s = match self.mode {
-                    ColorMode::Indexed => {
-                        if c >= 256 {
-                            continue;
-                        }
-                        let p = pal.get(c as usize).copied().unwrap_or([0, 0, 0]);
-                        [p[0], p[1], p[2], 255]
-                    }
-                    ColorMode::Rgba => unpack(c),
-                };
+                if c >= 256 {
+                    continue;
+                }
+                let p = pal.get(c as usize).copied().unwrap_or([0, 0, 0]);
                 let o = ((y * w + x) * 4) as usize;
-                blend(&mut out[o..o + 4], s, op);
+                out[o..o + 4].copy_from_slice(&[p[0], p[1], p[2], 255]);
             }
         }
     }
@@ -449,36 +386,27 @@ impl Doc {
                 None if !l.visible => continue,
                 _ => {}
             }
-            self.blend_cells(&mut out, &l.data, 0, 0, w as i32, h as i32, l.opacity, pal);
+            self.put_cells(&mut out, &l.data, 0, 0, w as i32, h as i32, pal);
             if li == self.active {
                 if let Some(f) = &self.float {
-                    self.blend_cells(&mut out, &f.data, f.x, f.y, f.w as i32, f.h as i32, l.opacity, pal);
+                    self.put_cells(&mut out, &f.data, f.x, f.y, f.w as i32, f.h as i32, pal);
                 }
             }
         }
         out
     }
 
-    /// Flattened cells in document colour mode (indexed: topmost opaque cell wins).
+    /// Flattened cells: the topmost visible non-transparent pixel wins.
     pub fn flat_cells(&self) -> Vec<Cell> {
-        match self.mode {
-            ColorMode::Indexed => {
-                let mut out = vec![TRANSP; self.len()];
-                for l in self.layers.iter().filter(|l| l.visible) {
-                    for (o, &c) in out.iter_mut().zip(l.data.iter()) {
-                        if c < 256 {
-                            *o = c;
-                        }
-                    }
+        let mut out = vec![TRANSP; self.len()];
+        for l in self.layers.iter().filter(|l| l.visible) {
+            for (o, &c) in out.iter_mut().zip(l.data.iter()) {
+                if c < 256 {
+                    *o = c;
                 }
-                out
             }
-            ColorMode::Rgba => self
-                .composite(&self.palette.colors, None, false)
-                .chunks_exact(4)
-                .map(|c| pack([c[0], c[1], c[2], c[3]]))
-                .collect(),
         }
+        out
     }
 
     pub fn sel_at(&self, x: i32, y: i32) -> bool {
@@ -511,7 +439,7 @@ impl Doc {
     /// Inclusive bounds of a layer's non-empty pixels.
     pub fn layer_bounds(&self, li: usize) -> Option<(i32, i32, i32, i32)> {
         let d = &self.layers[li].data;
-        self.bounds_of(|i| !cell_empty(self.mode, d[i]))
+        self.bounds_of(|i| !cell_empty(d[i]))
     }
 
     /// Cut the selection (or the whole layer content) out of the active layer into a float.
@@ -526,7 +454,7 @@ impl Doc {
             None => self.layer_bounds(li).ok_or("nothing to move on this layer")?,
         };
         let (fw, fh) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
-        let empty = self.empty();
+        let empty = TRANSP;
         let w = self.w as usize;
         let old = self.layers[li].data.clone();
         let old_sel = self.selection.clone();
@@ -561,7 +489,7 @@ impl Doc {
     /// Stamp the float into the active layer. Returns true if there was one.
     pub fn float_commit(&mut self) -> bool {
         let Some(f) = self.float.take() else { return false };
-        let (w, h, mode) = (self.w as i32, self.h as i32, self.mode);
+        let (w, h) = (self.w as i32, self.h as i32);
         let a = self.active.min(self.layers.len() - 1);
         let data = Arc::make_mut(&mut self.layers[a].data);
         let mut sel = f.sel.as_ref().map(|_| vec![0u8; (w * h) as usize]);
@@ -574,7 +502,7 @@ impl Doc {
                 }
                 let fi = (fy * f.w as i32 + fx) as usize;
                 let c = f.data[fi];
-                if !cell_empty(mode, c) {
+                if !cell_empty(c) {
                     data[(y * w + x) as usize] = c;
                 }
                 if let (Some(s), Some(fs)) = (sel.as_mut(), f.sel.as_ref()) {

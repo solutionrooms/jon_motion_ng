@@ -1,7 +1,6 @@
 //! The drawing canvas: view transform, overlays and interactive tools.
 
 use crate::app::{Drag, Gui, ACCENT};
-use crate::doc::*;
 use crate::engine::*;
 use crate::paint::{Brush, PaintMode};
 use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Sense, Shape, Stroke, StrokeKind};
@@ -21,7 +20,7 @@ pub fn step_zoom(z: f32, dir: i32) -> f32 {
 /// Refresh the composited canvas texture when the document or display palette changed.
 pub fn update_texture(ctx: &egui::Context, e: &Engine, g: &mut Gui) {
     let time = ctx.input(|i| i.time);
-    let cycling = e.view.cycling && e.doc.mode == ColorMode::Indexed && e.doc.palette.ramps.iter().any(|r| r.cycle);
+    let cycling = e.view.cycling && e.doc.palette.ramps.iter().any(|r| r.cycle);
     let blink = (time * 6.0) as u64 % 2;
     let key = (e.rev, if cycling { (time * 30.0) as u64 } else { 0 }, g.flash_now.map(|f| (f as i64) * 2 + blink as i64).unwrap_or(-1));
     if g.tex.is_some() && g.tex_key == key {
@@ -185,14 +184,14 @@ fn press(e: &mut Engine, g: &mut Gui, button: usize, p: (i32, i32), mods: egui::
             let mode = if e.o.mode == PaintMode::Smear { PaintMode::Normal } else { e.o.mode };
             let params = json!({
                 "x": p.0, "y": p.1, "color": e.cell_json(color), "bg": e.cell_json(bg), "contiguous": e.o.contiguous,
-                "tolerance": e.o.tolerance, "mode": mode.name(), "dither": e.o.dither, "dither_bg": e.o.dither_bg,
+                "mode": mode.name(), "dither": e.o.dither, "dither_bg": e.o.dither_bg,
             });
             g.run(e, "fill", params);
             None
         }
         Tool::Select => Some(Drag::Select { start: p, cur: p, button }),
         Tool::Wand => {
-            g.run_select(e, "select_wand", json!({ "x": p.0, "y": p.1, "contiguous": e.o.contiguous, "tolerance": e.o.tolerance, "op": sel_op(mods) }));
+            g.run_select(e, "select_wand", json!({ "x": p.0, "y": p.1, "contiguous": e.o.contiguous, "op": sel_op(mods) }));
             None
         }
         Tool::Move => {

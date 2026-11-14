@@ -154,3 +154,16 @@ pub fn to_indexed(rgba: &[[u8; 4]], w: usize, h: usize, pal: &Palette, dither: D
     }
     out
 }
+
+/// A palette of at most `n` colours chosen for these pixels (transparent ones are ignored).
+pub fn palette_for<'a>(px: impl Iterator<Item = &'a [u8; 4]>, n: usize) -> Palette {
+    let mut hist: HashMap<[u8; 3], u32> = HashMap::new();
+    for p in px.filter(|p| p[3] >= 128) {
+        *hist.entry([p[0], p[1], p[2]]).or_insert(0) += 1;
+    }
+    let mut colors = median_cut(&hist, n.clamp(1, 256));
+    if colors.is_empty() {
+        colors.push([0, 0, 0]);
+    }
+    Palette { colors, ramps: vec![] }
+}

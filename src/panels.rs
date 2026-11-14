@@ -26,11 +26,10 @@ fn swatch(p: &Painter, r: Rect, c: [u8; 4]) {
 }
 
 fn cell_label(e: &Engine, c: Cell) -> String {
-    match e.doc.mode {
-        ColorMode::Indexed if c >= 256 => "transparent".into(),
-        ColorMode::Indexed => format!("{} {}", c, hex6(e.doc.palette.colors.get(c as usize).copied().unwrap_or([0, 0, 0]))),
-        ColorMode::Rgba => hex8(unpack(c)),
+    if c >= 256 {
+        return "transparent".into();
     }
+    format!("{} {}", c, hex6(e.doc.palette.colors.get(c as usize).copied().unwrap_or([0, 0, 0])))
 }
 
 // ------------------------------------------------------------------ tool icons
@@ -125,9 +124,11 @@ pub fn toolbar(ui: &mut egui::Ui, e: &mut Engine, _g: &mut Gui) {
             ui.painter().rect_filled(rect, 6.0, bg);
             let size = 17.0;
             icon(ui.painter(), Rect::from_center_size(rect.center(), vec2(size, size)), t, if on { Color32::WHITE } else { Color32::from_gray(196) });
-            if resp.on_hover_text(format!("{}  ({})", t.label(), t.key())).clicked() {
+            let resp = resp.on_hover_text(format!("{}  ({})\nRight-click for options", t.label(), t.key()));
+            if resp.clicked() || resp.secondary_clicked() {
                 e.o.tool = t;
             }
+            resp.context_menu(|ui| tool_menu(ui, e, t));
         }
         ui.add_space(10.0);
         // Foreground over background; click to swap.
@@ -144,6 +145,99 @@ pub fn toolbar(ui: &mut egui::Ui, e: &mut Engine, _g: &mut Gui) {
             std::mem::swap(&mut e.o.fg, &mut e.o.bg);
         }
     });
+}
+
+/// Right-click menu for a toolbar button: the same settings as the options bar, for that tool.
+fn tool_menu(ui: &mut egui::Ui, e: &mut Engine, tool: Tool) {
+    ui.set_min_width(190.0);
+    ui.label(RichText::new(format!("{}  ({})", tool.label(), tool.key())).strong());
+    ui.separator();
+    let paints = matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Line | Tool::Rect | Tool::Ellipse);
+    if paints {
+        if let Some((w, h)) = e.o.custom_brush.as_ref().map(|b| (b.w, b.h)) {
+            ui.horizontal(|ui| {
+                ui.label(format!("Custom brush {w}x{h}"));
+                if ui.small_button("x").on_hover_text("Back to the standard brush (Esc)").clicked() {
+                    e.o.custom_brush = None;
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Size");
+                ui.add(egui::DragValue::new(&mut e.o.brush_size).range(1..=128).speed(0.2)).on_hover_text("[ and ]");
+                ui.selectable_value(&mut e.o.brush_shape, BrushShape::Round, "Round");
+                ui.selectable_value(&mut e.o.brush_shape, BrushShape::Square, "Square");
+            });
+        }
+    }
+    if (paints && tool != Tool::Eraser) || tool == Tool::Fill {
+        ui.label("Mode");
+        // A plain list: a drop-down inside a menu would close the menu.
+        egui::Grid::new("tool_menu_modes").num_columns(2).spacing([6.0, 2.0]).show(ui, |ui| {
+            for (i, m) in PaintMode::ALL.into_iter().enumerate() {
+                ui.selectable_value(&mut e.o.mode, m, m.name()).on_hover_text(m.hint());
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        if e.o.mode == PaintMode::Dither {
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut e.o.dither, 1..=15).show_value(false)).on_hover_text(format!("Dither density {}/16", e.o.dither));
+                ui.checkbox(&mut e.o.dither_bg, "2-colour").on_hover_text("Paint the background colour in the gaps");
+            });
+        }
+    }
+    match tool {
+        Tool::Rect | Tool::Ellipse => {
+            ui.checkbox(&mut e.o.filled, "Filled");
+        }
+        Tool::Pencil => {
+            ui.checkbox(&mut e.o.pixel_perfect, "Pixel perfect").on_hover_text("Remove corner pixels from 1 px freehand lines");
+        }
+        Tool::Fill | Tool::Wand => {
+            ui.checkbox(&mut e.o.contiguous, "Contiguous");
+        }
+        Tool::Gradient => {
+            ui.checkbox(&mut e.o.gradient_radial, "Radial");
+            ui.checkbox(&mut e.o.gradient_dither, "Dither");
+            ui.label("Colours");
+            ui.selectable_value(&mut e.o.active_ramp, None, "FG to BG");
+            for (i, r) in e.doc.palette.ramps.iter().enumerate() {
+                ui.selectable_value(&mut e.o.active_ramp, Some(i), &r.name);
+            }
+        }
+        Tool::Picker => {
+            ui.weak("Alt-click with a drawing tool also picks.");
+        }
+        Tool::Select => {
+            ui.weak("Shift adds, Alt subtracts.");
+        }
+        Tool::Move => {
+            ui.weak("Drag to move the selection or layer.\nEnter commits, Esc cancels.");
+        }
+        Tool::TileStamp => {
+            ui.weak(format!("Stamping tile {}.\nRight-click the canvas to pick a tile.", e.o.active_tile));
+        }
+        Tool::Pan => {
+            ui.weak("Middle-drag pans with any tool.");
+        }
+        _ => {}
+    }
+    if paints {
+        ui.horizontal(|ui| {
+            ui.label("Mirror");
+            ui.toggle_value(&mut e.o.sym_x, "X");
+            ui.toggle_value(&mut e.o.sym_y, "Y");
+        });
+    }
+    if e.doc.tileset.is_some() && (paints || matches!(tool, Tool::Fill | Tool::Gradient)) {
+        ui.horizontal(|ui| {
+            ui.label("Tiles");
+            ui.selectable_value(&mut e.o.tile_mode, TileMode::Auto, "Auto").on_hover_text("Edited cells become new tiles (or match existing ones)");
+            ui.selectable_value(&mut e.o.tile_mode, TileMode::Sync, "Sync").on_hover_text("Editing a cell edits its tile everywhere it is used");
+        });
+    }
 }
 
 // ------------------------------------------------------------------ options bar
@@ -190,10 +284,6 @@ pub fn options(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             }
             Tool::Fill | Tool::Wand => {
                 ui.checkbox(&mut e.o.contiguous, "Contiguous");
-                if e.doc.mode == ColorMode::Rgba {
-                    ui.label("Tolerance");
-                    ui.add(egui::DragValue::new(&mut e.o.tolerance).range(0..=255));
-                }
             }
             Tool::Gradient => {
                 ui.checkbox(&mut e.o.gradient_radial, "Radial");
@@ -251,7 +341,7 @@ pub fn options(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
 pub fn status(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 14.0;
-        ui.weak(format!("{} x {}  {}", e.doc.w, e.doc.h, e.doc.mode.name()));
+        ui.weak(format!("{} x {}  {} colours", e.doc.w, e.doc.h, e.doc.palette.colors.len()));
         match g.hover {
             Some((x, y)) => {
                 ui.monospace(format!("{x:>4},{y:<4}"));
@@ -289,17 +379,14 @@ pub fn status(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
 // ------------------------------------------------------------------ palette
 
 pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
-    let indexed = e.doc.mode == ColorMode::Indexed;
     let n = e.doc.palette.colors.len();
     if g.usage_rev != e.rev {
         g.usage_rev = e.rev;
         g.usage = vec![0; n];
-        if indexed {
-            for l in &e.doc.layers {
-                for &c in l.data.iter() {
-                    if let Some(u) = g.usage.get_mut(c as usize) {
-                        *u += 1;
-                    }
+        for l in &e.doc.layers {
+            for &c in l.data.iter() {
+                if let Some(u) = g.usage.get_mut(c as usize) {
+                    *u += 1;
                 }
             }
         }
@@ -314,21 +401,6 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             ui.label(RichText::new(format!("{label} {}", cell_label(e, cell))).small());
         }
     });
-    if !indexed {
-        ui.horizontal(|ui| {
-            let mut c = unpack(e.o.fg);
-            if c[3] == 0 {
-                c = [0, 0, 0, 255];
-            }
-            ui.label("Foreground");
-            if ui.color_edit_button_srgba_unmultiplied(&mut c).changed() {
-                e.o.fg = pack(c);
-            }
-            if ui.small_button("Add to palette").clicked() && n < 256 {
-                g.run(e, "palette_set", json!({ "index": n, "color": [c[0], c[1], c[2]] }));
-            }
-        });
-    }
     ui.add_space(2.0);
 
     // ---- colour grid
@@ -343,7 +415,7 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
         let r = cell_rect(i);
         let c = e.doc.palette.colors[i];
         p.rect_filled(r.shrink(0.5), 1.0, Color32::from_rgb(c[0], c[1], c[2]));
-        if indexed && g.usage.get(i).copied().unwrap_or(0) > 0 {
+        if g.usage.get(i).copied().unwrap_or(0) > 0 {
             // Colours the image actually uses get a small corner dot.
             let mark = if luma(c) > 128 { Color32::from_black_alpha(170) } else { Color32::from_white_alpha(190) };
             p.rect_filled(Rect::from_min_size(r.right_bottom() - vec2(4.5, 4.5), vec2(2.5, 2.5)), 0.0, mark);
@@ -355,15 +427,7 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
         }
     }
     let mark = |cellv: Cell, col: Color32, inset: f32| {
-        let i = match e.doc.mode {
-            ColorMode::Indexed if cellv < 256 => Some(cellv as usize),
-            ColorMode::Indexed => None,
-            ColorMode::Rgba => {
-                let c = unpack(cellv);
-                e.doc.palette.colors.iter().position(|pc| c[3] == 255 && *pc == [c[0], c[1], c[2]])
-            }
-        };
-        if let Some(i) = i.filter(|i| *i < n) {
+        if let Some(i) = Some(cellv as usize).filter(|i| *i < n) {
             p.rect_stroke(cell_rect(i).shrink(inset), 1.0, Stroke::new(1.0_f32, Color32::BLACK), StrokeKind::Outside);
             p.rect_stroke(cell_rect(i).shrink(inset), 1.0, Stroke::new(1.5_f32, col), StrokeKind::Inside);
         }
@@ -372,26 +436,22 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     mark(e.o.fg, Color32::WHITE, 0.0);
     if let Some(i) = hover {
         let (shift, alt) = ui.input(|inp| (inp.modifiers.shift, inp.modifiers.alt));
-        if alt && indexed {
+        if alt {
             g.flash = Some(i);
         }
-        let pick = |e: &Engine| match e.doc.mode {
-            ColorMode::Indexed => i as Cell,
-            ColorMode::Rgba => pack(e.doc.palette.rgba(i)),
-        };
         if resp.clicked() {
             if shift {
                 g.pal_sel = Some((g.pal_sel.map(|s| s.0).unwrap_or(i), i));
             } else {
-                e.o.fg = pick(e);
+                e.o.fg = i as Cell;
                 g.pal_sel = Some((i, i));
             }
         }
         if resp.secondary_clicked() {
-            e.o.bg = pick(e);
+            e.o.bg = i as Cell;
         }
         let c = e.doc.palette.colors[i];
-        let used = if indexed { format!("\n{} px", g.usage.get(i).copied().unwrap_or(0)) } else { String::new() };
+        let used = format!("\n{} px", g.usage.get(i).copied().unwrap_or(0));
         resp.on_hover_text(format!("{i}  {}{used}\nClick: foreground   Right-click: background\nShift-click: select a range   Alt: flash on canvas", hex6(c)));
     }
 
@@ -582,16 +642,7 @@ pub fn layers(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
         g.run(e, name, params);
     }
     ui.separator();
-    let l = &e.doc.layers[e.doc.active];
-    let (mut opacity, mut alpha_lock) = (l.opacity, l.alpha_lock);
-    ui.horizontal(|ui| {
-        ui.label("Opacity");
-        if ui.add(egui::Slider::new(&mut opacity, 0..=255)).changed() {
-            if let Err(err) = e.exec_coalesced("layer_set", &json!({ "opacity": opacity }), "opacity") {
-                g.error(err);
-            }
-        }
-    });
+    let mut alpha_lock = e.doc.layers[e.doc.active].alpha_lock;
     if ui.checkbox(&mut alpha_lock, "Lock transparency").on_hover_text("Only paint on pixels that already have colour").changed() {
         g.run(e, "layer_set", json!({ "alpha_lock": alpha_lock }));
     }

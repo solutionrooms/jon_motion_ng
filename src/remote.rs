@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 pub const BASE_PORT: u16 = 47800;
 
 const INSTRUCTIONS: &str = "\
-Jon Motion is a pixel art editor: layers, a 256-colour indexed palette (or RGBA), colour ramps, paint modes and tile maps.
+Jon Motion is a pixel art editor: layers, a 256-colour indexed palette, colour ramps, paint modes and tile maps.
 Coordinates are pixels with (0,0) at the top-left. Layer 0 is the bottom layer.
-Colours: in indexed documents a palette index (0-255, -1 = transparent) or '#rrggbb' (snapped to the nearest palette colour); \
-in RGBA documents '#rrggbb' / '#rrggbbaa'. 'fg', 'bg' and 'transparent' also work.
+Every pixel is a palette index; there is no true-colour mode and layers are fully opaque. \
+Colours: a palette index (0-255, -1 = transparent) or '#rrggbb' (snapped to the nearest palette colour). 'fg', 'bg' and 'transparent' also work.
 Workflow: get_info first; list_commands to discover commands; execute_command or batch to act; screenshot to look at the result. \
 For anything loop-heavy or procedural use run_lua. put_pixels places a whole sprite in one call.
 Every call is atomic and is one undo step. When the app window is open you are editing the user's live document alongside them: \
@@ -66,7 +66,7 @@ pub fn base64(data: &[u8]) -> String {
 pub fn tools() -> Value {
     json!([
         { "name": "get_info",
-          "description": "Summary of the open document: size, colour mode, layers, palette size, tile set, selection, current colours, file path, and whether you are attached to the live app ('gui') or a headless document.",
+          "description": "Summary of the open document: size, layers, palette size, tile set, selection, current colours, file path, and whether you are attached to the live app ('gui') or a headless document.",
           "inputSchema": { "type": "object", "properties": {} } },
         { "name": "list_commands",
           "description": "Reference for the editor's commands (every feature of the app is a command). Call with no arguments for everything, or narrow it down.",

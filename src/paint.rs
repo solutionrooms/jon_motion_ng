@@ -122,7 +122,6 @@ pub struct PaintOpts {
 pub struct Painter<'a> {
     pub w: i32,
     pub h: i32,
-    pub mode: ColorMode,
     pub pal: &'a Palette,
     pub data: &'a mut [Cell],
     /// Layer pixels as they were when the stroke began.
@@ -204,21 +203,12 @@ pub fn ellipse_points(xa: i32, ya: i32, xb: i32, yb: i32) -> Vec<(i32, i32)> {
     pts.into_iter().map(|(x, y)| (x as i32, y as i32)).collect()
 }
 
-fn similar(mode: ColorMode, a: Cell, b: Cell, tol: u8) -> bool {
-    match mode {
-        ColorMode::Indexed => a == b || (a >= 256 && b >= 256),
-        ColorMode::Rgba => {
-            if a == b {
-                return true;
-            }
-            let (a, b) = (unpack(a), unpack(b));
-            (0..4).all(|i| (a[i] as i32 - b[i] as i32).abs() <= tol as i32)
-        }
-    }
+fn similar(a: Cell, b: Cell) -> bool {
+    a == b || (a >= 256 && b >= 256)
 }
 
 /// Pixels matching the one at (x, y): the connected region, or every match when not contiguous.
-pub fn flood_mask(data: &[Cell], w: i32, h: i32, mode: ColorMode, x: i32, y: i32, contiguous: bool, tol: u8) -> Vec<bool> {
+pub fn flood_mask(data: &[Cell], w: i32, h: i32, x: i32, y: i32, contiguous: bool) -> Vec<bool> {
     let mut mask = vec![false; (w * h) as usize];
     if x < 0 || y < 0 || x >= w || y >= h {
         return mask;
@@ -226,7 +216,7 @@ pub fn flood_mask(data: &[Cell], w: i32, h: i32, mode: ColorMode, x: i32, y: i32
     let target = data[(y * w + x) as usize];
     if !contiguous {
         for (m, &c) in mask.iter_mut().zip(data) {
-            *m = similar(mode, c, target, tol);
+            *m = similar(c, target);
         }
         return mask;
     }
@@ -238,7 +228,7 @@ pub fn flood_mask(data: &[Cell], w: i32, h: i32, mode: ColorMode, x: i32, y: i32
                 continue;
             }
             let i = (ny * w + nx) as usize;
-            if !mask[i] && similar(mode, data[i], target, tol) {
+            if !mask[i] && similar(data[i], target) {
                 mask[i] = true;
                 stack.push((nx, ny));
             }
@@ -274,7 +264,7 @@ impl Painter<'_> {
             }
         }
         let b = self.base[i];
-        if self.alpha_lock && cell_empty(self.mode, b) {
+        if self.alpha_lock && cell_empty(b) {
             return;
         }
         let color = over.unwrap_or(self.o.color);
@@ -296,7 +286,7 @@ impl Painter<'_> {
                 color
             }
             PaintMode::Behind => {
-                if !cell_empty(self.mode, self.data[i]) {
+                if !cell_empty(self.data[i]) {
                     return;
                 }
                 color
@@ -326,75 +316,49 @@ impl Painter<'_> {
     }
 
     fn shade(&self, c: Cell, up: bool) -> Option<Cell> {
-        if cell_empty(self.mode, c) {
-            return None;
+        let cur = *self.pal.colors.get(c as usize)?;
+        if let Some((r, p)) = self.pal.ramp_pos(c as u8, self.o.ramp) {
+            let ramp = &self.pal.ramps[r].indices;
+            let col = |i: u8| self.pal.colors.get(i as usize).copied().unwrap_or([0, 0, 0]);
+            // Ramps may run light-to-dark; follow the ramp's own direction.
+            let ascending = luma(col(ramp[0])) <= luma(col(ramp[ramp.len() - 1]));
+            let np = if up == ascending { (p + 1).min(ramp.len() - 1) } else { p.saturating_sub(1) };
+            return Some(ramp[np] as Cell);
         }
-        match self.mode {
-            ColorMode::Indexed => {
-                let cur = *self.pal.colors.get(c as usize)?;
-                if let Some((r, p)) = self.pal.ramp_pos(c as u8, self.o.ramp) {
-                    let ramp = &self.pal.ramps[r].indices;
-                    let col = |i: u8| self.pal.colors.get(i as usize).copied().unwrap_or([0, 0, 0]);
-                    // Ramps may run light-to-dark; follow the ramp's own direction.
-                    let ascending = luma(col(ramp[0])) <= luma(col(ramp[ramp.len() - 1]));
-                    let np = if up == ascending { (p + 1).min(ramp.len() - 1) } else { p.saturating_sub(1) };
-                    return Some(ramp[np] as Cell);
-                }
-                let l = luma(cur);
-                let f = |v: u8| if up { (v as i32 * 118 / 100 + 10).min(255) as u8 } else { (v as i32 * 82 / 100 - 4).max(0) as u8 };
-                let target = [f(cur[0]), f(cur[1]), f(cur[2])];
-                self.pal
-                    .colors
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| if up { luma(**p) > l } else { luma(**p) < l })
-                    .min_by_key(|(_, p)| dist(**p, target))
-                    .map(|(i, _)| i as Cell)
-            }
-            ColorMode::Rgba => {
-                let [r, g, b, a] = unpack(c);
-                let f = |v: u8| if up { (v as i32 + (255 - v as i32) / 8 + 2).min(255) as u8 } else { (v as i32 - v as i32 / 8 - 2).max(0) as u8 };
-                Some(pack([f(r), f(g), f(b), a]))
-            }
-        }
+        let l = luma(cur);
+        let f = |v: u8| if up { (v as i32 * 118 / 100 + 10).min(255) as u8 } else { (v as i32 * 82 / 100 - 4).max(0) as u8 };
+        let target = [f(cur[0]), f(cur[1]), f(cur[2])];
+        self.pal
+            .colors
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| if up { luma(**p) > l } else { luma(**p) < l })
+            .min_by_key(|(_, p)| dist(**p, target))
+            .map(|(i, _)| i as Cell)
     }
 
+    /// The palette colour nearest the average of a pixel and its neighbours.
     fn smooth(&self, x: i32, y: i32) -> Option<Cell> {
-        let at = |x: i32, y: i32| -> Option<[u8; 4]> {
+        let at = |x: i32, y: i32| -> Option<[u8; 3]> {
             if x < 0 || y < 0 || x >= self.w || y >= self.h {
                 return None;
             }
-            let c = self.base[(y * self.w + x) as usize];
-            match self.mode {
-                ColorMode::Indexed if c < 256 => Some(self.pal.rgba(c as usize)),
-                ColorMode::Rgba if c >> 24 != 0 => Some(unpack(c)),
-                _ => None,
-            }
+            self.pal.colors.get(self.base[(y * self.w + x) as usize] as usize).copied()
         };
         at(x, y)?;
-        let (mut sum, mut wsum, mut asum, mut n) = ([0f32; 3], 0f32, 0f32, 0f32);
+        let (mut sum, mut wsum) = ([0f32; 3], 0f32);
         for dy in -1..=1 {
             for dx in -1..=1 {
                 let wgt = if dx == 0 && dy == 0 { 2.0 } else { 1.0 };
-                n += wgt;
                 if let Some(c) = at(x + dx, y + dy) {
-                    let a = c[3] as f32 / 255.0 * wgt;
                     for i in 0..3 {
-                        sum[i] += c[i] as f32 * a;
+                        sum[i] += c[i] as f32 * wgt;
                     }
-                    wsum += a;
-                    asum += c[3] as f32 * wgt;
+                    wsum += wgt;
                 }
             }
         }
-        if wsum <= 0.0 {
-            return None;
-        }
-        let rgb = [(sum[0] / wsum).round() as u8, (sum[1] / wsum).round() as u8, (sum[2] / wsum).round() as u8];
-        Some(match self.mode {
-            ColorMode::Indexed => self.pal.nearest(rgb) as Cell,
-            ColorMode::Rgba => pack([rgb[0], rgb[1], rgb[2], (asum / n).round().max(1.0) as u8]),
-        })
+        Some(self.pal.nearest([(sum[0] / wsum).round() as u8, (sum[1] / wsum).round() as u8, (sum[2] / wsum).round() as u8]) as Cell)
     }
 
     pub fn stamp(&mut self, x: i32, y: i32) {
@@ -502,7 +466,7 @@ impl Painter<'_> {
                     if self.sel.map(|s| s[i] == 0).unwrap_or(false) {
                         continue;
                     }
-                    if self.alpha_lock && cell_empty(self.mode, self.base[i]) {
+                    if self.alpha_lock && cell_empty(self.base[i]) {
                         continue;
                     }
                     writes.push((i, self.data[(sy * self.w + sx) as usize]));
@@ -522,26 +486,13 @@ impl Painter<'_> {
         }
         let (dx, dy) = (x1 - x0, y1 - y0);
         let len2 = (dx * dx + dy * dy).max(1e-6);
-        let smooth = self.mode == ColorMode::Rgba && !dither;
         for y in 0..self.h {
             for x in 0..self.w {
                 let (px, py) = (x as f32 - x0, y as f32 - y0);
                 let t = if radial { ((px * px + py * py) / len2).sqrt() } else { (px * dx + py * dy) / len2 }.clamp(0.0, 1.0);
                 let f = t * (n - 1) as f32;
-                let cell = if smooth {
-                    let i = (f.floor() as usize).min(n - 1);
-                    let j = (i + 1).min(n - 1);
-                    let k = f - i as f32;
-                    let (a, b) = (unpack(stops[i]), unpack(stops[j]));
-                    let mut c = [0u8; 4];
-                    for q in 0..4 {
-                        c[q] = (a[q] as f32 + (b[q] as f32 - a[q] as f32) * k).round() as u8;
-                    }
-                    pack(c)
-                } else {
-                    let thr = if dither { (BAYER4[(y & 3) as usize][(x & 3) as usize] as f32 + 0.5) / 16.0 } else { 0.5 };
-                    stops[((f + thr).floor() as usize).min(n - 1)]
-                };
+                let thr = if dither { (BAYER4[(y & 3) as usize][(x & 3) as usize] as f32 + 0.5) / 16.0 } else { 0.5 };
+                let cell = stops[((f + thr).floor() as usize).min(n - 1)];
                 self.plot(x, y, Some(cell));
             }
         }

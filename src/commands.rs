@@ -545,6 +545,14 @@ fn paint_args(e: &Engine, a: &Args) -> Result<PaintOpts, String> {
 }
 
 /// Run a painting closure as one stroke on the requested layer.
+/// The reply for a paint command: says so when an empty selection meant nothing could change.
+fn painted(e: &Engine) -> R {
+    if e.doc.selection.as_ref().is_some_and(|s| s.iter().all(|&v| v == 0)) {
+        return Ok(json!({"note": "nothing was drawn: the selection is empty (select_none clears it)"}));
+    }
+    ok()
+}
+
 fn draw(e: &mut Engine, a: &Args, o: PaintOpts, f: impl FnOnce(&mut Engine)) -> R {
     let li = layer_arg(e, a)?;
     let prev = e.doc.active;
@@ -556,7 +564,7 @@ fn draw(e: &mut Engine, a: &Args, o: PaintOpts, f: impl FnOnce(&mut Engine)) -> 
     }
     e.doc.active = prev.min(e.doc.layers.len() - 1);
     r?;
-    ok()
+    painted(e)
 }
 
 fn points_arg(a: &Args, k: &str) -> Result<Vec<(i32, i32)>, String> {
@@ -1285,7 +1293,7 @@ fn selection_cmds(b: &mut B) {
                 *c = color;
             }
         }
-        ok()
+        painted(e)
     });
     b.add("selection", "copy", Read, "", "Copy the selection (or whole active layer) to the internal clipboard.", |e, _| {
         e.copy()?;

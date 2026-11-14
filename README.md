@@ -59,7 +59,9 @@ print(jm.get_info().width)
 A script is atomic and one undo step: if it raises an error, the document is rolled back. Scripts are
 sandboxed: no `io`/`os` libraries, a 60 s time limit and a 256 MB memory limit. The only files a script
 can touch are through the document commands, which read `.jmn`/`.png` and write `.jmn`/`.png`/`.csv`.
-Scripts run off the UI thread; a long one shows a **Stop script** button. Headless: `jon_motion run script.lua [file]`.
+Scripts run on a working copy of the document, off the UI thread, and a long one shows a **Stop script**
+button. A script that will not stop after its limit is abandoned: the document is untouched and the
+script can no longer run commands, though it may keep using CPU until you quit. Headless: `jon_motion run script.lua [file]`.
 Full reference: `jon_motion commands [filter]`.
 
 ## AI / MCP

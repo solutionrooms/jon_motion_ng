@@ -214,6 +214,66 @@ fn lua_sandbox_limits_hold() {
     assert!(out.error.unwrap().contains("time limit"));
     assert!(t.elapsed().as_secs() < 10);
     assert_eq!(pixel(&mut e, 0, 0), -1, "a timed-out script is rolled back");
+    // Each of these used to escape the limit; every one must end with the time-limit error.
+    let ms = std::time::Duration::from_millis(200);
+    for code in [
+        "coroutine.wrap(function() while true do end end)() return 1",
+        "local co = coroutine.create(function() while true do end end) while true do coroutine.resume(co) end",
+        "local g = coroutine.wrap(function() coroutine.yield(1) end) g() while true do end",
+        "while true do local g = coroutine.wrap(function() coroutine.yield(1) end) g() end",
+        "coroutine.wrap(function() coroutine.wrap(function() coroutine.yield() while true do end end)() coroutine.yield() end)() while true do end",
+        "coroutine.wrap(function() local co = coroutine.wrap(function() while true do coroutine.yield() end end) while true do co() end end)()",
+        "local co = coroutine.create(function() local x <close> = setmetatable({}, {__close = function() while true do end end}) coroutine.yield() end)
+         coroutine.resume(co) while true do coroutine.close(co) end",
+        "while true do load(function() while true do end end) end",
+        "while true do pcall(coroutine.wrap(function() while true do end end)) end",
+    ] {
+        let t = std::time::Instant::now();
+        let out = script::run_lua_limited(&mut e, code, ms);
+        assert!(out.error.as_deref().is_some_and(|m| m.contains("time limit")), "{code}\n-> {:?} {:?}", out.error, out.result);
+        assert!(t.elapsed().as_secs() < 5, "{code} took {:?}", t.elapsed());
+    }
+    // Lua runs error handlers and finalizers with hooks off; these are closed off instead.
+    let out = script::run_lua_limited(&mut e, "xpcall(function() while true do end end, function() while true do end end)", ms);
+    assert!(out.error.unwrap().contains("time limit"));
+    let out = script::run_lua_limited(
+        &mut e,
+        "local co = coroutine.create(function() while true do coroutine.yield() end end)
+         local x <close> = setmetatable({}, { __close = function() while true do end end })
+         while true do for i = 1, 5000 do end coroutine.resume(co) end",
+        ms,
+    );
+    assert!(out.error.unwrap().contains("time limit"));
+    let out = script::run_lua(&mut e, "KEEP = setmetatable({}, { __gc = function() while true do end end }) return 1");
+    assert!(out.error.unwrap().contains("__gc"));
+    let out = script::run_lua(&mut e, "local mt = {} local t = setmetatable({}, mt) mt.__gc = function() end return pcall(setmetatable, t, mt)");
+    assert_eq!(out.result, json!(false));
+    // Whatever else a script finds, the host abandons it: here a slow C library call
+    // that no Lua hook can interrupt. The document is untouched and stays usable.
+    let before = e.doc.clone();
+    let t = std::time::Instant::now();
+    let out = script::run_lua_limited(&mut e, "jm.set(1, 1, 7) return string.rep('a', 400):find('^a*a*a*a*b')", ms);
+    assert!(out.error.unwrap().contains("abandoned"));
+    assert!(t.elapsed().as_secs() < 4, "took {:?}", t.elapsed());
+    assert!(e.doc == before && e.group == 0);
+    assert_eq!(script::run_lua(&mut e, "jm.set(2, 2, 8) return jm.get(2, 2)").result, json!(8));
+    assert_eq!(script::run_lua(&mut e, "return jm.get_info().undo_steps").result, json!(e.undo.len()), "a script sees the real history length");
+    e.exec("undo", &json!({})).unwrap();
+    // Coroutines still behave like coroutines.
+    let out = script::run_lua(
+        &mut e,
+        "local function gen(n) return coroutine.wrap(function() for i = 1, n do coroutine.yield(i) end end) end
+         local sum = 0 for v in gen(4) do sum = sum + v end
+         local co = coroutine.create(function(a, b) local c = coroutine.yield(a + b) error('bad ' .. c) end)
+         local ok1, v1 = coroutine.resume(co, 2, 3)
+         local ok2, v2 = coroutine.resume(co, 'x')
+         local wrapped = pcall(coroutine.wrap(function() error('inner') end))
+         local _, main = coroutine.running()
+         return {sum, ok1, v1, ok2, tostring(v2):match('bad x') ~= nil, coroutine.status(co), wrapped, main,
+                 coroutine.close(coroutine.create(print)), select('#', coroutine.resume(coroutine.create(function() return 1, 2, 3 end)))}",
+    );
+    assert_eq!(out.error, None);
+    assert_eq!(out.result, json!([10, true, 5, false, true, "dead", false, true, true, 4]));
     let out = script::run_lua(&mut e, "local ok, err = pcall(error, 'x') return {ok, err, pcall(function() return 1, 2 end)}");
     assert_eq!(out.result, json!([false, "x", true, 1, 2]), "pcall still behaves normally");
 }
@@ -237,7 +297,8 @@ fn an_empty_selection_selects_nothing() {
     e.exec("select_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4})).unwrap();
     e.exec("select_rect", &json!({"x": 10, "y": 10, "w": 4, "h": 4, "op": "intersect"})).unwrap();
     e.exec("selection_fill", &json!({"color": 5})).unwrap();
-    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 32, "h": 32, "color": 6, "filled": true})).unwrap();
+    let r = e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 32, "h": 32, "color": 6, "filled": true})).unwrap();
+    assert!(r["note"].as_str().unwrap().contains("selection is empty"), "the reply says why nothing changed");
     assert_eq!((pixel(&mut e, 20, 20), pixel(&mut e, 1, 1)), (-1, -1));
     assert_eq!(e.exec("get_info", &json!({})).unwrap()["selection"]["w"], 0);
     e.exec("select_all", &json!({})).unwrap();
@@ -288,6 +349,9 @@ fn brush_clipboard_selection_and_png_round_trip_details() {
     e.exec("palette_swap", &json!({"a": 5, "b": 6})).unwrap();
     e.exec("draw_line", &json!({"x0": 13, "y0": 2, "x1": 13, "y1": 2, "brush": "custom"})).unwrap();
     assert_eq!((pixel(&mut e, 0, 0), pixel(&mut e, 13, 2)), (6, 6), "the custom brush follows palette renumbering");
+    e.exec("undo", &json!({"steps": 2})).unwrap();
+    e.exec("draw_line", &json!({"x0": 13, "y0": 4, "x1": 13, "y1": 4, "brush": "custom"})).unwrap();
+    assert_eq!((pixel(&mut e, 0, 0), pixel(&mut e, 13, 4)), (5, 5), "and follows it back on undo");
 
     let mut e = eng(8, 8);
     e.exec("palette_load_preset", &json!({"name": "pico8"})).unwrap();
@@ -299,6 +363,23 @@ fn brush_clipboard_selection_and_png_round_trip_details() {
     assert_eq!((pixel(&mut e, 0, 0), pixel(&mut e, 5, 5)), (3, -1));
     assert!(e.exec("export_png", &json!({"path": tmp("evil.sh")})).unwrap_err().contains(".png"), "exports only write their own file type");
     assert!(e.exec("save_document", &json!({"path": tmp("evil.txt")})).unwrap_err().contains(".jmn"));
+}
+
+#[test]
+fn a_save_followed_by_a_rollback_leaves_the_document_marked_modified() {
+    let mut e = eng(8, 8);
+    let p = tmp("rollback.jmn");
+    e.exec("save_document", &json!({"path": p})).unwrap();
+    assert!(!e.modified);
+    let out = script::run_lua(&mut e, "jm.set(0, 0, 9) jm.save_document{} error('boom')");
+    assert!(out.error.is_some());
+    assert_eq!(pixel(&mut e, 0, 0), -1, "the edit was rolled back");
+    assert!(e.modified, "the file on disk now differs from the document");
+    // An ordinary failure with no save leaves a clean document clean.
+    e.exec("save_document", &json!({})).unwrap();
+    assert!(script::run_lua(&mut e, "jm.set(0, 0, 9) error('boom')").error.is_some());
+    assert!(!e.modified);
+    assert!(e.exec("bogus", &json!({})).is_err() && !e.modified);
 }
 
 #[test]

@@ -9,11 +9,14 @@ use serde_json::Value;
 use std::cell::{Cell as Flag, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 const TIME_LIMIT: Duration = Duration::from_secs(60);
 const MEMORY_LIMIT: usize = 256 << 20;
 const MAX_OUTPUT: usize = 64 * 1024;
+/// How long a script gets to stop by itself after its limit (or Stop) before it is abandoned.
+const GRACE: Duration = Duration::from_secs(1);
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -24,7 +27,7 @@ pub fn cancel() {
 
 pub const LUA_HELP: &str = "\
 Lua 5.4 scripting (sandboxed: math, string, table, utf8, coroutine; no io/os libraries - files are only reached \
-through the document commands, which read .jmn/.png and write .jmn/.png/.csv; 60 s and 256 MB limits).
+through the document commands, which read .jmn/.png and write .jmn/.png/.csv; 60 s and 256 MB limits; no __gc finalizers).
 Every editor command is a function on the global `jm` taking one table of named parameters:
     jm.draw_line{ x0=0, y0=0, x1=31, y1=31, color=15 }
     local info = jm.get_info()            -- commands return tables
@@ -37,25 +40,68 @@ Fast pixel access on the active layer:
 print(...) output and the script's return value are returned to the caller.
 A script is atomic and is one undo step; an error rolls everything back.";
 
-// The wrappers keep the sandbox's limits firm: `load` only takes source text (Lua does
-// not verify bytecode), and pcall/xpcall/coroutine.resume re-raise the time-limit or
-// cancel error, so a script cannot swallow it and carry on.
+// The wrappers keep the sandbox's limits firm:
+// * `load` only takes source text (Lua does not verify bytecode).
+// * Everything that can catch an error (pcall, xpcall, coroutine.resume/close, load
+//   with a reader function) re-raises the time-limit or cancel error, so a script
+//   cannot swallow it and carry on.
+// * The instruction hook that enforces the limits belongs to one Lua thread at a time,
+//   so it is moved onto a coroutine while that coroutine runs and back afterwards;
+//   `hook` also checks the limits itself, as moving the hook restarts its count.
+// * Lua runs error handlers and finalizers with hooks switched off, so an xpcall
+//   handler is skipped once the script is over and __gc metamethods are refused.
+// These are the first line of defence only: run_lua_limited abandons any script that
+// still overruns (for example inside a slow C library call).
 const PRELUDE: &str = r#"
 do
-  local load_, pcall_, xpcall_, resume_, error_, select_, dead = load, pcall, xpcall, coroutine.resume, error, select, __jm_dead
-  load = function(chunk, name, mode, ...)
-    if select_('#', ...) > 0 then return load_(chunk, name, 't', (...)) end
-    return load_(chunk, name, 't')
+  local load_, pcall_, xpcall_, error_, select_ = load, pcall, xpcall, error, select
+  local create_, resume_, close_, running_ = coroutine.create, coroutine.resume, coroutine.close, coroutine.running
+  local dead, hook = __jm_dead, __jm_hook
+  local setmetatable_, rawget_, type_ = setmetatable, rawget, type
+  setmetatable = function(t, mt)
+    if type_(mt) == 'table' and rawget_(mt, '__gc') ~= nil then error_('__gc finalizers are not available in scripts', 2) end
+    return setmetatable_(t, mt)
   end
   local function pass(ok, ...)
     if not ok and dead() then error_((...), 0) end
     return ok, ...
   end
+  local function loaded(f, ...)
+    if not f and dead() then error_((...), 0) end
+    return f, ...
+  end
+  load = function(chunk, name, mode, ...)
+    if select_('#', ...) > 0 then return loaded(load_(chunk, name, 't', (...))) end
+    return loaded(load_(chunk, name, 't'))
+  end
   pcall = function(f, ...) return pass(pcall_(f, ...)) end
-  xpcall = function(f, h, ...) return pass(xpcall_(f, h, ...)) end
-  coroutine.resume = function(co, ...) return pass(resume_(co, ...)) end
+  xpcall = function(f, h, ...)
+    return pass(xpcall_(f, function(...) if dead() then return ... end return h(...) end, ...))
+  end
+  -- Run fn(co, ...) with the hook on `co`, then put the hook back on the caller.
+  -- Going in, the limits are checked before the hook moves; coming back, after:
+  -- either way a failed check leaves the hook on the thread that carries on running.
+  local function back(ok, ...)
+    hook(running_(), false)
+    if not ok then error_((...), 0) end
+    return ...
+  end
+  local function on(fn, co, ...)
+    hook(co, true)
+    return back(pcall_(fn, co, ...))
+  end
+  local function unwrap(ok, ...)
+    if not ok then error_((...), 0) end
+    return ...
+  end
+  coroutine.resume = function(co, ...) return pass(on(resume_, co, ...)) end
+  coroutine.close = function(co) return pass(on(close_, co)) end
+  coroutine.wrap = function(f)
+    local co = create_(f)
+    return function(...) return unwrap(on(resume_, co, ...)) end
+  end
   string.dump = nil
-  __jm_dead = nil
+  __jm_dead, __jm_hook = nil, nil
 end
 jm = setmetatable({}, { __index = function(t, k)
   local f = function(p) return __jm_exec(k, p) end
@@ -83,7 +129,54 @@ pub fn run_lua(engine: &mut Engine, code: &str) -> ScriptOut {
     run_lua_limited(engine, code, TIME_LIMIT)
 }
 
+/// Run a script on a working copy of the engine, on its own thread, and take the result
+/// over only if it succeeds. The limits are enforced from inside Lua where possible; a
+/// script that still has not finished shortly after its time limit (or after Stop) is
+/// abandoned: the live document is untouched and the copy refuses further commands.
 pub fn run_lua_limited(engine: &mut Engine, code: &str, limit: Duration) -> ScriptOut {
+    let fail = |msg: String| ScriptOut { output: String::new(), result: Value::Null, error: Some(msg) };
+    CANCEL.store(false, Ordering::Relaxed);
+    let halt = Arc::new(AtomicBool::new(false));
+    let mut copy = engine.fork(halt.clone());
+    let (tx, rx) = mpsc::channel();
+    let code = code.to_string();
+    let worker = std::thread::Builder::new().name("lua-script".into()).stack_size(8 << 20).spawn(move || {
+        let out = run_on(&mut copy, &code, limit);
+        let _ = tx.send((copy, out));
+    });
+    if let Err(e) = worker {
+        return fail(format!("could not start the script: {e}"));
+    }
+    let deadline = Instant::now() + limit + GRACE;
+    let mut cancelled: Option<Instant> = None;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok((copy, out)) => {
+                if out.error.is_none() {
+                    engine.adopt(copy);
+                } else if copy.modified {
+                    // The script saved and then failed: the file no longer matches the document.
+                    engine.modified = true;
+                }
+                return out;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return fail("the script crashed".into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancelled.is_none() && CANCEL.load(Ordering::Relaxed) {
+                    cancelled = Some(Instant::now() + GRACE);
+                }
+                let now = Instant::now();
+                if cancelled.is_some_and(|t| now > t) || now > deadline {
+                    halt.store(true, Ordering::Relaxed);
+                    let why = if cancelled.is_some() { "script cancelled".to_string() } else { format!("script exceeded the {} second time limit", limit.as_secs()) };
+                    return fail(format!("{why} (it would not stop and was abandoned)"));
+                }
+            }
+        }
+    }
+}
+
+fn run_on(engine: &mut Engine, code: &str, limit: Duration) -> ScriptOut {
     let out = RefCell::new(String::new());
     let mut result = Value::Null;
     let r = engine.group(|e| {
@@ -98,21 +191,40 @@ fn run_inner(eng: &RefCell<&mut Engine>, out: &RefCell<String>, code: &str, limi
     let lua = Lua::new_with(libs, LuaOptions::default()).map_err(|e| e.to_string())?;
     lua.set_memory_limit(MEMORY_LIMIT).map_err(|e| e.to_string())?;
     let start = Instant::now();
-    CANCEL.store(false, Ordering::Relaxed);
     // Once set, the script is over: every later check fails too.
     let dead = Rc::new(Flag::new(false));
-    let hook_dead = dead.clone();
-    lua.set_hook(HookTriggers::new().every_nth_instruction(20_000), move |_, _| {
-        if CANCEL.load(Ordering::Relaxed) {
-            hook_dead.set(true);
-            Err(mlua::Error::runtime("script cancelled"))
-        } else if start.elapsed() > limit {
-            hook_dead.set(true);
-            Err(mlua::Error::runtime(format!("script exceeded the {} second time limit", limit.as_secs())))
-        } else {
-            Ok(VmState::Continue)
+    let check = {
+        let dead = dead.clone();
+        move || -> mlua::Result<()> {
+            if CANCEL.load(Ordering::Relaxed) {
+                dead.set(true);
+                Err(mlua::Error::runtime("script cancelled"))
+            } else if start.elapsed() > limit {
+                dead.set(true);
+                Err(mlua::Error::runtime(format!("script exceeded the {} second time limit", limit.as_secs())))
+            } else {
+                Ok(())
+            }
         }
-    });
+    };
+    let triggers = || HookTriggers::new().every_nth_instruction(20_000);
+    let hook_check = check.clone();
+    lua.set_hook(triggers(), move |_, _| hook_check().map(|_| VmState::Continue));
+    // mlua keeps one hook, tied to one Lua thread; the prelude calls this to move it
+    // to whichever coroutine is about to run (see PRELUDE).
+    let move_hook = lua
+        .create_function(move |_, (v, check_first): (LV, bool)| {
+            if check_first {
+                check()?;
+            }
+            if let LV::Thread(t) = v {
+                let c = check.clone();
+                t.set_hook(triggers(), move |_, _| c().map(|_| VmState::Continue));
+            }
+            check()
+        })
+        .map_err(|e| e.to_string())?;
+    lua.globals().set("__jm_hook", move_hook).map_err(|e| e.to_string())?;
     let r: mlua::Result<Value> = lua.scope(|scope| {
         let g = lua.globals();
         for k in ["dofile", "loadfile", "collectgarbage"] {

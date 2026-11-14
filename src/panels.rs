@@ -811,6 +811,142 @@ pub fn preview(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     }
 }
 
+// ------------------------------------------------------------------ animation
+
+/// Point the animation at the selection, or at the whole image when nothing is selected.
+pub fn animate_selection(e: &mut Engine, g: &mut Gui) {
+    let (x, y, w, h) = match e.doc.sel_bounds() {
+        Some((x0, y0, x1, y1)) => (x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32),
+        None => (0, 0, e.doc.w, e.doc.h),
+    };
+    // Keep the frame size in use, shrunk if the new region is smaller than one frame.
+    let (fw, fh) = e.doc.anim.map(|a| (a.fw, a.fh)).or(g.anim_size).unwrap_or((e.view.grid_w, e.view.grid_h));
+    let p = json!({ "x": x, "y": y, "w": w, "h": h, "frame_w": fw.clamp(1, w), "frame_h": fh.clamp(1, h) });
+    if let Some(v) = g.run(e, "anim_set", p) {
+        g.info(format!("Animating {} frames of {}x{} - Left / Right step and Space plays over the Animation tab", v["frames"], v["frame_w"], v["frame_h"]));
+        g.show_tab = Some(crate::app::Tab::Anim);
+    }
+}
+
+pub fn animation(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
+    g.anim_rect = ui.max_rect();
+    ui.add_space(2.0);
+    let source = if e.doc.sel_bounds().is_some() { "selection" } else { "whole image" };
+    let Some(a) = e.doc.anim else {
+        ui.label("Plays part of the image as an animation. Select the frames on the canvas and set the size of one frame; they are read left to right, then top to bottom.");
+        ui.add_space(4.0);
+        let mut size = g.anim_size.unwrap_or((e.view.grid_w, e.view.grid_h));
+        ui.horizontal(|ui| {
+            ui.label("Frame size");
+            let mut changed = ui.add(egui::DragValue::new(&mut size.0).range(1..=MAX_DIM)).changed();
+            ui.label("x");
+            changed |= ui.add(egui::DragValue::new(&mut size.1).range(1..=MAX_DIM)).changed();
+            for s in [8, 16, 32, 64] {
+                if ui.small_button(s.to_string()).clicked() {
+                    size = (s, s);
+                    changed = true;
+                }
+            }
+            if changed {
+                g.anim_size = Some(size);
+            }
+        });
+        if ui.button(format!("Animate the {source}")).clicked() {
+            animate_selection(e, g);
+        }
+        return;
+    };
+
+    // Playback: move on by however many frames are due.
+    let now = ui.input(|i| i.time);
+    let (n, fps) = (a.count(), a.fps as f64);
+    if e.view.anim_playing && n > 1 {
+        let due = ((now - g.anim_clock) * fps).floor();
+        if due >= 1.0 {
+            e.view.anim_frame = ((e.view.anim_frame as f64 + due) % n as f64) as u32;
+            // Carry the remainder so the speed is exact, unless the tab was hidden for a while.
+            g.anim_clock = if due > fps { now } else { g.anim_clock + due / fps };
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((g.anim_clock + 1.0 / fps - now).max(0.0)));
+    } else {
+        g.anim_clock = now;
+    }
+
+    let playing = e.view.anim_playing;
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("<").on_hover_text("Previous frame (Left)").clicked() {
+            g.run(e, "anim_control", json!({ "step": -1, "playing": false }));
+        }
+        if ui.add_sized([52.0, 20.0], egui::Button::new(if playing { "Pause" } else { "Play" })).on_hover_text("Space").clicked() {
+            g.run(e, "anim_control", json!({ "playing": !playing }));
+        }
+        if ui.button(">").on_hover_text("Next frame (Right)").clicked() {
+            g.run(e, "anim_control", json!({ "step": 1, "playing": false }));
+        }
+        ui.label(format!("Frame {} of {n}", e.view.anim_frame.min(n.saturating_sub(1)) + 1));
+    });
+    // Setup changes go through anim_set, so they are saved, undoable and visible to scripts.
+    let mut set = serde_json::Map::new();
+    let (mut fw, mut fh, mut limit, mut speed) = (a.fw, a.fh, a.limit, a.fps);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Frame size");
+        if ui.add(egui::DragValue::new(&mut fw).range(1..=a.w)).changed() {
+            set.insert("frame_w".into(), json!(fw));
+        }
+        ui.label("x");
+        if ui.add(egui::DragValue::new(&mut fh).range(1..=a.h)).changed() {
+            set.insert("frame_h".into(), json!(fh));
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Frames");
+        let frames = egui::DragValue::new(&mut limit).range(0..=a.total()).custom_formatter(|v, _| if v < 1.0 { "all".into() } else { format!("{v:.0}") });
+        if ui.add(frames).on_hover_text("How many frames play; 0 plays all of them. Use it to stop before empty cells in the last row.").changed() {
+            set.insert("frames".into(), json!(limit));
+        }
+        ui.label("Speed");
+        if ui.add(egui::DragValue::new(&mut speed).range(Anim::FPS).speed(0.1).max_decimals(1).suffix(" fps")).changed() {
+            set.insert("fps".into(), json!(speed));
+        }
+    });
+    if !set.is_empty() {
+        if let Err(err) = e.exec_coalesced("anim_set", &serde_json::Value::Object(set), "anim") {
+            g.error(err);
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui.button(format!("Use the {source}")).on_hover_text("Cut the frames from the selection instead (or from the whole image when nothing is selected)").clicked() {
+            animate_selection(e, g);
+        }
+        if ui.button("Remove").on_hover_text("Remove the animation setup; no pixels change").clicked() {
+            g.run(e, "anim_clear", json!({}));
+        }
+        ui.weak(format!("{}x{} at {},{}", a.w, a.h, a.x, a.y));
+    });
+    ui.checkbox(&mut e.view.anim_guides, "Show frames on the canvas").on_hover_text("Lines where the cuts fall, with the cells that do not play dimmed (also View > Animation Frames)");
+    ui.weak("Left / Right step and Space plays while the pointer is over this tab.");
+
+    let Some(a) = e.doc.anim else { return };
+    canvas::update_texture(ui.ctx(), e, g);
+    let avail = ui.available_size();
+    if avail.x < 16.0 || avail.y < 16.0 {
+        return;
+    }
+    let (resp, p) = ui.allocate_painter(avail, Sense::hover());
+    let (fx, fy) = a.origin(e.view.anim_frame.min(a.count().saturating_sub(1)));
+    let (fw, fh, dw, dh) = (a.fw as f32, a.fh as f32, e.doc.w as f32, e.doc.h as f32);
+    let fit = ((avail.x - 8.0) / fw).min((avail.y - 8.0) / fh);
+    let scale = if fit >= 1.0 { fit.floor() } else { fit.max(0.01) };
+    let r = Rect::from_center_size(resp.rect.center(), vec2(fw, fh) * scale);
+    if let Some(t) = &g.tex {
+        // The frame is cut from the canvas texture, so it shows exactly what the canvas shows
+        // (visible layers, colour cycling) and follows edits as they are drawn.
+        let uv = Rect::from_min_max(pos2(fx as f32 / dw, fy as f32 / dh), pos2((fx as f32 + fw) / dw, (fy as f32 + fh) / dh));
+        p.image(t.id(), r, uv, Color32::WHITE);
+    }
+    p.rect_stroke(r, 0.0, Stroke::new(1.0_f32, Color32::from_white_alpha(40)), StrokeKind::Outside);
+}
+
 // ------------------------------------------------------------------ script
 
 pub fn script(ui: &mut egui::Ui, _e: &mut Engine, g: &mut Gui) {

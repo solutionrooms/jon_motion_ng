@@ -195,8 +195,9 @@ pub fn registry() -> &'static Vec<Cmd> {
         palette_cmds(&mut b);
         tile_cmds(&mut b);
         editor_cmds(&mut b);
+        animation_cmds(&mut b);
         for c in &mut b.0 {
-            c.float_ok = matches!(c.name, "float_move" | "float_commit" | "float_cancel" | "float_lift" | "flip");
+            c.float_ok = matches!(c.name, "float_move" | "float_commit" | "float_cancel" | "float_lift" | "flip" | "anim_set" | "anim_clear");
         }
         b.0
     })
@@ -208,7 +209,7 @@ pub fn find(name: &str) -> Option<&'static Cmd> {
     idx.get(name).map(|&i| &registry()[i])
 }
 
-pub const CATEGORIES: &[&str] = &["document", "layer", "draw", "selection", "palette", "tiles", "editor"];
+pub const CATEGORIES: &[&str] = &["document", "layer", "draw", "selection", "palette", "tiles", "animation", "editor"];
 
 /// Human/AI readable command reference.
 pub fn reference(cat: Option<&str>, search: Option<&str>) -> String {
@@ -1876,6 +1877,7 @@ fn editor_cmds(b: &mut B) {
         "zoom:num? Screen pixels per image pixel; center_x:num? Image X at the centre of the view; center_y:num? Image Y at the centre; fit:bool? Zoom to fit the window; \
          pixel_grid:bool? Pixel grid at high zoom; grid:bool? Custom grid; grid_w:int? Grid cell width; grid_h:int? Grid cell height; \
          tile_grid:bool? Tile grid; tile_ids:bool? Show tile ids on the canvas; cycling:bool? Preview colour cycling; \
+         anim_guides:bool? Show the animation's frame cuts on the canvas; \
          keymap:str? Single-key shortcuts in the window: standard or dpaint (Deluxe Paint keys)",
         "Change what the app window shows. Has no effect on the document.",
         |e, a| {
@@ -1916,6 +1918,9 @@ fn editor_cmds(b: &mut B) {
             if let Some(b) = a.ob("cycling")? {
                 v.cycling = b;
             }
+            if let Some(b) = a.ob("anim_guides")? {
+                v.anim_guides = b;
+            }
             if let Some(k) = a.os("keymap")? {
                 v.keymap = Keymap::parse(k).ok_or_else(|| format!("unknown keymap '{k}' (standard or dpaint)"))?;
             }
@@ -1925,6 +1930,110 @@ fn editor_cmds(b: &mut B) {
     b.add("editor", "get_view", Read, "", "Current zoom, view centre and overlay settings.", |e, _| {
         let v = &e.view;
         Ok(json!({"zoom": v.zoom, "center_x": v.cx, "center_y": v.cy, "pixel_grid": v.pixel_grid, "grid": v.grid, "grid_w": v.grid_w,
-                  "grid_h": v.grid_h, "tile_grid": v.tile_grid, "tile_ids": v.tile_ids, "cycling": v.cycling, "keymap": v.keymap.name()}))
+                  "grid_h": v.grid_h, "tile_grid": v.tile_grid, "tile_ids": v.tile_ids, "cycling": v.cycling, "anim_guides": v.anim_guides, "keymap": v.keymap.name()}))
     });
+}
+
+// ------------------------------------------------------------------ animation
+
+pub fn anim_json(e: &Engine) -> Value {
+    let Some(a) = e.doc.anim else { return json!({"active": false}) };
+    let frame = e.view.anim_frame.min(a.count().saturating_sub(1));
+    let (fx, fy) = a.origin(frame);
+    json!({"active": true, "x": a.x, "y": a.y, "w": a.w, "h": a.h, "frame_w": a.fw, "frame_h": a.fh, "cols": a.cols(), "rows": a.rows(),
+           "frames": a.count(), "fps": a.fps, "frame": frame, "frame_x": fx, "frame_y": fy, "playing": e.view.anim_playing})
+}
+
+fn animation_cmds(b: &mut B) {
+    use Kind::*;
+    b.add(
+        "animation",
+        "anim_set",
+        Edit,
+        "x:int? Left of the region; y:int? Top of the region; w:int? Region width; h:int? Region height; \
+         frame_w:int? Width of one frame (default: the grid width); frame_h:int? Height of one frame (default: the grid height); \
+         frames:int? How many frames play, 0 for every frame in the region (default 0); fps:num? Frames per second, 1-60 (default 8)",
+        "Set up the sprite-sheet animation: a region of the image is cut into frames of frame_w x frame_h, read left to right, then top to bottom \
+         (part frames at the right and bottom edges are left out). With no animation set, the region defaults to the selection, or the whole image \
+         when nothing is selected; with one set, anything omitted keeps its value. The setup is saved in the project; no pixels change.",
+        |e, a| {
+            let cur = e.doc.anim;
+            let (dw, dh) = (e.doc.w as i64, e.doc.h as i64);
+            let base = match (cur, e.doc.sel_bounds()) {
+                (Some(c), _) => (c.x as i64, c.y as i64, c.w as i64, c.h as i64),
+                (None, Some((x0, y0, x1, y1))) => (x0 as i64, y0 as i64, (x1 - x0 + 1) as i64, (y1 - y0 + 1) as i64),
+                (None, None) => (0, 0, dw, dh),
+            };
+            let (x, y) = (a.oi("x")?.unwrap_or(base.0), a.oi("y")?.unwrap_or(base.1));
+            let (w, h) = (a.oi("w")?.unwrap_or(base.2), a.oi("h")?.unwrap_or(base.3));
+            // The part of the region that lies on the image.
+            let (x0, y0, x1, y1) = (x.clamp(0, dw), y.clamp(0, dh), (x + w).clamp(0, dw), (y + h).clamp(0, dh));
+            if x1 <= x0 || y1 <= y0 {
+                return Err("the region is empty or outside the image".into());
+            }
+            let (w, h) = (x1 - x0, y1 - y0);
+            let fw = a.oi("frame_w")?.or(cur.map(|c| c.fw as i64)).unwrap_or(e.view.grid_w as i64);
+            let fh = a.oi("frame_h")?.or(cur.map(|c| c.fh as i64)).unwrap_or(e.view.grid_h as i64);
+            if fw < 1 || fh < 1 {
+                return Err("frame_w and frame_h must be at least 1".into());
+            }
+            if fw > w || fh > h {
+                return Err(format!("a {fw}x{fh} frame does not fit in the {w}x{h} region"));
+            }
+            let total = (w / fw) * (h / fh);
+            let limit = a.oi("frames")?.or(cur.map(|c| c.limit as i64)).unwrap_or(0);
+            if limit < 0 {
+                return Err("frames must be 0 (all) or more".into());
+            }
+            let fps = a.of("fps")?.map(|v| v as f32).or(cur.map(|c| c.fps)).unwrap_or(8.0);
+            if !Anim::FPS.contains(&fps) {
+                return Err("fps must be between 1 and 60".into());
+            }
+            let anim = Anim { x: x0 as u32, y: y0 as u32, w: w as u32, h: h as u32, fw: fw as u32, fh: fh as u32, limit: if limit >= total { 0 } else { limit as u32 }, fps };
+            e.doc.anim = Some(anim);
+            if cur.is_none() {
+                e.view.anim_frame = 0;
+                e.view.anim_playing = true;
+            }
+            e.view.anim_frame = e.view.anim_frame.min(anim.count() - 1);
+            Ok(anim_json(e))
+        },
+    );
+    b.add("animation", "anim_clear", Edit, "", "Remove the animation setup. No pixels change.", |e, _| {
+        e.doc.anim = None;
+        e.view.anim_playing = false;
+        ok()
+    });
+    b.add(
+        "animation",
+        "anim_control",
+        Read,
+        "frame:int? Show this frame (0 is the first); step:int? Move this many frames forward, or back when negative, wrapping round; \
+         playing:bool? Start or stop playback in the app window",
+        "Step or play the animation. This is the playback position only: it is not saved and does not change the document.",
+        |e, a| {
+            let n = e.doc.anim.ok_or("no animation is set up (see anim_set)")?.count() as i64;
+            if let Some(f) = a.oi("frame")? {
+                if f < 0 || f >= n {
+                    return Err(format!("frame {f} is out of range (0-{})", n - 1));
+                }
+                e.view.anim_frame = f as u32;
+            }
+            if let Some(d) = a.oi("step")? {
+                e.view.anim_frame = (e.view.anim_frame as i64 + d).rem_euclid(n) as u32;
+            }
+            if let Some(p) = a.ob("playing")? {
+                e.view.anim_playing = p;
+            }
+            Ok(anim_json(e))
+        },
+    );
+    b.add(
+        "animation",
+        "anim_info",
+        Read,
+        "",
+        "The animation setup and playback position: region, frame size, cols, rows, frames, fps, the current frame and where it is in the image (frame_x, frame_y).",
+        |e, _| Ok(anim_json(e)),
+    );
 }

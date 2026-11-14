@@ -26,6 +26,7 @@ pub enum Tab {
     Layers,
     Tiles,
     Preview,
+    Anim,
 }
 
 pub enum Dialog {
@@ -92,6 +93,14 @@ pub struct Gui {
     pub mcp_port: Option<u16>,
     pub title: String,
     pub tileset_size: (u32, u32),
+    /// Where the Animation tab was drawn this frame; its keys apply while the pointer is over it.
+    pub anim_rect: egui::Rect,
+    /// When the playing animation last advanced.
+    pub anim_clock: f64,
+    /// Frame size typed in before an animation exists; `None` follows the grid size.
+    pub anim_size: Option<(u32, u32)>,
+    /// A tab to bring to the front.
+    pub show_tab: Option<Tab>,
 }
 
 impl Gui {
@@ -130,6 +139,10 @@ impl Gui {
             mcp_port: None,
             title: String::new(),
             tileset_size: (16, 16),
+            anim_rect: egui::Rect::NOTHING,
+            anim_clock: 0.0,
+            anim_size: None,
+            show_tab: None,
         }
     }
 
@@ -261,7 +274,7 @@ impl App {
         let mut dock = DockState::new(vec![Tab::Canvas, Tab::Script]);
         let surface = dock.main_surface_mut();
         let [_, right] = surface.split_right(NodeIndex::root(), 0.77, vec![Tab::Palette]);
-        surface.split_below(right, 0.52, vec![Tab::Layers, Tab::Tiles, Tab::Preview]);
+        surface.split_below(right, 0.52, vec![Tab::Layers, Tab::Tiles, Tab::Preview, Tab::Anim]);
         App { engine, gui, dock }
     }
 }
@@ -281,6 +294,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Tab::Layers => "Layers",
             Tab::Tiles => "Tiles",
             Tab::Preview => "Preview",
+            Tab::Anim => "Animation",
         }
         .into()
     }
@@ -292,6 +306,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Tab::Layers => panels::layers(ui, self.e, self.g),
             Tab::Tiles => panels::tiles(ui, self.e, self.g),
             Tab::Preview => panels::preview(ui, self.e, self.g),
+            Tab::Anim => panels::animation(ui, self.e, self.g),
         }
     }
     fn closeable(&mut self, _tab: &mut Tab) -> bool {
@@ -299,7 +314,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
     }
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         match tab {
-            Tab::Canvas | Tab::Preview | Tab::Script => [false, false],
+            Tab::Canvas | Tab::Preview | Tab::Script | Tab::Anim => [false, false],
             _ => [false, true],
         }
     }
@@ -437,6 +452,7 @@ pub fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     let cmd = Modifiers::COMMAND;
     let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
     let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+    let anim_rect = std::mem::replace(&mut g.anim_rect, egui::Rect::NOTHING);
     // File shortcuts work even while typing.
     if hit(cmd_shift, Key::S) {
         save(e, g, true);
@@ -503,6 +519,19 @@ pub fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
         }
     }
     let plain = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+    // With the pointer over the Animation tab, Left / Right and Space drive the animation. Anywhere
+    // else they keep their usual jobs: the arrows nudge the selection, and Space held pans the canvas.
+    if e.doc.anim.is_some() && ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| anim_rect.contains(p)) {
+        if plain(Key::Space) {
+            g.run(e, "anim_control", json!({ "playing": !e.view.anim_playing }));
+        }
+        for (k, step) in [(Key::ArrowLeft, -1), (Key::ArrowRight, 1)] {
+            // Shift is taken as well, so it cannot fall through to the 8 px selection nudge.
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k) || i.consume_key(Modifiers::SHIFT, k)) {
+                g.run(e, "anim_control", json!({ "step": step, "playing": false }));
+            }
+        }
+    }
     match e.view.keymap {
         Keymap::Standard => {
             for t in Tool::ALL {
@@ -686,6 +715,10 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if item(ui, "Crop Canvas to Selection", "") {
                 g.run(e, "crop_to_selection", json!({}));
             }
+            ui.separator();
+            if item(ui, "Animate Selection", "") {
+                panels::animate_selection(e, g);
+            }
         });
         ui.menu_button("Image", |ui| {
             if item(ui, "Canvas Size...", "") {
@@ -821,6 +854,7 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             });
             ui.checkbox(&mut e.view.tile_grid, "Tile Grid");
             ui.checkbox(&mut e.view.tile_ids, "Tile Numbers");
+            ui.checkbox(&mut e.view.anim_guides, "Animation Frames");
         });
         ui.menu_button("Help", |ui| {
             if item(ui, "Keyboard Shortcuts", "") {
@@ -1000,6 +1034,7 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
                     ("Add / subtract selection", "Shift / Alt with Select or Wand"),
                     ("Grab selection as brush", "Cmd/Ctrl + B"),
                     ("Nudge selection", "Arrow keys (Shift = 8 px)"),
+                    ("Animation: step / play", "Left and Right / Space, pointer over the Animation tab"),
                     ("Commit / cancel floating pixels", "Enter / Esc"),
                     ("Toggle grid", "Cmd/Ctrl + G"),
                     ("Run script", "Cmd/Ctrl + Enter in the Script tab"),
@@ -1180,11 +1215,16 @@ impl eframe::App for App {
             if g.saved_keymap.is_some() {
                 save_settings(e, g);
             }
+        } else {
+            g.anim_rect = egui::Rect::NOTHING;
         }
         egui::TopBottomPanel::top("menu").show(ctx, |ui| menu_bar(ui, e, g));
         egui::TopBottomPanel::top("options").exact_height(34.0).show(ctx, |ui| panels::options(ui, e, g));
         egui::TopBottomPanel::bottom("status").exact_height(24.0).show(ctx, |ui| panels::status(ui, e, g));
         egui::SidePanel::left("tools").exact_width(46.0).resizable(false).show(ctx, |ui| panels::toolbar(ui, e, g));
+        if let Some(at) = g.show_tab.take().and_then(|t| self.dock.find_tab(&t)) {
+            self.dock.set_active_tab(at);
+        }
         let mut style = egui_dock::Style::from_egui(ctx.style().as_ref());
         style.tab_bar.fill_tab_bar = true;
         DockArea::new(&mut self.dock)

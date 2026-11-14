@@ -807,3 +807,245 @@ fn deluxe_paint_keys() {
         assert!(!has(&shapes, hidden), "{map:?}: '{hidden}' is not listed");
     }
 }
+
+// ---------------------------------------------------------------- animation
+
+#[test]
+fn animation_setup_is_part_of_the_document_and_playback_is_not() {
+    let mut e = eng(128, 64);
+    assert_eq!(e.exec("anim_info", &json!({})).unwrap()["active"], false);
+    assert!(e.exec("anim_control", &json!({"step": 1})).is_err(), "nothing to step yet");
+
+    // With nothing selected the whole image is cut up, at the grid size.
+    let v = e.exec("anim_set", &json!({})).unwrap();
+    assert_eq!((v["w"].as_i64(), v["frame_w"].as_i64(), v["cols"].as_i64(), v["rows"].as_i64(), v["frames"].as_i64()), (Some(128), Some(16), Some(8), Some(4), Some(32)));
+    e.exec("anim_clear", &json!({})).unwrap();
+
+    // A selection gives the start and extent; part frames at the right and bottom edges are left out.
+    e.exec("select_rect", &json!({"x": 8, "y": 16, "w": 70, "h": 40})).unwrap();
+    let v = e.exec("anim_set", &json!({"frame_w": 16, "frame_h": 16, "fps": 12})).unwrap();
+    assert_eq!((v["x"].as_i64(), v["y"].as_i64(), v["cols"].as_i64(), v["rows"].as_i64(), v["frames"].as_i64()), (Some(8), Some(16), Some(4), Some(2), Some(8)));
+    assert_eq!(v["playing"], true, "a new animation starts playing");
+
+    // Frames run left to right, then top to bottom, and stepping wraps both ways.
+    let at = |e: &mut Engine, p: Value| {
+        let v = e.exec("anim_control", &p).unwrap();
+        (v["frame"].as_i64().unwrap(), v["frame_x"].as_i64().unwrap(), v["frame_y"].as_i64().unwrap())
+    };
+    assert_eq!(at(&mut e, json!({"frame": 3})), (3, 56, 16));
+    assert_eq!(at(&mut e, json!({"step": 1})), (4, 8, 32), "after the end of a row comes the start of the next");
+    assert_eq!(at(&mut e, json!({"step": 4})), (0, 8, 16));
+    assert_eq!(at(&mut e, json!({"step": -1})), (7, 56, 32));
+    assert!(e.exec("anim_control", &json!({"frame": 8})).is_err());
+
+    // A frame count stops before the empty cells of the last row; later changes keep what was set.
+    let v = e.exec("anim_set", &json!({"frames": 6})).unwrap();
+    assert_eq!((v["frames"].as_i64(), v["frame"].as_i64(), v["fps"].as_f64(), v["x"].as_i64()), (Some(6), Some(5), Some(12.0), Some(8)));
+    assert_eq!(at(&mut e, json!({"step": 1})), (0, 8, 16));
+    for bad in [json!({"frame_w": 0}), json!({"frame_w": 71}), json!({"fps": 0}), json!({"fps": 500}), json!({"frames": -1}), json!({"x": 500}), json!({"w": -4}), json!({"speed": 3})] {
+        assert!(e.exec("anim_set", &bad).is_err(), "{bad} is refused");
+    }
+    assert_eq!(e.exec("anim_info", &json!({})).unwrap()["frames"], 6, "a refused change leaves the setup alone");
+
+    // A region hanging off the image is clipped to it.
+    let v = e.exec("anim_set", &json!({"x": 96, "y": 0, "w": 400, "h": 16, "frames": 0})).unwrap();
+    assert_eq!((v["w"].as_i64(), v["frames"].as_i64()), (Some(32), Some(2)));
+
+    // The setup is a document change (undoable, marks it modified); stepping and playing are not.
+    let (undo, doc) = (e.undo.len(), e.doc.clone());
+    e.modified = false;
+    e.exec("anim_control", &json!({"step": 1, "playing": false})).unwrap();
+    assert!(e.undo.len() == undo && !e.modified && e.doc == doc, "playback leaves the document alone");
+    e.exec("anim_set", &json!({"fps": 20})).unwrap();
+    assert!(e.undo.len() == undo + 1 && e.modified);
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!(e.exec("anim_info", &json!({})).unwrap()["fps"], 12.0);
+    // No pixels were touched by any of it.
+    assert!(e.doc.layers == doc.layers);
+
+    // It is saved in the project, and comes back on open.
+    let p = tmp("anim.jmn");
+    e.exec("save_document", &json!({"path": p})).unwrap();
+    let saved = e.doc.anim;
+    assert!(saved.is_some());
+    e.exec("new_document", &json!({"width": 8, "height": 8, "force": true})).unwrap();
+    assert_eq!(e.exec("anim_info", &json!({})).unwrap()["active"], false);
+    e.exec("open_document", &json!({"path": p})).unwrap();
+    assert_eq!(e.doc.anim, saved);
+
+    // An animation that no longer fits the image goes, and undo brings it back.
+    e.exec("resize_canvas", &json!({"width": 100, "height": 64})).unwrap();
+    assert_eq!(e.exec("anim_info", &json!({})).unwrap()["active"], false);
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!(e.doc.anim, saved);
+
+    // Scripts drive it too.
+    let out = script::run_lua(&mut e, "jm.anim_set{ x = 0, y = 0, w = 64, h = 32, frame_w = 32, frame_h = 32 } jm.anim_control{ frame = 1 } return jm.anim_info().frame_x");
+    assert_eq!((out.error, out.result), (None, json!(32)));
+}
+
+#[test]
+fn project_files_stay_compatible_with_published_builds() {
+    use crate::doc::*;
+    use std::io::{Read, Write};
+    let inflate = |path: &str| {
+        let bytes = std::fs::read(path).unwrap();
+        let mut raw = vec![];
+        flate2::read::DeflateDecoder::new(&bytes[6..]).read_to_end(&mut raw).unwrap();
+        (bytes[..6].to_vec(), raw)
+    };
+    let write = |path: &str, magic: &[u8], raw: &[u8]| {
+        let mut out = magic.to_vec();
+        let mut enc = flate2::write::DeflateEncoder::new(&mut out, flate2::Compression::default());
+        enc.write_all(raw).unwrap();
+        enc.finish().unwrap();
+        std::fs::write(path, out).unwrap();
+    };
+    let mut d = Doc::new(64, 32, Palette::default_256());
+    d.layers[0] = { let mut l = d.layers[0].clone(); std::sync::Arc::make_mut(&mut l.data)[5] = 9; l };
+    let plain = bincode::serialize(&d).unwrap();
+
+    // A project without an animation is byte-for-byte what 0.1.3 wrote.
+    let p = tmp("compat.jmn");
+    crate::io::save_doc(&d, std::path::Path::new(&p)).unwrap();
+    let (magic, raw) = inflate(&p);
+    assert_eq!(raw, plain);
+
+    // With one, the document comes first and unchanged, so 0.1.3's loader - bincode::deserialize
+    // of the whole buffer - still reads it; it just does not see the animation.
+    d.anim = Some(Anim { x: 0, y: 0, w: 64, h: 32, fw: 16, fh: 16, limit: 5, fps: 10.0 });
+    crate::io::save_doc(&d, std::path::Path::new(&p)).unwrap();
+    let (_, raw) = inflate(&p);
+    assert!(raw.len() > plain.len() && raw[..plain.len()] == plain[..]);
+    let old: Doc = bincode::deserialize(&raw).unwrap();
+    assert!(old.layers == d.layers && old.anim.is_none());
+    assert_eq!(crate::io::load_doc(std::path::Path::new(&p)).unwrap().anim, d.anim);
+
+    // Chunks this build does not know are skipped, in any order; damaged ones are ignored.
+    let anim = &raw[plain.len()..];
+    let unknown = [b"WHAT".as_slice(), &3u32.to_le_bytes(), &[1, 2, 3]].concat();
+    for (extra, kept) in [
+        ([unknown.as_slice(), anim].concat(), true),
+        ([anim, unknown.as_slice()].concat(), true),
+        (anim[..anim.len() - 1].to_vec(), false),
+        ([b"ANIM".as_slice(), &u32::MAX.to_le_bytes(), &[0; 40]].concat(), false),
+        ([b"ANIM".as_slice(), &2u32.to_le_bytes(), &[7, 7]].concat(), false),
+        ([anim, b"ANIM".as_slice(), &2u32.to_le_bytes(), &[7, 7]].concat(), true),
+        (vec![0xff; 5], false),
+    ] {
+        write(&p, &magic, &[plain.as_slice(), &extra].concat());
+        let got = crate::io::load_doc(std::path::Path::new(&p)).unwrap();
+        assert_eq!(got.anim.is_some(), kept, "extra bytes {extra:?}");
+        assert!(got.layers == d.layers);
+    }
+
+    // The stored setup is checked like the rest of the file.
+    let good = d.anim.unwrap();
+    for (a, expect) in [
+        (Anim { fps: f32::NAN, ..good }, Some(Anim { fps: 8.0, ..good })),
+        (Anim { fps: -3.0, ..good }, Some(Anim { fps: 8.0, ..good })),
+        (Anim { fps: f32::INFINITY, ..good }, Some(Anim { fps: 8.0, ..good })),
+        (Anim { limit: u32::MAX, ..good }, Some(Anim { limit: 0, ..good })),
+        (Anim { fw: 0, ..good }, None),
+        (Anim { fh: 0, ..good }, None),
+        (Anim { fw: 65, ..good }, None),
+        (Anim { x: 1, ..good }, None),
+        (Anim { x: u32::MAX, y: u32::MAX, ..good }, None),
+        (Anim { w: u32::MAX, h: u32::MAX, fw: 1, fh: 1, ..good }, None),
+    ] {
+        d.anim = Some(a);
+        crate::io::save_doc(&d, std::path::Path::new(&p)).unwrap();
+        let mut e = Engine::new("headless");
+        e.exec("open_document", &json!({"path": p})).unwrap();
+        assert_eq!(e.doc.anim, expect, "{a:?}");
+        // Whatever survived can be shown and stepped without trouble.
+        e.exec("anim_info", &json!({})).unwrap();
+        let _ = e.exec("anim_control", &json!({"step": 1}));
+    }
+}
+
+#[test]
+fn animation_keys_apply_over_its_tab_only() {
+    let ctx = egui::Context::default();
+    let (mut e, mut g) = (Engine::new("gui"), Gui::new());
+    e.exec("new_document", &json!({"width": 64, "height": 64, "force": true})).unwrap();
+    let mut time = 0.0;
+    let mut frame = |e: &mut Engine, g: &mut Gui, events: Vec<Event>| {
+        time += 1.0 / 60.0;
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0))), time: Some(time), events, ..Default::default() };
+        let _ = ctx.run(raw, |ctx| {
+            crate::app::shortcuts(ctx, e, g);
+            egui::SidePanel::right("anim").exact_width(300.0).show(ctx, |ui| crate::panels::animation(ui, e, g));
+            egui::CentralPanel::default().show(ctx, |ui| canvas::show(ui, e, g));
+        });
+    };
+    let key = |key: egui::Key| vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }];
+    let (over_tab, over_canvas) = (Event::PointerMoved(pos2(850.0, 400.0)), Event::PointerMoved(pos2(300.0, 400.0)));
+    let sel_x = |e: &Engine| e.doc.sel_bounds().unwrap().0;
+
+    e.exec("select_rect", &json!({"x": 8, "y": 8, "w": 32, "h": 16})).unwrap();
+    // No animation yet: over the tab or not, the arrows nudge the selection as they always did.
+    frame(&mut e, &mut g, vec![over_tab.clone()]);
+    frame(&mut e, &mut g, key(egui::Key::ArrowRight));
+    assert_eq!(sel_x(&e), 9);
+
+    crate::panels::animate_selection(&mut e, &mut g);
+    let a = e.doc.anim.unwrap();
+    assert_eq!((a.x, a.y, a.w, a.h, a.count()), (9, 8, 32, 16, 2), "the selection is the strip; frames are grid sized");
+    assert_eq!(g.show_tab, Some(crate::app::Tab::Anim));
+    e.exec("anim_set", &json!({"frame_w": 8, "frame_h": 8, "fps": 10})).unwrap();
+    assert!(e.view.anim_playing);
+
+    // Playing advances with time, at the chosen speed.
+    frame(&mut e, &mut g, vec![]);
+    let start = e.view.anim_frame;
+    for _ in 0..60 {
+        frame(&mut e, &mut g, vec![]);
+    }
+    assert_eq!((e.view.anim_frame + 8 - start) % 8, 10 % 8, "a second at 10 fps is ten frames");
+
+    // Over the tab: Space pauses and plays, Left / Right step (and pause); the selection stays put.
+    frame(&mut e, &mut g, key(egui::Key::Space));
+    assert!(!e.view.anim_playing);
+    let f = e.view.anim_frame;
+    frame(&mut e, &mut g, key(egui::Key::ArrowRight));
+    frame(&mut e, &mut g, key(egui::Key::ArrowRight));
+    assert_eq!(e.view.anim_frame, (f + 2) % 8);
+    frame(&mut e, &mut g, key(egui::Key::ArrowLeft));
+    assert_eq!(e.view.anim_frame, (f + 1) % 8);
+    assert_eq!(sel_x(&e), 9, "the arrows did not nudge the selection");
+    for _ in 0..30 {
+        frame(&mut e, &mut g, vec![]);
+    }
+    assert_eq!(e.view.anim_frame, (f + 1) % 8, "paused means paused");
+    frame(&mut e, &mut g, key(egui::Key::Space));
+    assert!(e.view.anim_playing);
+    frame(&mut e, &mut g, key(egui::Key::ArrowLeft));
+    assert!(!e.view.anim_playing, "stepping stops playback");
+    // Shift + arrow steps as well, rather than falling through to the 8 px selection nudge.
+    let f = e.view.anim_frame;
+    frame(&mut e, &mut g, vec![Event::Key { key: egui::Key::ArrowRight, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::SHIFT }]);
+    assert_eq!((e.view.anim_frame, sel_x(&e)), ((f + 1) % 8, 9));
+    // The frame lines on the canvas are a view setting.
+    e.exec("set_view", &json!({"anim_guides": false})).unwrap();
+    assert_eq!(e.exec("get_view", &json!({})).unwrap()["anim_guides"], false);
+    frame(&mut e, &mut g, vec![]);
+    e.exec("set_view", &json!({"anim_guides": true})).unwrap();
+
+    // Over the canvas the same keys keep their usual jobs.
+    let f = e.view.anim_frame;
+    frame(&mut e, &mut g, vec![over_canvas]);
+    frame(&mut e, &mut g, key(egui::Key::ArrowRight));
+    frame(&mut e, &mut g, key(egui::Key::Space));
+    assert_eq!((sel_x(&e), e.view.anim_frame, e.view.anim_playing), (10, f, false));
+
+    // The Deluxe Paint preset leaves these keys alone too.
+    e.view.keymap = Keymap::DPaint;
+    frame(&mut e, &mut g, vec![over_tab]);
+    let mut space = key(egui::Key::Space);
+    space.push(Event::Text(" ".into()));
+    frame(&mut e, &mut g, space);
+    assert!(e.view.anim_playing);
+    frame(&mut e, &mut g, key(egui::Key::ArrowRight));
+    assert_eq!((e.view.anim_frame, sel_x(&e)), ((f + 1) % 8, 10));
+}

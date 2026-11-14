@@ -930,6 +930,7 @@ fn project_files_stay_compatible_with_published_builds() {
         (anim[..anim.len() - 1].to_vec(), false),
         ([b"ANIM".as_slice(), &u32::MAX.to_le_bytes(), &[0; 40]].concat(), false),
         ([b"ANIM".as_slice(), &2u32.to_le_bytes(), &[7, 7]].concat(), false),
+        ([anim, b"ANIM".as_slice(), &2u32.to_le_bytes(), &[7, 7]].concat(), true),
         (vec![0xff; 5], false),
     ] {
         write(&p, &magic, &[plain.as_slice(), &extra].concat());
@@ -1021,6 +1022,15 @@ fn animation_keys_apply_over_its_tab_only() {
     assert!(e.view.anim_playing);
     frame(&mut e, &mut g, key(egui::Key::ArrowLeft));
     assert!(!e.view.anim_playing, "stepping stops playback");
+    // Shift + arrow steps as well, rather than falling through to the 8 px selection nudge.
+    let f = e.view.anim_frame;
+    frame(&mut e, &mut g, vec![Event::Key { key: egui::Key::ArrowRight, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::SHIFT }]);
+    assert_eq!((e.view.anim_frame, sel_x(&e)), ((f + 1) % 8, 9));
+    // The frame lines on the canvas are a view setting.
+    e.exec("set_view", &json!({"anim_guides": false})).unwrap();
+    assert_eq!(e.exec("get_view", &json!({})).unwrap()["anim_guides"], false);
+    frame(&mut e, &mut g, vec![]);
+    e.exec("set_view", &json!({"anim_guides": true})).unwrap();
 
     // Over the canvas the same keys keep their usual jobs.
     let f = e.view.anim_frame;

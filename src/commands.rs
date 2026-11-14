@@ -1877,6 +1877,7 @@ fn editor_cmds(b: &mut B) {
         "zoom:num? Screen pixels per image pixel; center_x:num? Image X at the centre of the view; center_y:num? Image Y at the centre; fit:bool? Zoom to fit the window; \
          pixel_grid:bool? Pixel grid at high zoom; grid:bool? Custom grid; grid_w:int? Grid cell width; grid_h:int? Grid cell height; \
          tile_grid:bool? Tile grid; tile_ids:bool? Show tile ids on the canvas; cycling:bool? Preview colour cycling; \
+         anim_guides:bool? Show the animation's frame cuts on the canvas; \
          keymap:str? Single-key shortcuts in the window: standard or dpaint (Deluxe Paint keys)",
         "Change what the app window shows. Has no effect on the document.",
         |e, a| {
@@ -1917,6 +1918,9 @@ fn editor_cmds(b: &mut B) {
             if let Some(b) = a.ob("cycling")? {
                 v.cycling = b;
             }
+            if let Some(b) = a.ob("anim_guides")? {
+                v.anim_guides = b;
+            }
             if let Some(k) = a.os("keymap")? {
                 v.keymap = Keymap::parse(k).ok_or_else(|| format!("unknown keymap '{k}' (standard or dpaint)"))?;
             }
@@ -1926,7 +1930,7 @@ fn editor_cmds(b: &mut B) {
     b.add("editor", "get_view", Read, "", "Current zoom, view centre and overlay settings.", |e, _| {
         let v = &e.view;
         Ok(json!({"zoom": v.zoom, "center_x": v.cx, "center_y": v.cy, "pixel_grid": v.pixel_grid, "grid": v.grid, "grid_w": v.grid_w,
-                  "grid_h": v.grid_h, "tile_grid": v.tile_grid, "tile_ids": v.tile_ids, "cycling": v.cycling, "keymap": v.keymap.name()}))
+                  "grid_h": v.grid_h, "tile_grid": v.tile_grid, "tile_ids": v.tile_ids, "cycling": v.cycling, "anim_guides": v.anim_guides, "keymap": v.keymap.name()}))
     });
 }
 

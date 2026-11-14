@@ -526,7 +526,8 @@ pub fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             g.run(e, "anim_control", json!({ "playing": !e.view.anim_playing }));
         }
         for (k, step) in [(Key::ArrowLeft, -1), (Key::ArrowRight, 1)] {
-            if plain(k) {
+            // Shift is taken as well, so it cannot fall through to the 8 px selection nudge.
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k) || i.consume_key(Modifiers::SHIFT, k)) {
                 g.run(e, "anim_control", json!({ "step": step, "playing": false }));
             }
         }
@@ -853,6 +854,7 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             });
             ui.checkbox(&mut e.view.tile_grid, "Tile Grid");
             ui.checkbox(&mut e.view.tile_ids, "Tile Numbers");
+            ui.checkbox(&mut e.view.anim_guides, "Animation Frames");
         });
         ui.menu_button("Help", |ui| {
             if item(ui, "Keyboard Shortcuts", "") {

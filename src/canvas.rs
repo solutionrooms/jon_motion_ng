@@ -422,7 +422,7 @@ pub fn show(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     painter.rect_stroke(img_rect, 0.0, Stroke::new(1.0_f32, Color32::from_white_alpha(40)), StrokeKind::Outside);
 
     // ---- animation frames: where the cuts fall, which cells play, and the frame on show
-    if let Some(a) = e.doc.anim {
+    if let Some(a) = e.doc.anim.filter(|_| e.view.anim_guides) {
         let amber = Color32::from_rgb(255, 190, 70);
         let (cols, rows, n) = (a.cols(), a.rows(), a.count());
         let at = |c: u32, r: u32| to_screen((a.x + c * a.fw) as f32, (a.y + r * a.fh) as f32);

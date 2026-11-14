@@ -923,6 +923,7 @@ pub fn animation(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
         }
         ui.weak(format!("{}x{} at {},{}", a.w, a.h, a.x, a.y));
     });
+    ui.checkbox(&mut e.view.anim_guides, "Show frames on the canvas").on_hover_text("Lines where the cuts fall, with the cells that do not play dimmed (also View > Animation Frames)");
     ui.weak("Left / Right step and Space plays while the pointer is over this tab.");
 
     let Some(a) = e.doc.anim else { return };

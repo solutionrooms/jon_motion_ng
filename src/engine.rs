@@ -198,6 +198,8 @@ pub struct View {
     /// setup lives in the document (`Doc::anim`); this playback position does not.
     pub anim_frame: u32,
     pub anim_playing: bool,
+    /// Draw the animation's frame cuts on the canvas.
+    pub anim_guides: bool,
 }
 
 #[derive(Clone)]
@@ -334,6 +336,7 @@ impl Engine {
                 cycling: false,
                 anim_frame: 0,
                 anim_playing: false,
+                anim_guides: true,
             },
             clipboard: None,
             path: None,

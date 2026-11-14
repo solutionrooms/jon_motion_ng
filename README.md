@@ -47,6 +47,8 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
 - **Animation** - select a strip of frames, give the size of one frame, and the Animation tab plays them
   (left to right, then top to bottom) while you keep drawing. Left / Right step and Space plays or pauses while
   the pointer is over the tab. The setup (region, frame size, frame count, speed) is saved in the project.
+  The region is a fixed rectangle: it does not follow a resize, scale or flip, and is removed if it no longer
+  fits the image (undo brings it back). View > Animation Frames hides the frame lines on the canvas.
 - **Files** - native `.jmn` projects (everything), PNG in and out. Exports are always indexed PNGs. An indexed
   PNG opens with its own palette; a true-colour PNG is converted to a generated palette of up to 256 colours.
 

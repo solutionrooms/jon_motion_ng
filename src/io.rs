@@ -67,7 +67,9 @@ fn read_chunks(d: &mut Doc, mut rest: &[u8]) {
         let len = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
         let Some(payload) = rest[8..].get(..len) else { return };
         if &rest[..4] == b"ANIM" {
-            d.anim = bincode::deserialize(payload).ok();
+            if let Ok(a) = bincode::deserialize(payload) {
+                d.anim = Some(a);
+            }
         }
         rest = &rest[8 + len..];
     }

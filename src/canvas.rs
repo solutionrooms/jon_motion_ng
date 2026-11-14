@@ -86,6 +86,10 @@ fn update_ants(e: &Engine, g: &mut Gui) {
         return;
     }
     g.ants_key = key;
+    g.ants_hold = match (&d.float, &d.selection) {
+        (Some(f), _) => (Some(f.data.clone()), f.sel.clone()),
+        (None, s) => (None, s.clone()),
+    };
     g.ants = match (&d.float, &d.selection) {
         (Some(f), _) => {
             let fw = f.w as i32;
@@ -188,7 +192,7 @@ fn press(e: &mut Engine, g: &mut Gui, button: usize, p: (i32, i32), mods: egui::
         }
         Tool::Select => Some(Drag::Select { start: p, cur: p, button }),
         Tool::Wand => {
-            g.run(e, "select_wand", json!({ "x": p.0, "y": p.1, "contiguous": e.o.contiguous, "tolerance": e.o.tolerance, "op": sel_op(mods) }));
+            g.run_select(e, "select_wand", json!({ "x": p.0, "y": p.1, "contiguous": e.o.contiguous, "tolerance": e.o.tolerance, "op": sel_op(mods) }));
             None
         }
         Tool::Move => {
@@ -330,7 +334,7 @@ pub fn show(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
                     } else {
                         let (x0, y0) = (s.0.min(c.0), s.1.min(c.1));
                         let params = json!({ "x": x0, "y": y0, "w": (s.0 - c.0).abs() + 1, "h": (s.1 - c.1).abs() + 1, "op": sel_op(mods) });
-                        g.run(e, "select_rect", params);
+                        g.run_select(e, "select_rect", params);
                     }
                 }
             }

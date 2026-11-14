@@ -54,7 +54,19 @@ impl<'a> Args<'a> {
         }
     }
     pub fn oi(&self, k: &str) -> Result<Option<i64>, String> {
-        Ok(self.of(k)?.map(|v| v.floor() as i64))
+        // Clamped so arithmetic on the result can never overflow.
+        Ok(self.of(k)?.map(|v| (v.floor() as i64).clamp(-(1 << 40), 1 << 40)))
+    }
+    /// A pixel coordinate or offset, clamped to a range far larger than any canvas.
+    pub fn c(&self, k: &str) -> Result<i32, String> {
+        Ok(self.i(k)?.clamp(-COORD as i64, COORD as i64) as i32)
+    }
+    pub fn oc(&self, k: &str) -> Result<Option<i32>, String> {
+        Ok(self.oi(k)?.map(|v| v.clamp(-COORD as i64, COORD as i64) as i32))
+    }
+    /// A width or height for a shape.
+    pub fn len(&self, k: &str) -> Result<i32, String> {
+        Ok(self.i(k)?.clamp(1, 2 * COORD as i64) as i32)
     }
     pub fn i(&self, k: &str) -> Result<i64, String> {
         self.oi(k)?.ok_or_else(|| format!("missing '{k}'"))
@@ -270,10 +282,16 @@ fn layer_data(e: &mut Engine, li: usize) -> Result<&mut Vec<Cell>, String> {
     Ok(Arc::make_mut(&mut l.data))
 }
 
+/// Destination for a save or export. The extension must match the format, so
+/// scripts and AI clients can only ever write .jmn, .png and .csv files.
 fn path_arg(a: &Args, ext: &str) -> Result<PathBuf, String> {
     let mut p = PathBuf::from(a.s("path")?);
-    if p.extension().is_none() {
-        p.set_extension(ext);
+    match p.extension() {
+        None => {
+            p.set_extension(ext);
+        }
+        Some(x) if x.eq_ignore_ascii_case(ext) => {}
+        Some(_) => return Err(format!("'{}' must end in .{ext}", p.display())),
     }
     Ok(p)
 }
@@ -294,7 +312,11 @@ pub fn info(e: &Engine) -> Value {
         "ramps": d.palette.ramps.len(),
         "tileset": d.tileset.as_ref().map(|t| json!({
             "tile_w": t.tw, "tile_h": t.th, "count": t.tiles.len(), "cols": d.w / t.tw, "rows": d.h / t.th })),
-        "selection": d.sel_bounds().map(|(x0, y0, x1, y1)| json!({"x": x0, "y": y0, "w": x1 - x0 + 1, "h": y1 - y0 + 1})),
+        // An empty selection (nothing can be drawn) reports w = h = 0; no selection is null.
+        "selection": d.selection.as_ref().map(|_| match d.sel_bounds() {
+            Some((x0, y0, x1, y1)) => json!({"x": x0, "y": y0, "w": x1 - x0 + 1, "h": y1 - y0 + 1}),
+            None => json!({"x": 0, "y": 0, "w": 0, "h": 0}),
+        }),
         "floating": d.float.is_some(),
         "fg": e.cell_json(e.o.fg), "bg": e.cell_json(e.o.bg),
         "path": e.path.as_ref().map(|p| p.display().to_string()),
@@ -323,7 +345,12 @@ fn install_doc(e: &mut Engine, doc: Doc, path: Option<PathBuf>) {
 
 pub fn doc_from_png(img: io::PngImage) -> Doc {
     match img.pixels {
-        io::PngPixels::Indexed { data, palette, trns } => {
+        io::PngPixels::Indexed { data, mut palette, trns } => {
+            // Trailing transparent entries are only there to carry transparency (our own
+            // exports add one); every pixel using them becomes transparent below.
+            while palette.len() > 1 && trns.get(palette.len() - 1).is_some_and(|a| *a < 128) {
+                palette.pop();
+            }
             let mut d = Doc::new(img.w, img.h, ColorMode::Indexed, Palette { colors: palette, ramps: vec![] });
             let n = d.palette.colors.len();
             d.layers[0].data = Arc::new(
@@ -430,6 +457,9 @@ fn remap_indices(e: &mut Engine, map: &[Cell]) {
         }
         e.o.fg = f(e.o.fg);
         e.o.bg = f(e.o.bg);
+        if let Some(cells) = e.o.custom_brush.as_mut().and_then(|b| b.cells.as_mut()) {
+            cells.iter_mut().for_each(|c| *c = f(*c));
+        }
     }
     for r in &mut e.doc.palette.ramps {
         r.indices = r.indices.iter().map(|&i| f(i as Cell)).filter(|&n| n < 256).map(|n| n as u8).collect();
@@ -531,7 +561,7 @@ fn draw(e: &mut Engine, a: &Args, o: PaintOpts, f: impl FnOnce(&mut Engine)) -> 
 
 fn points_arg(a: &Args, k: &str) -> Result<Vec<(i32, i32)>, String> {
     let arr = a.arr(k)?;
-    let num = |v: &Value| v.as_f64().map(|f| f.floor() as i32).ok_or_else(|| format!("'{k}' must contain numbers"));
+    let num = |v: &Value| v.as_f64().map(|f| (f.floor() as i32).clamp(-COORD, COORD)).ok_or_else(|| format!("'{k}' must contain numbers"));
     if arr.first().is_some_and(|v| v.is_array()) {
         arr.iter()
             .map(|p| {
@@ -587,7 +617,9 @@ fn sel_op(e: &mut Engine, mask: Vec<bool>, op: Option<&str>) -> Result<(), Strin
         "intersect" => mask.iter().enumerate().map(|(i, &m)| (m && has(i)) as u8).collect(),
         o => return Err(format!("unknown op '{o}' (replace, add, subtract, intersect)")),
     };
-    e.doc.selection = out.iter().any(|&v| v != 0).then(|| Arc::new(out));
+    // A result with no pixels stays an (empty) selection, so later drawing and
+    // selection_fill do nothing instead of silently applying to the whole layer.
+    e.doc.selection = Some(Arc::new(out));
     Ok(())
 }
 
@@ -673,7 +705,7 @@ fn document_cmds(b: &mut B) {
         "save_document",
         Read,
         "path:str? Destination .jmn file (default: the current file)",
-        "Save the project in the native .jmn format (layers, palette, ramps, tiles).",
+        "Save the project in the native .jmn format (layers, palette, ramps, tiles). Overwrites an existing file.",
         |e, a| {
             let p = match a.os("path")? {
                 Some(_) => path_arg(a, "jmn")?,
@@ -690,7 +722,7 @@ fn document_cmds(b: &mut B) {
         "export_png",
         Read,
         "path:str Destination file; scale:int? Integer upscale 1-64 (default 1); layer:layer? Export a single layer",
-        "Export a flattened PNG. Indexed documents export as indexed PNGs at scale 1.",
+        "Export a flattened PNG. Indexed documents export as indexed PNGs at scale 1. The scaled image may be at most 8192x8192 pixels in area.",
         |e, a| {
             let p = path_arg(a, "png")?;
             let layer = if a.get("layer").is_some() { Some(layer_arg(e, a)?) } else { None };
@@ -708,7 +740,7 @@ fn document_cmds(b: &mut B) {
         |e, a| {
             let p = PathBuf::from(a.s("path")?);
             let src = doc_from_png(io::load_png(&p)?);
-            let (ox, oy) = (a.oi("x")?.unwrap_or(0) as i32, a.oi("y")?.unwrap_or(0) as i32);
+            let (ox, oy) = (a.oc("x")?.unwrap_or(0), a.oc("y")?.unwrap_or(0));
             let name = a.os("name")?.map(str::to_string).unwrap_or_else(|| p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("Imported".into()));
             let mut l = e.doc.new_layer(&name);
             let (w, h) = (e.doc.w as i32, e.doc.h as i32);
@@ -1049,7 +1081,7 @@ fn draw_cmds(b: &mut B) {
         |e, a| {
             let li = layer_arg(e, a)?;
             let rows = rows_arg(e, a)?;
-            let (ox, oy) = (a.i("x")?, a.i("y")?);
+            let (ox, oy) = (a.c("x")? as i64, a.c("y")? as i64);
             let (w, h) = (e.doc.w as i64, e.doc.h as i64);
             let data = layer_data(e, li)?;
             let mut n = 0;
@@ -1076,12 +1108,12 @@ fn draw_cmds(b: &mut B) {
         })
     });
     b.paint("draw_line", "x0:int Start X; y0:int Start Y; x1:int End X; y1:int End Y", "Draw a straight line with the brush.", |e, a| {
-        let (x0, y0, x1, y1) = (a.i("x0")? as i32, a.i("y0")? as i32, a.i("x1")? as i32, a.i("y1")? as i32);
+        let (x0, y0, x1, y1) = (a.c("x0")?, a.c("y0")?, a.c("x1")?, a.c("y1")?);
         let o = paint_args(e, a)?;
         draw(e, a, o, |e| e.stroke_shape(ShapeKind::Line, x0, y0, x1, y1, false))
     });
     b.paint("draw_rect", "x:int Left; y:int Top; w:int Width; h:int Height; filled:bool? Fill the interior (default false)", "Draw a rectangle outline or filled rectangle.", |e, a| {
-        let (x, y, w, h) = (a.i("x")? as i32, a.i("y")? as i32, a.i("w")?.max(1) as i32, a.i("h")?.max(1) as i32);
+        let (x, y, w, h) = (a.c("x")?, a.c("y")?, a.len("w")?, a.len("h")?);
         let filled = a.b("filled")?;
         let o = paint_args(e, a)?;
         draw(e, a, o, |e| e.stroke_shape(ShapeKind::Rect, x, y, x + w - 1, y + h - 1, filled))
@@ -1091,7 +1123,7 @@ fn draw_cmds(b: &mut B) {
         "x:int Left of bounding box; y:int Top of bounding box; w:int Width; h:int Height; filled:bool? Fill the interior (default false)",
         "Draw an ellipse inscribed in the bounding box.",
         |e, a| {
-            let (x, y, w, h) = (a.i("x")? as i32, a.i("y")? as i32, a.i("w")?.max(1) as i32, a.i("h")?.max(1) as i32);
+            let (x, y, w, h) = (a.c("x")?, a.c("y")?, a.len("w")?, a.len("h")?);
             let filled = a.b("filled")?;
             let o = paint_args(e, a)?;
             draw(e, a, o, |e| e.stroke_shape(ShapeKind::Ellipse, x, y, x + w - 1, y + h - 1, filled))
@@ -1103,7 +1135,7 @@ fn draw_cmds(b: &mut B) {
         "Flood fill from a point. With mode=dither it fills with a dither pattern.",
         |e, a| {
             let li = layer_arg(e, a)?;
-            let (x, y) = (a.i("x")? as i32, a.i("y")? as i32);
+            let (x, y) = (a.c("x")?, a.c("y")?);
             let d = &e.doc;
             let mask = flood_mask(&d.layers[li].data, d.w as i32, d.h as i32, d.mode, x, y, a.ob("contiguous")?.unwrap_or(true), a.oi("tolerance")?.unwrap_or(0).clamp(0, 255) as u8);
             let o = paint_args(e, a)?;
@@ -1119,7 +1151,7 @@ fn draw_cmds(b: &mut B) {
          layer:layer? Target layer (default: active)",
         "Fill the selection (or the whole layer) with a gradient. Indexed documents step through the stops with optional dithering.",
         |e, a| {
-            let (x0, y0, x1, y1) = (a.i("x0")? as i32, a.i("y0")? as i32, a.i("x1")? as i32, a.i("y1")? as i32);
+            let (x0, y0, x1, y1) = (a.c("x0")?, a.c("y0")?, a.c("x1")?, a.c("y1")?);
             let stops: Vec<Cell> = if let Some(c) = a.get("colors") {
                 c.as_array().ok_or("'colors' must be an array")?.iter().map(|v| e.parse_color(v)).collect::<Result<_, _>>()?
             } else if let Some(r) = a.oi("ramp")? {
@@ -1193,7 +1225,7 @@ fn selection_cmds(b: &mut B) {
     use Kind::*;
     const OP: &str = "op:str? replace (default), add, subtract or intersect";
     b.add("selection", "select_rect", Edit, &format!("x:int Left; y:int Top; w:int Width; h:int Height; {OP}"), "Select a rectangle. Drawing is confined to the selection.", |e, a| {
-        let (x, y, w, h) = (a.i("x")?, a.i("y")?, a.i("w")?, a.i("h")?);
+        let (x, y, w, h) = (a.c("x")? as i64, a.c("y")? as i64, a.c("w")? as i64, a.c("h")? as i64);
         let (dw, dh) = (e.doc.w as i64, e.doc.h as i64);
         let mut mask = vec![false; e.doc.len()];
         for yy in y.max(0)..(y + h).min(dh) {
@@ -1213,7 +1245,7 @@ fn selection_cmds(b: &mut B) {
         |e, a| {
             let li = layer_arg(e, a)?;
             let d = &e.doc;
-            let mask = flood_mask(&d.layers[li].data, d.w as i32, d.h as i32, d.mode, a.i("x")? as i32, a.i("y")? as i32, a.ob("contiguous")?.unwrap_or(true), a.oi("tolerance")?.unwrap_or(0).clamp(0, 255) as u8);
+            let mask = flood_mask(&d.layers[li].data, d.w as i32, d.h as i32, d.mode, a.c("x")?, a.c("y")?, a.ob("contiguous")?.unwrap_or(true), a.oi("tolerance")?.unwrap_or(0).clamp(0, 255) as u8);
             sel_op(e, mask, a.os("op")?)?;
             ok()
         },
@@ -1279,7 +1311,7 @@ fn selection_cmds(b: &mut B) {
         |e, a| {
             let data = e.clip_cells().ok_or("the clipboard is empty; use copy first")?;
             let c = e.clipboard.as_ref().unwrap();
-            let (x, y) = (a.oi("x")?.map(|v| v as i32).unwrap_or(c.x), a.oi("y")?.map(|v| v as i32).unwrap_or(c.y));
+            let (x, y) = (a.oc("x")?.unwrap_or(c.x), a.oc("y")?.unwrap_or(c.y));
             if e.doc.layers[e.doc.active].locked {
                 return Err("the active layer is locked".into());
             }
@@ -1298,16 +1330,16 @@ fn selection_cmds(b: &mut B) {
         ok()
     });
     b.add("selection", "float_move", Edit, "dx:int Horizontal offset; dy:int Vertical offset", "Move floating pixels.", |e, a| {
-        let (dx, dy) = (a.i("dx")? as i32, a.i("dy")? as i32);
+        let (dx, dy) = (a.c("dx")?, a.c("dy")?);
         let f = e.doc.float.as_mut().ok_or("nothing is floating; use float_lift or paste with float=true")?;
-        f.x += dx;
-        f.y += dy;
+        f.x = (f.x + dx).clamp(-COORD, COORD);
+        f.y = (f.y + dy).clamp(-COORD, COORD);
         ok()
     });
     b.add("selection", "float_commit", Paint, "", "Stamp floating pixels into the active layer.", |e, _| Ok(json!({"committed": e.doc.float_commit()})));
     b.add("selection", "float_cancel", Edit, "", "Discard floating pixels (lifted pixels return to where they were).", |e, _| Ok(json!({"cancelled": e.doc.float_cancel()})));
     b.add("selection", "selection_move", Paint, "dx:int Horizontal offset; dy:int Vertical offset", "Move the selected pixels (or the whole layer's content) in one step.", |e, a| {
-        let (dx, dy) = (a.i("dx")? as i32, a.i("dy")? as i32);
+        let (dx, dy) = (a.c("dx")?, a.c("dy")?);
         if e.doc.layers[e.doc.active].locked {
             return Err("the active layer is locked".into());
         }
@@ -1320,8 +1352,8 @@ fn selection_cmds(b: &mut B) {
         ok()
     });
     b.add("selection", "grab_brush", Read, "", "Turn the selection (or whole active layer) into a custom brush for the drawing tools.", |e, _| {
-        e.copy()?;
-        let c = e.clipboard.as_ref().unwrap();
+        // Grabbing a brush leaves the clipboard alone.
+        let c = e.grab()?;
         if c.w > 256 || c.h > 256 {
             return Err("custom brushes are limited to 256x256".into());
         }
@@ -1330,8 +1362,9 @@ fn selection_cmds(b: &mut B) {
         if !mask.iter().any(|m| *m) {
             return Err("the selection has no pixels to grab".into());
         }
-        e.o.custom_brush = Some(Brush { w: c.w as i32, h: c.h as i32, mask, cells: Some(c.data.clone()) });
-        Ok(json!({"w": c.w, "h": c.h}))
+        let (w, h) = (c.w, c.h);
+        e.o.custom_brush = Some(Brush { w: w as i32, h: h as i32, mask, cells: Some(c.data) });
+        Ok(json!({"w": w, "h": h}))
     });
     b.add("selection", "clear_brush", Read, "", "Drop the custom brush and return to the standard round/square brush.", |e, _| {
         e.o.custom_brush = None;
@@ -1484,7 +1517,7 @@ fn palette_cmds(b: &mut B) {
             }
             // Ramp entries pointing at removed colours are dropped rather than renumbered.
             for r in &mut e.doc.palette.ramps {
-                r.indices.retain(|&i| u[i as usize] > 0);
+                r.indices.retain(|&i| u.get(i as usize).is_some_and(|n| *n > 0));
             }
             e.doc.palette.colors = cols;
             remap_indices(e, &map);
@@ -1669,7 +1702,10 @@ fn tile_cmds(b: &mut B) {
         let i = cell_arg(a, cols, rows)?;
         let old = e.doc.layers[li].map.as_ref().unwrap()[i] as usize;
         let ts = e.doc.tileset.as_mut().unwrap();
-        let copy = ts.tiles[old].clone();
+        if ts.tiles.len() >= u16::MAX as usize {
+            return Err("the tile set is full".into());
+        }
+        let copy = ts.tiles.get(old).ok_or("that cell has no valid tile")?.clone();
         ts.tiles.push(copy);
         let id = (ts.tiles.len() - 1) as u16;
         Arc::make_mut(e.doc.layers[li].map.as_mut().unwrap())[i] = id;
@@ -1683,7 +1719,7 @@ fn tile_cmds(b: &mut B) {
     b.add("tiles", "tilemap_set", Edit, &format!("cells:array Rows of tile ids - null leaves a cell unchanged; col:int? Left column of the block (default 0); row:int? Top row (default 0); {LAYER}"), "Write a block of the tile map.", |e, a| {
         let (li, cols, rows) = map_layer(e, a)?;
         let n = tileset(e)?.tiles.len();
-        let (oc, or) = (a.oi("col")?.unwrap_or(0), a.oi("row")?.unwrap_or(0));
+        let (oc, or) = (a.oc("col")?.unwrap_or(0) as i64, a.oc("row")?.unwrap_or(0) as i64);
         let mut m = e.doc.layers[li].map.as_ref().unwrap().to_vec();
         for (ry, row) in a.arr("cells")?.iter().enumerate() {
             for (rx, v) in row.as_array().ok_or("'cells' must be an array of arrays")?.iter().enumerate() {

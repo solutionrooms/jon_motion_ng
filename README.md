@@ -56,8 +56,10 @@ for x = 0, 63 do jm.set(x, 0, x % 16) end          -- fast pixel access: jm.get 
 print(jm.get_info().width)
 ```
 
-A script is atomic and one undo step: if it raises an error, nothing is applied. Scripts are
-sandboxed (no file or OS access; 60 s limit). Headless: `jon_motion run script.lua [file]`.
+A script is atomic and one undo step: if it raises an error, the document is rolled back. Scripts are
+sandboxed: no `io`/`os` libraries, a 60 s time limit and a 256 MB memory limit. The only files a script
+can touch are through the document commands, which read `.jmn`/`.png` and write `.jmn`/`.png`/`.csv`.
+Scripts run off the UI thread; a long one shows a **Stop script** button. Headless: `jon_motion run script.lua [file]`.
 Full reference: `jon_motion commands [filter]`.
 
 ## AI / MCP
@@ -72,11 +74,14 @@ claude mcp add jon-motion -- /path/to/jon_motion mcp
   brush strokes (never during one), you see each change as it lands, and each call is one undo step.
 - If the editor is not open, the same command works on a headless document (`save_document` to keep it).
 - The window also serves MCP directly at `http://127.0.0.1:47800/mcp` (port shown in the status bar;
-  Help > AI / MCP Setup has copy-paste commands). It listens on localhost only.
+  Help > AI / MCP Setup has copy-paste commands). It listens on localhost only and requires the token
+  in `~/.jon_motion/token` as an `Authorization: Bearer` header, so other users of the machine and web
+  pages cannot drive the editor. The `jon_motion mcp` bridge sends it for you.
 
 Tools: `get_info`, `list_commands`, `execute_command`, `batch` (atomic), `run_lua`, `screenshot`
-(returns an image so the model can see its work). The AI cannot discard your unsaved work:
-replacing the document is refused unless it passes `force`.
+(returns an image so the model can see its work). Replacing a document that has unsaved changes is
+refused unless the caller explicitly passes `force`, so it cannot happen by accident - but a client that
+passes `force` does discard them. Save and export commands overwrite existing files.
 
 ## Code map
 

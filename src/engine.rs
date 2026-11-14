@@ -11,6 +11,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const MAX_UNDO: usize = 100;
+const MIN_UNDO: usize = 8;
+/// Rough memory budget for undo history (each step can hold a whole layer).
+const UNDO_BYTES: usize = 1 << 30;
+
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into())
+}
+
+/// Turn a panic inside `f` into an error, so one bad command cannot take the editor down.
+pub fn guarded<R>(f: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| Err(format!("internal error: {}", panic_text(&*p))))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
@@ -180,6 +192,8 @@ pub struct Snapshot {
     modified: bool,
     fg: Cell,
     bg: Cell,
+    tiles_dirty: Option<bool>,
+    reset_history: bool,
 }
 
 pub struct Engine {
@@ -201,7 +215,11 @@ pub struct Engine {
     /// Some(painted) when tile-mapped layers may be out of step with the tile set.
     tiles_dirty: Option<bool>,
     pub reset_history: bool,
-    coalesce: Option<(String, usize)>,
+    coalesce: Option<(String, u64)>,
+    /// Bumped whenever undo history changes; lets coalescing spot unrelated edits.
+    undo_seq: u64,
+    /// Set while a coalesced edit continues: the earlier undo step already covers it.
+    merge_undo: bool,
     /// Count of document edits, and its value at the last save, so a save made
     /// part-way through a script still leaves the document marked clean.
     edits: u64,
@@ -285,6 +303,8 @@ impl Engine {
             tiles_dirty: None,
             reset_history: false,
             coalesce: None,
+            undo_seq: 0,
+            merge_undo: false,
             edits: 0,
             saved_at: None,
             host,
@@ -376,9 +396,13 @@ impl Engine {
 
     fn push_undo(&mut self, before: Doc) {
         if before != self.doc {
-            self.undo.push(before);
-            if self.undo.len() > MAX_UNDO {
-                self.undo.remove(0);
+            if !self.merge_undo {
+                self.undo.push(before);
+                self.undo_seq += 1;
+                let max = (UNDO_BYTES / (self.doc.len() * 4).max(1)).clamp(MIN_UNDO, MAX_UNDO);
+                while self.undo.len() > max {
+                    self.undo.remove(0);
+                }
             }
             self.redo.clear();
             self.modified = true;
@@ -392,6 +416,7 @@ impl Engine {
         let Some(d) = self.undo.pop() else { return Ok(false) };
         let cur = self.replace_doc(d);
         self.redo.push(cur);
+        self.undo_seq += 1;
         self.modified = true;
         self.rev += 1;
         Ok(true)
@@ -404,6 +429,7 @@ impl Engine {
         let Some(d) = self.redo.pop() else { return Ok(false) };
         let cur = self.replace_doc(d);
         self.undo.push(cur);
+        self.undo_seq += 1;
         self.modified = true;
         self.rev += 1;
         Ok(true)
@@ -425,14 +451,30 @@ impl Engine {
         self.rev += 1;
     }
 
-    fn begin_top(&mut self) -> Option<Snapshot> {
-        (self.group == 0).then(|| Snapshot {
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
             doc: self.doc.clone(),
             path: self.path.clone(),
             modified: self.modified,
             fg: self.o.fg,
             bg: self.o.bg,
-        })
+            tiles_dirty: self.tiles_dirty,
+            reset_history: self.reset_history,
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.doc = s.doc;
+        self.path = s.path;
+        self.modified = s.modified;
+        self.o.fg = s.fg;
+        self.o.bg = s.bg;
+        self.tiles_dirty = s.tiles_dirty;
+        self.reset_history = s.reset_history;
+    }
+
+    fn begin_top(&mut self) -> Option<Snapshot> {
+        (self.group == 0).then(|| self.snapshot())
     }
 
     fn end_top(&mut self, snap: Option<Snapshot>, ok: bool) {
@@ -450,11 +492,7 @@ impl Engine {
                 self.modified = false;
             }
         } else {
-            self.doc = s.doc;
-            self.path = s.path;
-            self.modified = s.modified;
-            self.o.fg = s.fg;
-            self.o.bg = s.bg;
+            self.restore(s);
             self.tiles_dirty = None;
         }
         self.reset_history = false;
@@ -467,9 +505,14 @@ impl Engine {
     /// On error the document is rolled back to how it was.
     pub fn group<R>(&mut self, f: impl FnOnce(&mut Engine) -> Result<R, String>) -> Result<R, String> {
         let snap = self.begin_top();
+        let (depth, had_stroke) = (self.group, self.stroke.is_some());
         self.group += 1;
-        let r = f(self);
-        self.group -= 1;
+        let r = guarded(|| f(self));
+        // A panic can leave these behind; put them back so the editor stays usable.
+        self.group = depth;
+        if !had_stroke {
+            self.stroke = None;
+        }
         self.end_top(snap, r.is_ok());
         r
     }
@@ -488,40 +531,46 @@ impl Engine {
         let args = Args(map);
         if let Some(painted) = self.tiles_dirty {
             let kind_changed = cmd.kind != Kind::Read && (cmd.kind == Kind::Paint) != painted;
-            if kind_changed || cmd.cat == "tiles" || cmd.name == "get_info" {
+            if kind_changed || cmd.cat == "tiles" || matches!(cmd.name, "get_info" | "save_document") {
                 self.tiles_flush();
             }
         }
         if cmd.kind == Kind::Read {
-            let r = (cmd.run)(self, &args);
+            let r = guarded(|| (cmd.run)(self, &args));
             self.rev += 1;
             return r.map_err(|e| format!("{name}: {e}"));
         }
         if self.stroke.is_some() {
             return Err("busy: a stroke is in progress".into());
         }
-        self.group(|e| {
+        // Inside a script or batch each command still fails cleanly on its own,
+        // so a caught error (pcall) never leaves half a command behind.
+        let nested = (self.group > 0).then(|| self.snapshot());
+        let r = self.group(|e| {
             if !cmd.float_ok {
                 e.doc.float_commit();
             }
             let r = (cmd.run)(e, &args);
             e.touch(cmd.kind == Kind::Paint, matches!(cmd.name, "new_document" | "open_document"));
             r
-        })
-        .map_err(|e| format!("{name}: {e}"))
+        });
+        if let (Err(_), Some(s)) = (&r, nested) {
+            self.restore(s);
+        }
+        r.map_err(|e| format!("{name}: {e}"))
     }
 
     /// Like `exec`, but consecutive calls with the same key share one undo step
     /// (used for continuous edits such as dragging a colour slider).
     pub fn exec_coalesced(&mut self, name: &str, params: &Value, key: &str) -> Result<Value, String> {
-        let before = self.undo.len();
-        let r = self.exec(name, params)?;
-        if self.undo.len() == before + 1 {
-            if self.coalesce.as_ref().is_some_and(|(k, n)| k == key && *n == before) {
-                self.undo.pop();
-            } else {
-                self.coalesce = Some((key.to_string(), before + 1));
-            }
+        let before = self.undo_seq;
+        let cont = self.coalesce.as_ref().is_some_and(|(k, n)| k == key && *n == before);
+        self.merge_undo = cont;
+        let r = self.exec(name, params);
+        self.merge_undo = false;
+        let r = r?;
+        if !cont && self.undo_seq == before + 1 {
+            self.coalesce = Some((key.to_string(), self.undo_seq));
         }
         Ok(r)
     }
@@ -768,10 +817,15 @@ impl Engine {
     // ------------------------------------------------------------ clipboard
 
     pub fn copy(&mut self) -> Result<(), String> {
+        self.clipboard = Some(self.grab()?);
+        Ok(())
+    }
+
+    /// The selected pixels of the active layer (or floating pixels, or the whole layer).
+    pub fn grab(&self) -> Result<Clip, String> {
         let d = &self.doc;
         if let Some(f) = &d.float {
-            self.clipboard = Some(Clip { x: f.x, y: f.y, w: f.w, h: f.h, data: f.data.to_vec(), mode: d.mode, pal: d.palette.colors.clone() });
-            return Ok(());
+            return Ok(Clip { x: f.x, y: f.y, w: f.w, h: f.h, data: f.data.to_vec(), mode: d.mode, pal: d.palette.colors.clone() });
         }
         let li = d.active;
         let (x0, y0, x1, y1) = match d.sel_bounds() {
@@ -789,8 +843,7 @@ impl Engine {
                 }
             }
         }
-        self.clipboard = Some(Clip { x: x0, y: y0, w: cw as u32, h: ch as u32, data, mode: d.mode, pal: d.palette.colors.clone() });
-        Ok(())
+        Ok(Clip { x: x0, y: y0, w: cw as u32, h: ch as u32, data, mode: d.mode, pal: d.palette.colors.clone() })
     }
 
     /// Clipboard cells converted to this document's colour mode and palette.
@@ -855,6 +908,7 @@ impl Engine {
         let Some(ts) = self.doc.tileset.as_mut() else { return };
         let old = ts.tiles.clone();
         let mut changed = vec![false; old.len()];
+        let mut blank_edited = false;
         for l in &self.doc.layers {
             let Some(map) = &l.map else { continue };
             if map.len() != cols * rows {
@@ -864,6 +918,11 @@ impl Engine {
                 for cx in 0..cols {
                     let t = map[cy * cols + cx] as usize;
                     if t >= old.len() || cell_eq(&l.data, w, cx, cy, tw, th, &old[t]) {
+                        continue;
+                    }
+                    if t == 0 {
+                        // Tile 0 stays blank: a cell drawn on gets a tile of its own instead.
+                        blank_edited = true;
                         continue;
                     }
                     let nt = Arc::make_mut(&mut ts.tiles[t]);
@@ -879,21 +938,25 @@ impl Engine {
                 }
             }
         }
-        if !changed.iter().any(|c| *c) {
-            return;
-        }
-        for l in &mut self.doc.layers {
-            let Some(map) = l.map.clone() else { continue };
-            if map.len() != cols * rows {
-                continue;
-            }
-            for cy in 0..rows {
-                for cx in 0..cols {
-                    let t = map[cy * cols + cx] as usize;
-                    if t < changed.len() && changed[t] && !cell_eq(&l.data, w, cx, cy, tw, th, &ts.tiles[t]) {
-                        blit_tile(Arc::make_mut(&mut l.data).as_mut_slice(), w, cx, cy, tw, th, &ts.tiles[t]);
+        if changed.iter().any(|c| *c) {
+            for l in &mut self.doc.layers {
+                let Some(map) = l.map.clone() else { continue };
+                if map.len() != cols * rows {
+                    continue;
+                }
+                for cy in 0..rows {
+                    for cx in 0..cols {
+                        let t = map[cy * cols + cx] as usize;
+                        if t < changed.len() && changed[t] && !cell_eq(&l.data, w, cx, cy, tw, th, &ts.tiles[t]) {
+                            blit_tile(Arc::make_mut(&mut l.data).as_mut_slice(), w, cx, cy, tw, th, &ts.tiles[t]);
+                        }
                     }
                 }
+            }
+        }
+        if blank_edited {
+            for li in 0..self.doc.layers.len() {
+                self.match_cells(li);
             }
         }
     }

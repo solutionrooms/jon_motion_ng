@@ -585,7 +585,10 @@ impl Doc {
                 }
             }
         }
-        self.selection = if any { sel.map(Arc::new) } else { None };
+        // Pasted pixels carry no selection shape and leave the current selection alone.
+        if f.sel.is_some() {
+            self.selection = if any { sel.map(Arc::new) } else { None };
+        }
         true
     }
 

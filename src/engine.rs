@@ -194,6 +194,10 @@ pub struct View {
     pub tile_grid: bool,
     pub tile_ids: bool,
     pub cycling: bool,
+    /// Which animation frame the window shows, and whether it is playing. The animation's
+    /// setup lives in the document (`Doc::anim`); this playback position does not.
+    pub anim_frame: u32,
+    pub anim_playing: bool,
 }
 
 #[derive(Clone)]
@@ -328,6 +332,8 @@ impl Engine {
                 tile_grid: true,
                 tile_ids: false,
                 cycling: false,
+                anim_frame: 0,
+                anim_playing: false,
             },
             clipboard: None,
             path: None,
@@ -462,6 +468,15 @@ impl Engine {
         }
         if self.doc.active >= self.doc.layers.len() {
             self.doc.active = self.doc.layers.len() - 1;
+        }
+        // An animation whose frames no longer lie inside the image (after a crop or resize) is dropped.
+        if self.doc.anim.is_some_and(|a| !a.fits(self.doc.w, self.doc.h)) {
+            self.doc.anim = None;
+        }
+        let frames = self.doc.anim.map(|a| a.count()).unwrap_or(0);
+        self.view.anim_frame = self.view.anim_frame.min(frames.saturating_sub(1));
+        if frames == 0 {
+            self.view.anim_playing = false;
         }
     }
 

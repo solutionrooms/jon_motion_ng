@@ -170,6 +170,20 @@ jm.gradient{ x0 = 0, y0 = 4, x1 = 15, y1 = 4, colors = { "#000000", "#ffffff" },
 jm.reduce_colors{ colors = 8, dither = "bayer" }
 eq(jm.get_info().mode, "indexed"); eq(jm.palette_get{}.count <= 8, true, "quantised")
 
+-- animation: a strip of frames cut from the image, left to right then top to bottom
+jm.new_document{ width = 64, height = 32, force = true }
+eq(jm.anim_info().active, false)
+jm.select_rect{ x = 0, y = 0, w = 48, h = 32 }
+local an = jm.anim_set{ frame_w = 16, frame_h = 16, fps = 10 }
+eq(an.cols, 3); eq(an.rows, 2); eq(an.frames, 6)
+eq(jm.anim_set{ frames = 5 }.frames, 5, "stop before an empty last cell")
+local fr = jm.anim_control{ frame = 3, playing = false }
+eq(fr.frame_x, 0); eq(fr.frame_y, 16)
+eq(jm.anim_control{ step = 2 }.frame, 0, "stepping wraps")
+fails(function() jm.anim_set{ frame_w = 100 } end, "frame larger than the region")
+jm.anim_clear{}; eq(jm.anim_info().active, false)
+fails(function() jm.anim_control{ step = 1 } end, "no animation")
+
 -- editor state
 jm.set_options{ tool = "line", brush_size = 5, mode = "smooth", symmetry = "xy" }
 eq(jm.get_options().brush_size, 5)

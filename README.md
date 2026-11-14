@@ -44,6 +44,9 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
 - **Tile mapping** - turn a layer into a tile map; identical cells share one tile. *Auto* mode makes
   or matches tiles as you draw; *Sync* mode edits a tile everywhere it is used, live. Tile stamp tool,
   tile set PNG and map CSV export.
+- **Animation** - select a strip of frames, give the size of one frame, and the Animation tab plays them
+  (left to right, then top to bottom) while you keep drawing. Left / Right step and Space plays or pauses while
+  the pointer is over the tab. The setup (region, frame size, frame count, speed) is saved in the project.
 - **Files** - native `.jmn` projects (everything), PNG in and out. Exports are always indexed PNGs. An indexed
   PNG opens with its own palette; a true-colour PNG is converted to a generated palette of up to 256 colours.
 

@@ -14,7 +14,10 @@ const MAX_RAW: u64 = 4 << 30;
 pub fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
     let mut d = doc.clone();
     d.float_commit();
-    let raw = bincode::serialize(&d).map_err(|e| e.to_string())?;
+    let mut raw = bincode::serialize(&d).map_err(|e| e.to_string())?;
+    if let Some(a) = &d.anim {
+        chunk(&mut raw, b"ANIM", &bincode::serialize(a).map_err(|e| e.to_string())?);
+    }
     if raw.len() as u64 > MAX_RAW {
         return Err("the project is too large to save (over 4 GB of pixel data); merge or remove layers".into());
     }
@@ -39,11 +42,35 @@ pub fn load_doc(path: &Path) -> Result<Doc, String> {
         return Err(format!("{}: project file is too large", path.display()));
     }
     let mut d: Doc = bincode::deserialize(&raw).map_err(|e| format!("corrupt project file: {e}"))?;
+    // The document re-serialises to exactly the bytes it was read from, which locates the chunks after it.
+    let used = bincode::serialized_size(&d).map_err(|e| e.to_string())? as usize;
+    read_chunks(&mut d, raw.get(used..).unwrap_or(&[]));
     validate(&mut d)?;
     if d.mode == ColorMode::Rgba {
         to_indexed(&mut d);
     }
     Ok(d)
+}
+
+/// Data added after 0.1.3 follows the document as tagged chunks: a four-byte tag, a
+/// little-endian u32 length, then the payload. The document's own layout is unchanged, so
+/// older builds still open these files (they ignore the chunks and drop them when they save),
+/// and a build that does not know a tag skips it.
+fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+}
+
+fn read_chunks(d: &mut Doc, mut rest: &[u8]) {
+    while rest.len() >= 8 {
+        let len = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+        let Some(payload) = rest[8..].get(..len) else { return };
+        if &rest[..4] == b"ANIM" {
+            d.anim = bincode::deserialize(payload).ok();
+        }
+        rest = &rest[8 + len..];
+    }
 }
 
 /// Convert a true-colour project written by 0.1.x: its cells are packed RGBA
@@ -91,6 +118,18 @@ fn validate(d: &mut Doc) -> Result<(), String> {
             }
         }
         None => d.layers.iter_mut().for_each(|l| l.map = None),
+    }
+    // The animation setup is as untrusted as the rest of the file.
+    if let Some(a) = &mut d.anim {
+        if !Anim::FPS.contains(&a.fps) {
+            a.fps = 8.0;
+        }
+        if a.limit >= a.total() {
+            a.limit = 0;
+        }
+    }
+    if d.anim.is_some_and(|a| !a.fits(d.w, d.h)) {
+        d.anim = None;
     }
     Ok(())
 }

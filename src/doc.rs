@@ -276,6 +276,53 @@ pub struct Float {
     pub restore: Option<(Arc<Vec<Cell>>, Option<Arc<Vec<u8>>>)>,
 }
 
+/// A sprite-sheet animation: a rectangle of the image cut into equal frames, read left to
+/// right, then top to bottom. Part of the document, so it is saved, undone and redone with it.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Anim {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    /// Size of one frame.
+    pub fw: u32,
+    pub fh: u32,
+    /// Frames to play; 0 plays every whole frame in the region.
+    pub limit: u32,
+    pub fps: f32,
+}
+
+impl Anim {
+    pub const FPS: std::ops::RangeInclusive<f32> = 1.0..=60.0;
+    pub fn cols(&self) -> u32 {
+        self.w / self.fw.max(1)
+    }
+    pub fn rows(&self) -> u32 {
+        self.h / self.fh.max(1)
+    }
+    /// Whole frames in the region; part frames at the right and bottom edges are left out.
+    pub fn total(&self) -> u32 {
+        self.cols().saturating_mul(self.rows())
+    }
+    /// Frames that play.
+    pub fn count(&self) -> u32 {
+        if self.limit == 0 {
+            self.total()
+        } else {
+            self.limit.min(self.total())
+        }
+    }
+    /// Top-left corner of frame `i`.
+    pub fn origin(&self, i: u32) -> (u32, u32) {
+        let c = self.cols().max(1);
+        (self.x + i % c * self.fw, self.y + i / c * self.fh)
+    }
+    /// True when the region lies inside a `w` x `h` image and holds at least one frame.
+    pub fn fits(&self, w: u32, h: u32) -> bool {
+        self.fw >= 1 && self.fh >= 1 && self.fw <= self.w && self.fh <= self.h && self.x as u64 + self.w as u64 <= w as u64 && self.y as u64 + self.h as u64 <= h as u64
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Doc {
     pub w: u32,
@@ -290,6 +337,9 @@ pub struct Doc {
     #[serde(skip)]
     pub float: Option<Float>,
     pub next_id: u32,
+    /// Not in the serialised layout (which published builds read): `io` stores it after the document.
+    #[serde(skip)]
+    pub anim: Option<Anim>,
 }
 
 impl Doc {
@@ -305,6 +355,7 @@ impl Doc {
             selection: None,
             float: None,
             next_id: 1,
+            anim: None,
         };
         let l = d.new_layer("Layer 1");
         d.layers.push(l);

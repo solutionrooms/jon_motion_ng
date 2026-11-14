@@ -421,6 +421,45 @@ pub fn show(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     }
     painter.rect_stroke(img_rect, 0.0, Stroke::new(1.0_f32, Color32::from_white_alpha(40)), StrokeKind::Outside);
 
+    // ---- animation frames: where the cuts fall, which cells play, and the frame on show
+    if let Some(a) = e.doc.anim {
+        let amber = Color32::from_rgb(255, 190, 70);
+        let (cols, rows, n) = (a.cols(), a.rows(), a.count());
+        let at = |c: u32, r: u32| to_screen((a.x + c * a.fw) as f32, (a.y + r * a.fh) as f32);
+        let used = Rect::from_min_max(at(0, 0), at(cols, rows));
+        if a.fw as f32 * zoom >= 4.0 && a.fh as f32 * zoom >= 4.0 {
+            let cut = Stroke::new(1.0_f32, amber.gamma_multiply(0.45));
+            for c in 1..cols {
+                let x = at(c, 0).x;
+                if rect.x_range().contains(x) {
+                    painter.vline(x, used.y_range(), cut);
+                }
+            }
+            for r in 1..rows {
+                let y = at(0, r).y;
+                if rect.y_range().contains(y) {
+                    painter.hline(used.x_range(), y, cut);
+                }
+            }
+        }
+        // Cells after the last frame that plays are dimmed.
+        let (full, part) = (n / cols.max(1), n % cols.max(1));
+        let dim = Color32::from_black_alpha(120);
+        if part > 0 {
+            painter.rect_filled(Rect::from_min_max(at(part, full), at(cols, full + 1)), 0.0, dim);
+        }
+        let below = full + (part > 0) as u32;
+        if below < rows {
+            painter.rect_filled(Rect::from_min_max(at(0, below), at(cols, rows)), 0.0, dim);
+        }
+        painter.rect_stroke(used, 0.0, Stroke::new(1.0_f32, amber), StrokeKind::Outside);
+        if !e.view.anim_playing && n > 0 {
+            let f = e.view.anim_frame.min(n - 1);
+            let (c, r) = (f % cols.max(1), f / cols.max(1));
+            painter.rect_stroke(Rect::from_min_max(at(c, r), at(c + 1, r + 1)), 0.0, Stroke::new(2.0_f32, amber), StrokeKind::Inside);
+        }
+    }
+
     let guide = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 120, 200, 150));
     if e.o.sym_x {
         painter.vline(origin.x + dw * zoom / 2.0, img_rect.y_range(), guide);

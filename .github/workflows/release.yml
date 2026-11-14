@@ -3,7 +3,9 @@ name: Release
 # Push a tag like v0.1.0 to build both platforms and publish a GitHub release.
 # "Run workflow" builds the same packages as downloadable artifacts without releasing.
 #
-# macOS signing is used when these repository secrets exist; without them the app is unsigned:
+# macOS signing is used when these secrets exist in the "release" environment (Settings > Environments);
+# without them the app is unsigned. Only the macos-sign job names that environment, so no other job -
+# and no older copy of this workflow on a tag or branch - can read them:
 #   MACOS_CERT_P12        base64 of a "Developer ID Application" certificate exported as .p12
 #   MACOS_CERT_PASSWORD   the password chosen for that .p12
 #   APPLE_ID, APPLE_APP_PASSWORD, APPLE_TEAM_ID   for notarisation (an app-specific password)
@@ -59,6 +61,7 @@ jobs:
   macos-sign:
     needs: macos
     runs-on: macos-latest
+    environment: release
     env:
       SIGNING: ${{ secrets.MACOS_CERT_P12 != '' }}
     steps:

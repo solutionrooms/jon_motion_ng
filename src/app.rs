@@ -516,7 +516,8 @@ pub fn write_settings(p: &Path, keymap: Keymap, recent: Option<&[PathBuf]>) -> s
     // Written beside the target and renamed over it, so a crash cannot leave half a file, and
     // whatever is at the path (a link, a directory) is never written through or re-moded.
     // The recent list is file names from the user's disk, so the file is created private.
-    let tmp = p.with_extension("json.tmp");
+    // The name carries the process id, so two windows saving at the same moment do not collide.
+    let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);

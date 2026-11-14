@@ -1080,7 +1080,7 @@ fn recent_files_and_settings() {
     assert_eq!(read_settings(&file), (Some(Keymap::DPaint), g.recent.clone()));
     write_settings(&file, Keymap::Standard, None).unwrap();
     assert_eq!(read_settings(&file), (Some(Keymap::Standard), g.recent.clone()), "changing the preset keeps the list");
-    assert!(!file.with_extension("json.tmp").exists(), "written beside the file, then renamed over it");
+    assert!(!file.with_extension(format!("json.{}.tmp", std::process::id())).exists(), "written beside the file, then renamed over it");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1127,7 +1127,7 @@ fn recent_files_and_settings() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(write_settings(&dir, Keymap::DPaint, None).is_err());
-        assert!(mode(&dir) == 0o755 && !dir.with_extension("json.tmp").exists());
+        assert!(mode(&dir) == 0o755 && !dir.with_extension(format!("json.{}.tmp", std::process::id())).exists());
         let _ = std::fs::remove_file(&locked);
         std::fs::write(&locked, r#"{"keymap":"standard"}"#).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o400)).unwrap();

@@ -109,7 +109,7 @@ pub struct Gui {
     /// Frame size typed in before an animation exists; `None` follows the grid size.
     pub anim_size: Option<(u32, u32)>,
     /// The animation's name while it is being typed in the Animation tab.
-    pub anim_name: Option<String>,
+    pub anim_name: Option<(String, String)>,
     /// While quitting: documents the user chose not to save.
     pub quit_skip: Vec<u32>,
     /// The document the window last drew, to notice a change of tab.

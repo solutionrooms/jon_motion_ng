@@ -94,7 +94,8 @@ fn read_chunks(d: &mut Doc, mut rest: &[u8]) {
                     v1 = Some(a);
                 }
             }
-            b"ANMS" => {
+            // A list larger than this program ever writes is not parsed at all.
+            b"ANMS" if payload.len() as u64 <= ANIM_JSON_MAX => {
                 // Entries that are not sound for this image are left out; the rest are kept.
                 if let Some(list) = serde_json::from_slice::<Value>(payload).ok().and_then(|v| anims_from_json(&v, d.w, d.h).ok()) {
                     let mut kept: Vec<Anim> = vec![];
@@ -111,38 +112,65 @@ fn read_chunks(d: &mut Doc, mut rest: &[u8]) {
         rest = &rest[8 + len..];
     }
     d.anims = match (all, v1) {
-        (Some(list), _) => list,
-        (None, Some(a)) => {
+        (Some(list), v1) if !list.is_empty() || v1.is_none() => list,
+        (_, Some(a)) => {
             let mut g = Grid { x: a.x, y: a.y, w: a.w, h: a.h, fw: a.fw, fh: a.fh, limit: a.limit };
             if g.limit >= g.total() {
                 g.limit = 0;
             }
             vec![Anim { name: "Animation".into(), fps: if Anim::FPS.contains(&a.fps) { a.fps } else { 8.0 }, frames: Frames::Grid(g) }]
         }
-        (None, None) => vec![],
+        (_, None) => vec![],
     };
 }
 
 // ------------------------------------------------------------ animations as JSON
 
 pub const ANIM_FORMAT: &str = "jon-motion-animations";
-/// Largest animations file read.
+/// Largest animations file read, and largest stored list parsed. Everything this program
+/// writes is far smaller (see `Anim::MAX_LIST_FRAMES`).
 pub const ANIM_JSON_MAX: u64 = 8 << 20;
 
+/// A frame as [x, y, w, h], or [x, y, w, h, offset_x, offset_y] when it has an offset.
 pub fn frame_to_json(f: &Frame) -> Value {
     if f.ox == 0 && f.oy == 0 {
-        json!({"x": f.x, "y": f.y, "w": f.w, "h": f.h})
+        json!([f.x, f.y, f.w, f.h])
     } else {
-        json!({"x": f.x, "y": f.y, "w": f.w, "h": f.h, "offset_x": f.ox, "offset_y": f.oy})
+        json!([f.x, f.y, f.w, f.h, f.ox, f.oy])
     }
+}
+
+/// The speed as the number the user sees (8.3, not 8.300000190734863).
+pub fn fps_json(fps: f32) -> Value {
+    json!(fps.to_string().parse::<f64>().unwrap_or(fps as f64))
 }
 
 pub fn anim_to_json(a: &Anim) -> Value {
     match &a.frames {
-        Frames::Grid(g) => json!({"name": a.name, "fps": a.fps,
+        Frames::Grid(g) => json!({"name": a.name, "fps": fps_json(a.fps),
             "grid": {"x": g.x, "y": g.y, "w": g.w, "h": g.h, "frame_w": g.fw, "frame_h": g.fh, "frames": g.limit}}),
-        Frames::List(l) => json!({"name": a.name, "fps": a.fps, "frames": l.iter().map(frame_to_json).collect::<Vec<_>>()}),
+        Frames::List(l) => json!({"name": a.name, "fps": fps_json(a.fps), "frames": l.iter().map(frame_to_json).collect::<Vec<_>>()}),
     }
+}
+
+/// The animations as a file for people to read: one animation per block, one frame per line.
+pub fn anims_to_text(d: &Doc) -> String {
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let mut out = format!("{{\n  \"format\": {},\n  \"version\": 1,\n  \"image\": {{ \"width\": {}, \"height\": {} }},\n  \"animations\": [\n", q(ANIM_FORMAT), d.w, d.h);
+    for (i, a) in d.anims.iter().enumerate() {
+        out += &format!("    {{ \"name\": {}, \"fps\": {}, ", q(&a.name), a.fps);
+        match &a.frames {
+            Frames::Grid(g) => {
+                out += &format!("\"grid\": {{ \"x\": {}, \"y\": {}, \"w\": {}, \"h\": {}, \"frame_w\": {}, \"frame_h\": {}, \"frames\": {} }} }}", g.x, g.y, g.w, g.h, g.fw, g.fh, g.limit)
+            }
+            Frames::List(l) => {
+                let rows: Vec<String> = l.iter().map(|f| format!("      {}", frame_to_json(f).to_string().replace(',', ", "))).collect();
+                out += &format!("\"frames\": [\n{}\n    ] }}", rows.join(",\n"));
+            }
+        }
+        out += if i + 1 < d.anims.len() { ",\n" } else { "\n" };
+    }
+    out + "  ]\n}\n"
 }
 
 /// Every animation of the document: what anim_export_json writes and the project file stores.
@@ -296,6 +324,9 @@ fn validate(d: &mut Doc) -> Result<(), String> {
     let (w, h) = (d.w, d.h);
     d.anims.retain(|a| a.valid(w, h));
     d.anims.truncate(Anim::MAX);
+    while Anim::list_frames(&d.anims) > Anim::MAX_LIST_FRAMES {
+        d.anims.pop();
+    }
     Ok(())
 }
 

@@ -361,6 +361,9 @@ impl Anim {
     pub const MAX: usize = 256;
     /// Most frames in one frame list.
     pub const MAX_FRAMES: usize = 4096;
+    /// Most frame-list frames in one document, all animations together. It keeps the stored
+    /// and exported lists small enough to be read back.
+    pub const MAX_LIST_FRAMES: usize = 32768;
     pub const NAME_MAX: usize = 64;
 
     pub fn grid(&self) -> Option<Grid> {
@@ -408,6 +411,10 @@ impl Anim {
             Frames::Grid(g) => g.fits(w, h),
             Frames::List(l) => !l.is_empty() && l.len() <= Self::MAX_FRAMES && l.iter().all(|f| f.fits(w, h)),
         }
+    }
+    /// Frame-list frames in a set of animations.
+    pub fn list_frames(anims: &[Anim]) -> usize {
+        anims.iter().map(|a| if let Frames::List(l) = &a.frames { l.len() } else { 0 }).sum()
     }
     /// A name that can be shown and listed as it is: not blank, not padded, a sensible length,
     /// and with no control characters or characters that reorder text.

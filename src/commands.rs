@@ -1945,7 +1945,7 @@ fn anim_json(e: &Engine, i: usize) -> Value {
     let f = a.frame(frame).unwrap_or(Frame { x: 0, y: 0, w: 1, h: 1, ox: 0, oy: 0 });
     let (_, _, bw, bh) = a.bounds();
     let mut v = json!({"active": true, "name": a.name, "index": i, "count": e.doc.anims.len(), "current": current,
-        "frames": a.count(), "fps": a.fps, "frame": frame, "frame_x": f.x, "frame_y": f.y, "frame_w": f.w, "frame_h": f.h,
+        "frames": a.count(), "fps": io::fps_json(a.fps), "frame": frame, "frame_x": f.x, "frame_y": f.y, "frame_w": f.w, "frame_h": f.h,
         "offset_x": f.ox, "offset_y": f.oy, "box_w": bw, "box_h": bh, "playing": current && e.view.anim_playing});
     match a.grid() {
         Some(g) => v.as_object_mut().unwrap().extend(json!({"kind": "grid", "x": g.x, "y": g.y, "w": g.w, "h": g.h, "cols": g.cols(), "rows": g.rows()}).as_object().unwrap().clone()),
@@ -1988,6 +1988,10 @@ fn anim_name_check(d: &Doc, name: &str, except: Option<usize>) -> Result<(), Str
 
 /// Store an animation at `at`, or add it as a new one and put it on show.
 fn anim_put(e: &mut Engine, at: Option<usize>, anim: Anim) -> Result<usize, String> {
+    let others: usize = e.doc.anims.iter().enumerate().filter(|(i, _)| Some(*i) != at).map(|(_, a)| Anim::list_frames(std::slice::from_ref(a))).sum();
+    if others + Anim::list_frames(std::slice::from_ref(&anim)) > Anim::MAX_LIST_FRAMES {
+        return Err(format!("a document holds at most {} frame-list frames in all", Anim::MAX_LIST_FRAMES));
+    }
     match at {
         Some(i) => {
             e.doc.anims[i] = anim;
@@ -2002,7 +2006,7 @@ fn anim_put(e: &mut Engine, at: Option<usize>, anim: Anim) -> Result<usize, Stri
                 return Err(format!("a document holds at most {} animations", Anim::MAX));
             }
             e.doc.anims.push(anim);
-            e.view.anim_index = e.doc.anims.len() - 1;
+            e.show_anim(e.doc.anims.len() - 1);
             e.view.anim_frame = 0;
             e.view.anim_playing = true;
             Ok(e.view.anim_index)
@@ -2041,16 +2045,22 @@ fn animation_cmds(b: &mut B) {
         "Set up a grid animation: a region of the image is cut into frames of frame_w x frame_h, read left to right, then top to bottom \
          (part frames at the right and bottom edges are left out). For a new animation the region defaults to the selection, or the whole image \
          when nothing is selected; for an existing one anything omitted keeps its value. A document can hold many named animations; a new one \
-         is put on show. On a frame-list animation (see anim_frames), fps alone changes the speed and any other value replaces the list with a grid. \
-         Animations are saved in the project; no pixels change.",
+         is put on show. A new name needs at least one region or frame value, so a mistyped name is an error rather than a new animation. \
+         On a frame-list animation (see anim_frames) only fps can be changed here. Animations are saved in the project; no pixels change.",
         |e, a| {
             let at = anim_target(e, a)?;
             let cur = at.map(|i| e.doc.anims[i].clone());
             let fps = fps_arg(a, cur.as_ref().map(|c| c.fps))?;
             let geometry = ["x", "y", "w", "h", "frame_w", "frame_h", "frames"].iter().any(|k| a.get(k).is_some());
-            if let (Some(i), true, false) = (at, cur.as_ref().is_some_and(|c| c.grid().is_none()), geometry) {
+            if let (Some(i), Some(c)) = (at, cur.as_ref().filter(|c| c.grid().is_none())) {
+                if geometry {
+                    return Err(format!("'{}' is a frame list, so only its fps can be set here; use anim_frames to change its frames, or anim_clear it first to make a grid", c.name));
+                }
                 e.doc.anims[i].fps = fps;
                 return Ok(anim_json(e, i));
+            }
+            if let (None, Some(n), false) = (at, a.os("name")?, geometry) {
+                return Err(format!("there is no animation named '{n}' (to make one, give its region or frame size)"));
             }
             let grid = cur.as_ref().and_then(|c| c.grid());
             let (dw, dh) = (e.doc.w as i64, e.doc.h as i64);
@@ -2115,6 +2125,9 @@ fn animation_cmds(b: &mut B) {
             let to = a.s("to")?;
             anim_name_check(&e.doc, to, Some(i))?;
             e.doc.anims[i].name = to.to_string();
+            if i == e.view.anim_index {
+                e.show_anim(i);
+            }
             Ok(anim_json(e, i))
         },
     );
@@ -2131,8 +2144,9 @@ fn animation_cmds(b: &mut B) {
                 let i = anim_need(e, a)?;
                 e.doc.anims.remove(i);
                 if i < e.view.anim_index {
-                    e.view.anim_index -= 1;
+                    e.show_anim(e.view.anim_index - 1);
                 } else if i == e.view.anim_index {
+                    e.show_anim(i.min(e.doc.anims.len().saturating_sub(1)));
                     e.view.anim_frame = 0;
                     e.view.anim_playing = false;
                 }
@@ -2153,7 +2167,7 @@ fn animation_cmds(b: &mut B) {
         |e, a| {
             let i = anim_need(e, a)?;
             if i != e.view.anim_index {
-                e.view.anim_index = i;
+                e.show_anim(i);
                 e.view.anim_frame = 0;
             }
             let n = e.doc.anims[i].count() as i64;
@@ -2197,19 +2211,15 @@ fn animation_cmds(b: &mut B) {
         Read,
         "path:str Destination .json file",
         "Write every animation to a JSON file: {\"format\": \"jon-motion-animations\", \"version\": 1, \"image\": {width, height}, \"animations\": [...]}, \
-         where each animation is {name, fps, grid: {x, y, w, h, frame_w, frame_h, frames}} or {name, fps, frames: [{x, y, w, h, offset_x?, offset_y?}, ...]}. \
-         An existing file is only overwritten if it is itself an animations file.",
+         where each animation is {name, fps, grid: {x, y, w, h, frame_w, frame_h, frames}} or {name, fps, frames: [[x, y, w, h] or [x, y, w, h, offset_x, offset_y], ...]}. \
+         An existing file is only overwritten if it is itself an animations file and nothing else, and nothing is written in the app's own settings folder.",
         |e, a| {
             let p = path_arg(a, "json")?;
             if e.doc.anims.is_empty() {
                 return Err("there are no animations to export".into());
             }
-            // Never write over some other program's .json.
-            if std::fs::symlink_metadata(&p).is_ok() && anim_file(&p).is_err() {
-                return Err(format!("{} already exists and is not a Jon Motion animations file; choose another name", p.display()));
-            }
-            let text = serde_json::to_string_pretty(&io::anims_to_json(&e.doc)).map_err(|e| e.to_string())?;
-            write_file(&p, text.as_bytes())?;
+            anim_export_allowed(&p, crate::remote::settings_file().as_deref().and_then(|f| f.parent()))?;
+            write_file(&p, io::anims_to_text(&e.doc).as_bytes())?;
             Ok(json!({"ok": true, "animations": e.doc.anims.len()}))
         },
     );
@@ -2236,15 +2246,34 @@ fn animation_cmds(b: &mut B) {
             if all.len() > Anim::MAX {
                 return Err(format!("that would make {} animations; a document holds at most {}", all.len(), Anim::MAX));
             }
+            if Anim::list_frames(&all) > Anim::MAX_LIST_FRAMES {
+                return Err(format!("that would make {} frame-list frames; a document holds at most {}", Anim::list_frames(&all), Anim::MAX_LIST_FRAMES));
+            }
             e.doc.anims = all;
             // Show the first one that came in.
             if let Some(i) = list.first().and_then(|x| e.doc.anims.iter().position(|y| y.name == x.name)) {
-                e.view.anim_index = i;
+                e.show_anim(i);
                 e.view.anim_frame = 0;
             }
             Ok(json!({"ok": true, "imported": list.len(), "count": e.doc.anims.len()}))
         },
     );
+}
+
+/// Where an export may be written. Never over some other program's .json: an existing file
+/// must be an animations file with nothing else in it. Nor into the app's own folder, where
+/// the settings and the access token live.
+pub fn anim_export_allowed(p: &Path, app_dir: Option<&Path>) -> Result<(), String> {
+    let ours = |v: Value| v.as_object().is_some_and(|o| o.keys().all(|k| matches!(k.as_str(), "format" | "version" | "image" | "animations")));
+    if std::fs::symlink_metadata(p).is_ok() && !anim_file(p).is_ok_and(ours) {
+        return Err(format!("{} already exists and is not a Jon Motion animations file; choose another name", p.display()));
+    }
+    let folder = |d: &Path| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
+    let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if app_dir.is_some_and(|d| folder(d) == folder(parent)) {
+        return Err("animations cannot be exported into the app's settings folder; choose another place".into());
+    }
+    Ok(())
 }
 
 /// Read an animations file: a regular .json file of a sensible size holding our format.

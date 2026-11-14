@@ -908,15 +908,16 @@ pub fn animation(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     });
     ui.horizontal(|ui| {
         ui.label("Name");
-        let mut name = g.anim_name.clone().unwrap_or_else(|| a.name.clone());
+        // The text belongs to the animation it was typed for, whichever is on show when it is applied.
+        let (of, mut name) = g.anim_name.clone().unwrap_or_else(|| (a.name.clone(), a.name.clone()));
         let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0).char_limit(Anim::NAME_MAX));
         if r.changed() {
-            g.anim_name = Some(name.clone());
+            g.anim_name = Some((of, name.clone()));
         }
         if r.lost_focus() {
             // Renamed when the field is left; a name that cannot be used is reported and dropped.
-            if let Some(to) = g.anim_name.take().map(|n| n.trim().to_string()).filter(|n| *n != a.name) {
-                g.run(e, "anim_rename", json!({ "name": a.name, "to": to }));
+            if let Some((of, to)) = g.anim_name.take().map(|(of, n)| (of, n.trim().to_string())).filter(|(of, n)| n != of) {
+                g.run(e, "anim_rename", json!({ "name": of, "to": to }));
             }
         }
     });

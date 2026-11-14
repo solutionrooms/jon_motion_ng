@@ -107,7 +107,7 @@ pub struct Gui {
     /// Frame size typed in before an animation exists; `None` follows the grid size.
     pub anim_size: Option<(u32, u32)>,
     /// The animation's name while it is being typed in the Animation tab.
-    pub anim_name: Option<String>,
+    pub anim_name: Option<(String, String)>,
     /// A tab to bring to the front.
     pub show_tab: Option<Tab>,
     /// Files opened or saved from this window, newest first. Window state only: no command,

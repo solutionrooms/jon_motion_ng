@@ -58,13 +58,13 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
   { "format": "jon-motion-animations", "version": 1, "image": { "width": 128, "height": 64 },
     "animations": [
       { "name": "walk", "fps": 8, "grid": { "x": 0, "y": 0, "w": 64, "h": 16, "frame_w": 16, "frame_h": 16, "frames": 0 } },
-      { "name": "jump", "fps": 12, "frames": [ { "x": 0, "y": 32, "w": 10, "h": 20 },
-                                                { "x": 10, "y": 32, "w": 14, "h": 24, "offset_x": -2, "offset_y": -4 } ] } ] }
+      { "name": "jump", "fps": 12, "frames": [ [0, 32, 10, 20], [10, 32, 14, 24, -2, -4] ] } ] }
   ```
 
-  A frame may also be written `[x, y, w, h]` or `[x, y, w, h, offset_x, offset_y]`. Import checks every animation
-  against the image and imports nothing if one is refused; one with the name of an existing animation replaces it.
-  Export only overwrites a file that is itself an animations file. Versions 0.1.4 and older open these projects
+  A frame is `[x, y, w, h]` or `[x, y, w, h, offset_x, offset_y]` (an object with those names is read too). Import checks
+  every animation against the image and imports nothing if one is refused; one with the name of an existing animation
+  replaces it. Frame lists hold up to 4096 frames each and 32,768 in a document. Export only overwrites a file that is
+  itself an animations file and nothing else, and never writes into `~/.jon_motion`. Versions 0.1.4 and older open these projects
   but know one grid animation at most: 0.1.4 shows the first grid animation, and saving from an old version
   drops the rest.
 - **Files** - native `.jmn` projects (everything), PNG in and out. Exports are always indexed PNGs. An indexed

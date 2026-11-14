@@ -979,6 +979,21 @@ fn project_files_stay_compatible_with_published_builds() {
         assert!(got.layers == d.layers);
     }
 
+    // A stored list far larger than this program writes is not parsed at all, and a list with
+    // nothing usable in it does not hide the animation 0.1.4 would show.
+    let padded = format!("{}{}", " ".repeat((crate::io::ANIM_JSON_MAX + 1) as usize), std::str::from_utf8(&tail[tail.len() - 40..]).map(|_| "").unwrap_or(""));
+    let walk_only = json!({"format": "jon-motion-animations", "animations": [{"name": "kept", "frames": [[0, 0, 4, 4]]}]}).to_string();
+    for (extra, expect) in [
+        (chunk(b"ANMS", format!("{padded}{walk_only}").as_bytes()), ""),
+        ([v1((0, 0, 64, 32, 16, 16, 5, 10.0)), chunk(b"ANMS", format!("{padded}{walk_only}").as_bytes())].concat(), "Animation"),
+        (chunk(b"ANMS", walk_only.as_bytes()), "kept"),
+        ([v1((0, 0, 64, 32, 16, 16, 5, 10.0)), chunk(b"ANMS", br#"{"format":"jon-motion-animations","animations":[]}"#)].concat(), "Animation"),
+        ([v1((0, 0, 64, 32, 16, 16, 5, 10.0)), chunk(b"ANMS", br#"{"format":"jon-motion-animations","animations":[{"name":"bad","frames":[[99,0,4,4]]}]}"#)].concat(), "Animation"),
+    ] {
+        write(&p, &magic, &[plain.as_slice(), &extra].concat());
+        assert_eq!(names(&crate::io::load_doc(path).unwrap().anims), expect);
+    }
+
     // 0.1.4's chunk is checked like the rest of the file.
     let good: V1 = (0, 0, 64, 32, 16, 16, 5, 10.0);
     let g = |f: &dyn Fn(&mut V1)| { let mut a = good; f(&mut a); a };
@@ -1073,9 +1088,16 @@ fn a_document_holds_many_named_animations() {
     let v = e.exec("anim_control", &json!({"step": 1, "playing": false})).unwrap();
     assert_eq!((v["frame_x"].as_i64(), v["frame_w"].as_i64(), v["frame_h"].as_i64(), v["offset_x"].as_i64(), v["offset_y"].as_i64()), (Some(10), Some(14), Some(24), Some(-2), Some(-4)));
     assert_eq!(e.exec("anim_control", &json!({"step": 2})).unwrap()["frame"], 0, "stepping wraps");
-    // Speed alone keeps the list; any grid value replaces it with a grid.
+    // On a frame list anim_set changes the speed and nothing else, and a name that is not in
+    // use is only a new animation when it comes with a region or frame size.
     assert_eq!(e.exec("anim_set", &json!({"fps": 6})).unwrap()["kind"], "frames");
+    assert!(e.exec("anim_set", &json!({"frames": 1})).unwrap_err().contains("frame list"));
+    assert!(e.exec("anim_set", &json!({"name": "jump", "frame_w": 8, "fps": 3})).is_err());
     assert_eq!((e.doc.anims[2].fps, e.doc.anims[2].count()), (6.0, 3));
+    assert!(e.exec("anim_set", &json!({"name": "wlak", "fps": 20})).unwrap_err().contains("no animation named"));
+    e.exec("anim_set", &json!({"name": "walk", "fps": 8.3})).unwrap();
+    assert_eq!(e.exec("anim_info", &json!({"name": "walk"})).unwrap()["fps"], 8.3, "a speed reads back as it was given");
+    e.exec("anim_set", &json!({"name": "walk", "fps": 30})).unwrap();
     for bad in [
         json!({"frames": []}), json!({"frames": [[0, 0, 4]]}), json!({"frames": [[0, 0, 0, 4]]}), json!({"frames": [[120, 0, 16, 4]]}), json!({"frames": [[-1, 0, 4, 4]]}),
         json!({"frames": [[0.5, 0, 4, 4]]}), json!({"frames": [[0, 0, 4, 4, 5000, 0]]}), json!({"frames": [["a", 0, 4, 4]]}), json!({"frames": "all"}), json!({"frames": [[0, 0, 4, 4]], "fps": 0}),
@@ -1119,7 +1141,7 @@ fn a_document_holds_many_named_animations() {
     // New ones get a name of their own.
     e.exec("anim_clear", &json!({"all": true})).unwrap();
     e.exec("anim_set", &json!({})).unwrap();
-    e.exec("anim_set", &json!({"name": "Animation 2"})).unwrap();
+    e.exec("anim_set", &json!({"name": "Animation 2", "frame_w": 8})).unwrap();
     assert_eq!(crate::commands::fresh_anim_name(&e.doc), "Animation 3");
     e.exec("undo", &json!({})).unwrap();
     e.exec("undo", &json!({})).unwrap();
@@ -1143,7 +1165,7 @@ fn a_document_holds_many_named_animations() {
     for i in 0..Anim::MAX {
         full.doc.anims.push(Anim { name: format!("a{i}"), fps: 8.0, frames: Frames::Grid(Grid { x: 0, y: 0, w: 8, h: 8, fw: 8, fh: 8, limit: 0 }) });
     }
-    assert!(full.exec("anim_set", &json!({"name": "one more"})).is_err());
+    assert!(full.exec("anim_set", &json!({"name": "one more", "frame_w": 8, "frame_h": 8})).unwrap_err().contains("at most"));
 
     // ---- JSON: export, edit by hand, import
     let file = tmp("anims.json");
@@ -1151,8 +1173,10 @@ fn a_document_holds_many_named_animations() {
     assert_eq!(e.exec("anim_export_json", &json!({"path": file})).unwrap()["animations"], 3);
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!((v["format"].as_str(), v["version"].as_i64(), v["image"]["width"].as_i64(), v["animations"].as_array().unwrap().len()), (Some("jon-motion-animations"), Some(1), Some(128), 3));
-    assert_eq!(v["animations"][0], json!({"name": "walk", "fps": 30.0, "grid": {"x": 0, "y": 0, "w": 64, "h": 16, "frame_w": 16, "frame_h": 16, "frames": 0}}));
-    assert_eq!(v["animations"][2]["frames"][1], json!({"x": 10, "y": 32, "w": 14, "h": 24, "offset_x": -2, "offset_y": -4}));
+    assert_eq!(v["animations"][0], json!({"name": "walk", "fps": 30, "grid": {"x": 0, "y": 0, "w": 64, "h": 16, "frame_w": 16, "frame_h": 16, "frames": 0}}));
+    assert_eq!((&v["animations"][2]["frames"][0], &v["animations"][2]["frames"][1]), (&json!([0, 32, 10, 20]), &json!([10, 32, 14, 24, -2, -4])));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("\n      [10, 32, 14, 24, -2, -4],\n") && text.contains("\"fps\": 30,"), "one frame per line, speeds as typed:\n{text}");
     // It round-trips, onto an empty document or over the same names.
     e.exec("anim_clear", &json!({"all": true})).unwrap();
     assert_eq!(e.exec("anim_import_json", &json!({"path": file})).unwrap()["imported"], 3);
@@ -1180,6 +1204,51 @@ fn a_document_holds_many_named_animations() {
     e.exec("anim_export_json", &json!({"path": file})).unwrap();
     let mut none = eng(8, 8);
     assert!(none.exec("anim_export_json", &json!({"path": file})).is_err(), "nothing to export leaves the file alone");
+
+    // Nor over a file that merely carries the format marker among other things, nor into the app's own folder.
+    std::fs::write(&other, json!({"format": "jon-motion-animations", "animations": [], "keymap": "dpaint", "recent": []}).to_string()).unwrap();
+    assert!(e.exec("anim_export_json", &json!({"path": other})).is_err());
+    assert!(std::fs::read_to_string(&other).unwrap().contains("keymap"));
+    let app_dir = std::path::Path::new(&dir);
+    assert!(crate::commands::anim_export_allowed(&app_dir.join("settings.json"), Some(app_dir)).unwrap_err().contains("settings folder"));
+    assert!(crate::commands::anim_export_allowed(&app_dir.join("..").join("folder.json").join("x.json"), Some(app_dir)).is_err(), "however the folder is spelled");
+    assert!(crate::commands::anim_export_allowed(std::path::Path::new(&tmp("fresh.json")), Some(app_dir)).is_ok());
+
+    // A document holds only so many frame-list frames, so its largest export can be read back.
+    let mut big = eng(8, 8);
+    let frames: Vec<Value> = (0..Anim::MAX_FRAMES).map(|i| json!([i % 4, 0, 4, 8, -1, i % 3])).collect();
+    for i in 0..Anim::MAX_LIST_FRAMES / Anim::MAX_FRAMES {
+        big.exec("anim_frames", &json!({"name": format!("n{i}"), "frames": frames})).unwrap();
+    }
+    assert!(big.exec("anim_frames", &json!({"name": "over", "frames": [[0, 0, 1, 1]]})).unwrap_err().contains("in all"));
+    big.exec("anim_set", &json!({"name": "grids are not counted", "frame_w": 4, "frame_h": 4})).unwrap();
+    big.exec("anim_frames", &json!({"name": "n0", "frames": frames})).unwrap();
+    let (max_file, max_jmn) = (tmp("max.json"), tmp("max.jmn"));
+    let _ = std::fs::remove_file(&max_file);
+    big.exec("anim_export_json", &json!({"path": max_file})).unwrap();
+    assert!(std::fs::metadata(&max_file).unwrap().len() < crate::io::ANIM_JSON_MAX);
+    let all = big.doc.anims.clone();
+    big.exec("anim_import_json", &json!({"path": max_file, "replace": true})).unwrap();
+    assert_eq!(big.doc.anims, all);
+    big.exec("save_document", &json!({"path": max_jmn})).unwrap();
+    assert_eq!(crate::io::load_doc(std::path::Path::new(&max_jmn)).unwrap().anims, all);
+    let mut small = eng(8, 8);
+    small.exec("anim_frames", &json!({"name": "mine", "frames": [[0, 0, 1, 1]]})).unwrap();
+    assert!(small.exec("anim_import_json", &json!({"path": max_file})).unwrap_err().contains("frame-list frames"));
+
+    // After an undo changes the list, the animation that was on show stays on show.
+    let mut u = eng(32, 32);
+    for n in ["a", "b", "c"] {
+        u.exec("anim_set", &json!({"name": n, "frame_w": 8})).unwrap();
+    }
+    u.exec("anim_control", &json!({"name": "c"})).unwrap();
+    u.exec("anim_clear", &json!({"name": "a"})).unwrap();
+    assert_eq!(u.anim().unwrap().name, "c");
+    u.exec("undo", &json!({})).unwrap();
+    assert_eq!((u.anim().unwrap().name.as_str(), u.view.anim_index), ("c", 2));
+    u.exec("anim_rename", &json!({"to": "sea"})).unwrap();
+    u.exec("anim_clear", &json!({"name": "b"})).unwrap();
+    assert_eq!(u.anim().unwrap().name, "sea");
 
     // Import is all or nothing, and a file can say anything.
     let before = e.doc.anims.clone();

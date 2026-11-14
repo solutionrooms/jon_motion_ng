@@ -16,8 +16,10 @@ cargo run --release -- art.jmn   # open a project (or a .png)
 ```
 
 Prebuilt macOS (universal) and Windows builds are on the
-[releases page](https://github.com/solutionrooms/jon_motion_ng/releases). They are unsigned -
-on macOS, right-click the app and choose Open the first time.
+[releases page](https://github.com/solutionrooms/jon_motion_ng/releases). They are unsigned, so
+macOS refuses to open the app at first ("Apple could not verify..."). Click Done, then open System Settings >
+Privacy & Security, scroll to the message about Jon Motion and click **Open Anyway** (once per download).
+Or clear the download flag in Terminal: `xattr -dr com.apple.quarantine "/path/to/Jon Motion.app"`.
 
 To cut a release, bump `version` in `Cargo.toml` and push a matching tag (`git tag v0.1.0 && git push --tags`);
 CI tests, builds both platforms and publishes them. Local packages: `./scripts/package.sh` (run on macOS;

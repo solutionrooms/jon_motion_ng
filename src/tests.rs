@@ -631,3 +631,46 @@ fn canvas_zoom_and_pan() {
     assert!(r.e.view.cx > cx, "middle-drag pans");
     assert_eq!(r.e.undo.len(), undo, "panning never touches the document");
 }
+
+#[test]
+fn right_clicking_a_tool_selects_it_and_opens_its_options() {
+    let ctx = egui::Context::default();
+    let (mut e, mut g) = (Engine::new("gui"), Gui::new());
+    let mut time = 0.0;
+    let mut frame = |e: &mut Engine, g: &mut Gui, events: Vec<Event>| {
+        time += 1.0 / 60.0;
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0))), time: Some(time), events, ..Default::default() };
+        let mut menu_text = false;
+        let out = ctx.run(raw, |ctx| {
+            egui::SidePanel::left("tools").exact_width(46.0).resizable(false).show(ctx, |ui| crate::panels::toolbar(ui, e, g));
+            egui::CentralPanel::default().show(ctx, |_| {});
+        });
+        // The menu's contents are painted as text shapes; look for the Filled checkbox.
+        fn has(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
+            fn walk(s: &egui::Shape, needle: &str) -> bool {
+                match s {
+                    egui::Shape::Text(t) => t.galley.text().contains(needle),
+                    egui::Shape::Vec(v) => v.iter().any(|s| walk(s, needle)),
+                    _ => false,
+                }
+            }
+            shapes.iter().any(|c| walk(&c.shape, needle))
+        }
+        menu_text |= has(&out.shapes, "Filled");
+        menu_text
+    };
+    frame(&mut e, &mut g, vec![]);
+    // Tool buttons are 34x30 with 3 px gaps, stacked from the top of the panel; Rectangle is the fourth.
+    let rect_tool = Tool::ALL.iter().position(|t| *t == Tool::Rect).unwrap() as f32;
+    let p = pos2(23.0, 6.0 + rect_tool * 33.0 + 15.0);
+    assert_eq!(e.o.tool, Tool::Pencil);
+    frame(&mut e, &mut g, vec![Event::PointerMoved(p)]);
+    frame(&mut e, &mut g, vec![Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE }]);
+    frame(&mut e, &mut g, vec![Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE }]);
+    assert_eq!(e.o.tool, Tool::Rect, "right-click selects the tool");
+    let mut shown = false;
+    for _ in 0..3 {
+        shown |= frame(&mut e, &mut g, vec![]);
+    }
+    assert!(shown, "the options menu for the rectangle tool is showing");
+}

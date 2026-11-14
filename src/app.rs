@@ -443,15 +443,15 @@ pub fn use_dropped(e: &mut Engine, g: &mut Gui, p: &Path, as_layer: bool) {
     }
 }
 
-/// Shown while a file is held over the window.
-fn drop_hint(ctx: &egui::Context) {
+/// Shown while a file is held over the window: what dropping it here would do.
+fn drop_hint(ctx: &egui::Context, text: &str) {
     if ctx.input(|i| i.raw.hovered_files.is_empty()) {
         return;
     }
     let r = ctx.screen_rect();
     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hint")));
     p.rect_filled(r, 0.0, Color32::from_black_alpha(160));
-    p.text(r.center(), egui::Align2::CENTER_CENTER, "Drop a .jmn or .png file to open it", egui::FontId::proportional(22.0), Color32::WHITE);
+    p.text(r.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(22.0), Color32::WHITE);
 }
 
 fn export(e: &mut Engine, g: &mut Gui, command: &str, ext: &str, suffix: &str, extra: Value) {
@@ -1375,6 +1375,11 @@ fn busy_screen(ctx: &egui::Context, g: &mut Gui) {
         script::cancel();
         g.busy_quit = true;
     }
+    // A file dropped now cannot be opened; say so once the window is back.
+    if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
+        g.error("The document was busy, so the dropped file was not opened; drop it again");
+    }
+    drop_hint(ctx, "The document is busy; drop the file when it has finished");
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.4);
@@ -1442,8 +1447,8 @@ impl eframe::App for App {
         }
 
         dropped(ctx, e, g);
-        drop_hint(ctx);
         let modal = !matches!(g.dialog, Dialog::None) || g.pending.is_some();
+        drop_hint(ctx, if modal { "Finish the open dialog before dropping a file" } else { "Drop a .jmn to open it, or a .png to open it or add it as a layer" });
         if !modal {
             shortcuts(ctx, e, g);
             if g.saved_keymap.is_some() {

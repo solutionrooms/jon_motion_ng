@@ -11,7 +11,7 @@ use crate::script;
 use eframe::egui::{self, Color32, CornerRadius, Key, KeyboardShortcut, Modifiers, Stroke, ViewportCommand};
 use egui_dock::{DockArea, DockState, NodeIndex};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -42,8 +42,13 @@ pub enum Dialog {
 pub enum Pending {
     New,
     Open,
+    /// Open this file (from File > Open Recent).
+    OpenFile(PathBuf),
     Quit,
 }
+
+/// How many files File > Open Recent keeps.
+pub const RECENT_MAX: usize = 10;
 
 pub enum Drag {
     Pan { last: egui::Pos2, button: usize },
@@ -101,6 +106,13 @@ pub struct Gui {
     pub anim_size: Option<(u32, u32)>,
     /// A tab to bring to the front.
     pub show_tab: Option<Tab>,
+    /// Files opened or saved from this window, newest first. Window state only: no command,
+    /// script or AI client can read it.
+    pub recent: Vec<PathBuf>,
+    /// The list changed and is to be written to the settings file.
+    pub recent_dirty: bool,
+    /// The user cleared the list, so the copy on disk is replaced rather than merged with.
+    pub recent_cleared: bool,
 }
 
 impl Gui {
@@ -143,6 +155,9 @@ impl Gui {
             anim_clock: 0.0,
             anim_size: None,
             show_tab: None,
+            recent: vec![],
+            recent_dirty: false,
+            recent_cleared: false,
         }
     }
 
@@ -177,6 +192,18 @@ impl Gui {
         if let Err(err) = r {
             self.error(err);
         }
+    }
+    /// Put a file at the top of File > Open Recent.
+    pub fn remember(&mut self, p: &Path) {
+        let p = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        // The list is stored as JSON text, which cannot hold a path that is not valid Unicode.
+        if p.to_str().is_none() {
+            return;
+        }
+        self.recent.retain(|q| *q != p);
+        self.recent.insert(0, p);
+        self.recent.truncate(RECENT_MAX);
+        self.recent_dirty = true;
     }
     pub fn script_done(&mut self, out: script::ScriptOut) {
         let mut s = out.output;
@@ -258,11 +285,16 @@ impl App {
         theme(&cc.egui_ctx);
         let mut engine = Engine::new("gui");
         let mut gui = Gui::new();
-        load_settings(&mut engine);
+        if let Some(p) = remote::settings_file() {
+            let (keymap, recent) = read_settings(&p);
+            engine.view.keymap = keymap.unwrap_or(engine.view.keymap);
+            gui.recent = recent;
+        }
         gui.saved_keymap = Some(engine.view.keymap);
         if let Some(f) = file {
-            if let Err(e) = engine.exec("open_document", &json!({ "path": f.display().to_string() })) {
-                gui.error(e);
+            match engine.exec("open_document", &json!({ "path": f.display().to_string() })) {
+                Ok(_) => gui.remember(&f),
+                Err(e) => gui.error(e),
             }
         }
         let engine = Arc::new(Mutex::new(engine));
@@ -339,15 +371,22 @@ pub fn save(e: &mut Engine, g: &mut Gui, save_as: bool) -> bool {
     let ok = g.run(e, "save_document", json!({ "path": path.display().to_string() })).is_some();
     if ok {
         g.info(format!("Saved {}", path.display()));
+        g.remember(&path);
     }
     ok
 }
 
 fn open(e: &mut Engine, g: &mut Gui) {
     if let Some(p) = pick_open() {
-        if g.run(e, "open_document", json!({ "path": p.display().to_string(), "force": true })).is_some() {
-            g.info(format!("Opened {}", p.display()));
-        }
+        open_path(e, g, &p);
+    }
+}
+
+/// Open a file the user chose; any unsaved changes have already been dealt with.
+fn open_path(e: &mut Engine, g: &mut Gui, p: &Path) {
+    if g.run(e, "open_document", json!({ "path": p.display().to_string(), "force": true })).is_some() {
+        g.info(format!("Opened {}", p.display()));
+        g.remember(p);
     }
 }
 
@@ -362,7 +401,7 @@ fn export(e: &mut Engine, g: &mut Gui, command: &str, ext: &str, suffix: &str, e
     }
 }
 
-fn request(e: &mut Engine, g: &mut Gui, what: Pending) {
+pub fn request(e: &mut Engine, g: &mut Gui, what: Pending) {
     if e.modified {
         g.pending = Some(what);
     } else {
@@ -374,6 +413,7 @@ fn proceed(e: &mut Engine, g: &mut Gui, what: Pending) {
     match what {
         Pending::New => g.dialog = Dialog::New { w: e.doc.w, h: e.doc.h, preset: 0 },
         Pending::Open => open(e, g),
+        Pending::OpenFile(p) => open_path(e, g, &p),
         Pending::Quit => g.allow_close = true,
     }
 }
@@ -422,29 +462,62 @@ pub fn zoom(e: &mut Engine, dir: i32) {
 
 // ------------------------------------------------------------------ shortcuts
 
-/// Preferences that outlive the window, in ~/.jon_motion/settings.json.
-fn load_settings(e: &mut Engine) {
-    let Some(p) = remote::settings_file() else { return };
-    let Ok(text) = std::fs::read_to_string(p) else { return };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
-    if let Some(k) = v["keymap"].as_str().and_then(Keymap::parse) {
-        e.view.keymap = k;
+/// Read the preferences that outlive the window (~/.jon_motion/settings.json): the key preset
+/// and the recent files. The file is the user's to edit, so anything malformed in it is ignored.
+pub fn read_settings(p: &Path) -> (Option<Keymap>, Vec<PathBuf>) {
+    let small = std::fs::metadata(p).is_ok_and(|m| m.len() <= 1 << 20);
+    let Some(v) = small.then(|| std::fs::read_to_string(p).ok()).flatten().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return (None, vec![]) };
+    let mut recent: Vec<PathBuf> = vec![];
+    for s in v["recent"].as_array().into_iter().flatten().filter_map(|s| s.as_str()) {
+        let f = PathBuf::from(s);
+        if s.len() <= 4096 && f.is_absolute() && !recent.contains(&f) && recent.len() < RECENT_MAX {
+            recent.push(f);
+        }
     }
+    (v["keymap"].as_str().and_then(Keymap::parse), recent)
+}
+
+/// Write the preferences, keeping any keys in the file that this build does not know.
+pub fn write_settings(p: &Path, keymap: Keymap, recent: &[PathBuf]) -> std::io::Result<()> {
+    use std::io::Write;
+    let old = std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let mut v = old.filter(Value::is_object).unwrap_or_else(|| json!({}));
+    v["keymap"] = json!(keymap.name());
+    v["recent"] = json!(recent.iter().filter_map(|f| f.to_str()).collect::<Vec<_>>());
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // The recent list is file names from the user's disk, so the file is private to them.
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        o.mode(0o600);
+        if p.exists() {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    o.open(p)?.write_all(serde_json::to_string_pretty(&v)?.as_bytes())
 }
 
 /// Write the preferences when one changed (from the menu, the dialog, a script or an AI client).
 fn save_settings(e: &Engine, g: &mut Gui) {
-    if g.saved_keymap == Some(e.view.keymap) {
+    if g.saved_keymap == Some(e.view.keymap) && !g.recent_dirty {
         return;
     }
     g.saved_keymap = Some(e.view.keymap);
-    if let Some(p) = remote::settings_file() {
-        if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir).ok();
+    let Some(p) = remote::settings_file() else { return };
+    if std::mem::take(&mut g.recent_dirty) && !std::mem::take(&mut g.recent_cleared) {
+        // Another window may have added files since this one started: keep those too.
+        for f in read_settings(&p).1 {
+            if !g.recent.contains(&f) && g.recent.len() < RECENT_MAX {
+                g.recent.push(f);
+            }
         }
-        if let Err(err) = std::fs::write(&p, json!({ "keymap": e.view.keymap.name() }).to_string()) {
-            g.error(format!("could not save settings to {}: {err}", p.display()));
-        }
+    }
+    if let Err(err) = write_settings(&p, e.view.keymap, &g.recent) {
+        g.error(format!("could not save settings to {}: {err}", p.display()));
     }
 }
 
@@ -621,6 +694,39 @@ fn item(ui: &mut egui::Ui, label: &str, shortcut: &str) -> bool {
     clicked
 }
 
+pub fn recent_menu(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
+    if g.recent.is_empty() {
+        ui.weak("No recent files");
+        return;
+    }
+    let mut pick = None;
+    for p in &g.recent {
+        let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string());
+        // Two files with the same name are told apart by their folder.
+        let twin = g.recent.iter().filter(|q| q.file_name() == p.file_name()).count() > 1;
+        let label = match (twin, p.parent()) {
+            (true, Some(dir)) => format!("{name}  -  {}", dir.display()),
+            _ => name,
+        };
+        let there = p.exists();
+        let b = ui.add_enabled(there, egui::Button::new(label));
+        let b = if there { b.on_hover_text(p.display().to_string()) } else { b.on_disabled_hover_text(format!("This file is no longer there: {}", p.display())) };
+        if b.clicked() {
+            pick = Some(p.clone());
+            ui.close_menu();
+        }
+    }
+    ui.separator();
+    if item(ui, "Clear Recent", "") {
+        g.recent.clear();
+        (g.recent_dirty, g.recent_cleared) = (true, true);
+    }
+    if let Some(p) = pick {
+        // The same unsaved-changes prompt as File > Open.
+        request(e, g, Pending::OpenFile(p));
+    }
+}
+
 fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     egui::menu::bar(ui, |ui| {
         ui.menu_button("File", |ui| {
@@ -630,6 +736,7 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if item(ui, "Open...", "Cmd+O") {
                 request(e, g, Pending::Open);
             }
+            ui.menu_button("Open Recent", |ui| recent_menu(ui, e, g));
             ui.separator();
             if item(ui, "Save", "Cmd+S") {
                 save(e, g, false);

@@ -113,6 +113,10 @@ pub struct Gui {
     pub recent_dirty: bool,
     /// The user cleared the list, so the copy on disk is replaced rather than merged with.
     pub recent_cleared: bool,
+    /// Recent files found to be missing, a check still running, and when the last one started.
+    pub recent_gone: Vec<PathBuf>,
+    pub recent_check: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    pub recent_checked: Option<Instant>,
 }
 
 impl Gui {
@@ -158,6 +162,9 @@ impl Gui {
             recent: vec![],
             recent_dirty: false,
             recent_cleared: false,
+            recent_gone: vec![],
+            recent_check: None,
+            recent_checked: None,
         }
     }
 
@@ -195,9 +202,12 @@ impl Gui {
     }
     /// Put a file at the top of File > Open Recent.
     pub fn remember(&mut self, p: &Path) {
-        let p = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        // One spelling per file: symlinks, ".." and (on case-insensitive disks) letter case are
+        // resolved. Windows keeps the plain absolute path, as its canonical form is the \\?\ kind.
+        let full = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let p = if cfg!(unix) { std::fs::canonicalize(&full).unwrap_or(full) } else { full };
         // The list is stored as JSON text, which cannot hold a path that is not valid Unicode.
-        if p.to_str().is_none() {
+        if !p.to_str().is_some_and(listable) {
             return;
         }
         self.recent.retain(|q| *q != p);
@@ -462,15 +472,25 @@ pub fn zoom(e: &mut Engine, dir: i32) {
 
 // ------------------------------------------------------------------ shortcuts
 
+/// A path that can be shown in a menu as it is: no control characters, and none of the
+/// invisible characters that reorder text (which could make one name display as another).
+fn listable(s: &str) -> bool {
+    s.len() <= 4096 && !s.chars().any(|c| c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+}
+
+/// The settings file as JSON, if it is there, a sensible size and well formed.
+fn settings_json(p: &Path) -> Option<Value> {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= 1 << 20).then(|| std::fs::read_to_string(p).ok()).flatten().and_then(|t| serde_json::from_str(&t).ok())
+}
+
 /// Read the preferences that outlive the window (~/.jon_motion/settings.json): the key preset
 /// and the recent files. The file is the user's to edit, so anything malformed in it is ignored.
 pub fn read_settings(p: &Path) -> (Option<Keymap>, Vec<PathBuf>) {
-    let small = std::fs::metadata(p).is_ok_and(|m| m.len() <= 1 << 20);
-    let Some(v) = small.then(|| std::fs::read_to_string(p).ok()).flatten().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return (None, vec![]) };
+    let Some(v) = settings_json(p) else { return (None, vec![]) };
     let mut recent: Vec<PathBuf> = vec![];
     for s in v["recent"].as_array().into_iter().flatten().filter_map(|s| s.as_str()) {
         let f = PathBuf::from(s);
-        if s.len() <= 4096 && f.is_absolute() && !recent.contains(&f) && recent.len() < RECENT_MAX {
+        if listable(s) && f.is_absolute() && !recent.contains(&f) && recent.len() < RECENT_MAX {
             recent.push(f);
         }
     }
@@ -478,27 +498,35 @@ pub fn read_settings(p: &Path) -> (Option<Keymap>, Vec<PathBuf>) {
 }
 
 /// Write the preferences, keeping any keys in the file that this build does not know.
-pub fn write_settings(p: &Path, keymap: Keymap, recent: &[PathBuf]) -> std::io::Result<()> {
+/// `recent: None` leaves the list in the file as it is.
+pub fn write_settings(p: &Path, keymap: Keymap, recent: Option<&[PathBuf]>) -> std::io::Result<()> {
     use std::io::Write;
-    let old = std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
-    let mut v = old.filter(Value::is_object).unwrap_or_else(|| json!({}));
+    // A settings file the user has made read-only is theirs to keep that way.
+    if std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file() && m.permissions().readonly()) {
+        return Ok(());
+    }
+    let mut v = settings_json(p).filter(Value::is_object).unwrap_or_else(|| json!({}));
     v["keymap"] = json!(keymap.name());
-    v["recent"] = json!(recent.iter().filter_map(|f| f.to_str()).collect::<Vec<_>>());
+    if let Some(recent) = recent {
+        v["recent"] = json!(recent.iter().filter_map(|f| f.to_str()).collect::<Vec<_>>());
+    }
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // The recent list is file names from the user's disk, so the file is private to them.
+    // Written beside the target and renamed over it, so a crash cannot leave half a file, and
+    // whatever is at the path (a link, a directory) is never written through or re-moded.
+    // The recent list is file names from the user's disk, so the file is created private.
+    let tmp = p.with_extension("json.tmp");
+    let _ = std::fs::remove_file(&tmp);
     let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
+    o.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        o.mode(0o600);
-        if p.exists() {
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
-        }
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let done = o.open(&tmp).and_then(|mut f| f.write_all(serde_json::to_string_pretty(&v)?.as_bytes())).and_then(|()| std::fs::rename(&tmp, p));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    o.open(p)?.write_all(serde_json::to_string_pretty(&v)?.as_bytes())
+    done
 }
 
 /// Write the preferences when one changed (from the menu, the dialog, a script or an AI client).
@@ -508,7 +536,10 @@ fn save_settings(e: &Engine, g: &mut Gui) {
     }
     g.saved_keymap = Some(e.view.keymap);
     let Some(p) = remote::settings_file() else { return };
-    if std::mem::take(&mut g.recent_dirty) && !std::mem::take(&mut g.recent_cleared) {
+    // The list is only written when this window changed it, so a key preset change here
+    // cannot drop files another window added.
+    let dirty = std::mem::take(&mut g.recent_dirty);
+    if dirty && !std::mem::take(&mut g.recent_cleared) {
         // Another window may have added files since this one started: keep those too.
         for f in read_settings(&p).1 {
             if !g.recent.contains(&f) && g.recent.len() < RECENT_MAX {
@@ -516,7 +547,7 @@ fn save_settings(e: &Engine, g: &mut Gui) {
             }
         }
     }
-    if let Err(err) = write_settings(&p, e.view.keymap, &g.recent) {
+    if let Err(err) = write_settings(&p, e.view.keymap, dirty.then_some(g.recent.as_slice())) {
         g.error(format!("could not save settings to {}: {err}", p.display()));
     }
 }
@@ -699,16 +730,34 @@ pub fn recent_menu(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
         ui.weak("No recent files");
         return;
     }
+    // Whether each file is still there is checked on another thread, at most every two seconds:
+    // a path on an unreachable network drive can take a long time to answer, and must not
+    // freeze the window while the menu is open.
+    match g.recent_check.as_ref().map(|rx| rx.try_recv()) {
+        Some(Ok(gone)) => (g.recent_gone, g.recent_check) = (gone, None),
+        Some(Err(mpsc::TryRecvError::Disconnected)) => g.recent_check = None,
+        _ => {}
+    }
+    if g.recent_check.is_none() && g.recent_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+        let (tx, rx) = mpsc::channel();
+        let (list, ctx) = (g.recent.clone(), ui.ctx().clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(list.into_iter().filter(|p| !p.exists()).collect());
+            ctx.request_repaint();
+        });
+        (g.recent_check, g.recent_checked) = (Some(rx), Some(Instant::now()));
+    }
+    let short = |s: String| if s.chars().count() > 64 { format!("{}...{}", s.chars().take(30).collect::<String>(), s.chars().skip(s.chars().count() - 30).collect::<String>()) } else { s };
     let mut pick = None;
     for p in &g.recent {
-        let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string());
+        let name = short(p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string()));
         // Two files with the same name are told apart by their folder.
         let twin = g.recent.iter().filter(|q| q.file_name() == p.file_name()).count() > 1;
         let label = match (twin, p.parent()) {
-            (true, Some(dir)) => format!("{name}  -  {}", dir.display()),
+            (true, Some(dir)) => format!("{name}  -  {}", short(dir.display().to_string())),
             _ => name,
         };
-        let there = p.exists();
+        let there = !g.recent_gone.contains(p);
         let b = ui.add_enabled(there, egui::Button::new(label));
         let b = if there { b.on_hover_text(p.display().to_string()) } else { b.on_disabled_hover_text(format!("This file is no longer there: {}", p.display())) };
         if b.clicked() {

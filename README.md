@@ -57,7 +57,8 @@ standard set and **Deluxe Paint** keys (`d` draw, `v` line, `r`/`R` rectangle, `
 the choice is remembered in `~/.jon_motion/settings.json`.
 
 File > Open Recent lists the last 10 files opened or saved from the window (not ones a script or AI client
-opened). The list lives in `~/.jon_motion/settings.json`, readable only by you, and no command exposes it.
+opened). The list lives in `~/.jon_motion/settings.json` (created private to your account on macOS and Linux;
+on Windows it is protected by your user profile folder), and no command exposes it.
 
 ## Scripting (Lua)
 

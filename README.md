@@ -84,6 +84,16 @@ every document that has unsaved changes. Each open document keeps its own undo h
 Drag a `.jmn` or `.png` file onto the window (one at a time). A project opens in a tab; for a PNG you choose
 between opening it and adding it to the current document as a layer.
 
+**Sprite atlas viewer** - File > Open Sprite Atlas... (or drop the file on the window, or pass it on the command
+line) opens a game's baked atlas - an `atlas.json` beside its `atlas_0.webp`, `atlas_1.webp`... pages (PNG pages work
+too) - in a floating viewer: every object is listed, and any of them plays with its per-frame offsets, including
+labelled sequences (`run1` ... `run1_end`). Left / Right step and Space plays while the pointer is over the viewer.
+It shows the pages in true colour, exactly as they are, and it is **view only**: the atlas is not a document, so no
+tool, command, script or AI client can paint, convert or save it, and its files are only ever read. The format is
+`{prefix, pages, ext, objects: [{name, labels: [[label, frame], ...], frames: [[page, x, y, w, h, source_w,
+source_h, x_offset, y_offset], ...]}]}`, with page -1 for an empty frame. Scripts and AI clients cannot see or drive
+the viewer.
+
 File > Open Recent lists the last 10 files opened or saved from the window (not ones a script or AI client
 opened). The list lives in `~/.jon_motion/settings.json` (created private to your account on macOS and Linux;
 on Windows it is protected by your user profile folder), and no command exposes it.
@@ -146,6 +156,7 @@ passes `force` does discard them. Save and export commands overwrite existing fi
 | `src/commands.rs` | The command registry - add a feature here and it is scriptable everywhere |
 | `src/script.rs` | Lua bindings |
 | `src/remote.rs` | MCP: tools, JSON-RPC, HTTP server, stdio bridge |
+| `src/atlas.rs` | View-only sprite atlas reader and viewer window |
 | `src/app.rs`, `canvas.rs`, `panels.rs` | The egui app |
 
 `cargo test` runs the Lua command suite (`tests/smoke.lua`), the MCP protocol, and the interactive

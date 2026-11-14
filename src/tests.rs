@@ -808,6 +808,148 @@ fn deluxe_paint_keys() {
     }
 }
 
+// ---------------------------------------------------------------- sprite atlas viewer
+
+#[test]
+fn a_sprite_atlas_is_read_exactly_and_only_read() {
+    use crate::atlas::{self, AFrame};
+    use std::path::{Path, PathBuf};
+    let dir = PathBuf::from(tmp("atlas"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Two pages: a WebP with soft-edged, many-coloured pixels and a PNG.
+    let page = |w: u32, h: u32, seed: u32| -> Vec<u8> { (0..w * h).flat_map(|i| [(i * 7 + seed) as u8, (i * 13) as u8, (i / w * 9) as u8, if i % 5 == 0 { (i * 3) as u8 } else { 255 }]).collect() };
+    let (p0, p1) = (page(64, 32, 1), page(16, 16, 9));
+    let mut webp = vec![];
+    image_webp::WebPEncoder::new(&mut webp).encode(&p0, 64, 32, image_webp::ColorType::Rgba8).unwrap();
+    std::fs::write(dir.join("atlas_0.webp"), &webp).unwrap();
+    std::fs::write(dir.join("atlas_1.webp"), {
+        let mut v = vec![];
+        image_webp::WebPEncoder::new(&mut v).encode(&p1, 16, 16, image_webp::ColorType::Rgba8).unwrap();
+        v
+    })
+    .unwrap();
+    let desc = json!({"scale": 1, "prefix": "atlas_", "pages": 2, "ext": ".webp", "objects": [
+        {"name": "ball", "flags": "", "mcName": "ball",
+         "labels": [["roll", 0], ["roll_end", 1], ["pop", 3], ["junk", 99], [7, 0], ["bad\u{202e}name", 2]],
+         "frames": [[0, 0, 0, 16, 16, 16.4, 16.0, -8, -8], [0, 16, 0, 20, 12, 20.0, 12.5, -10.0, -4], [-1, 0, 0, 0, 0, 0, 0, 3, 3], [1, 0, 0, 16, 16, 16, 16, -8, -12]]},
+        {"name": "post\u{7}", "labels": [], "frames": [[0, 40, 8, 8, 24, 8, 24, 1e9, -1e9]]},
+        {"labels": [], "frames": []},
+    ]});
+    let file = dir.join("atlas.json");
+    std::fs::write(&file, desc.to_string()).unwrap();
+    let listing = |d: &Path| {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap()).map(|e| (e.file_name().to_string_lossy().to_string(), std::fs::read(e.path()).unwrap_or_default())).collect();
+        v.sort();
+        v
+    };
+    let before = listing(&dir);
+
+    let a = atlas::load(&file).unwrap();
+    assert_eq!((a.pages.len(), a.pages[0].w, a.pages[0].h, a.pages[1].w, a.objects.len()), (2, 64, 32, 16, 3));
+    assert!(a.pages[0].rgba == p0 && a.pages[1].rgba == p1, "every pixel, partly transparent ones included, is exactly the file's");
+    let ball = &a.objects[0];
+    assert_eq!(ball.frames[1], Some(AFrame { page: 0, x: 16, y: 0, w: 20, h: 12, ox: -10, oy: -4 }));
+    assert_eq!((ball.frames[2], ball.frames[3].map(|f| f.page)), (None, Some(1)), "an empty frame, and a frame on another page");
+    assert_eq!(ball.bounds, (-10, -12, 20, 20), "the box holds every frame at its offset");
+    let seqs: Vec<(&str, u32, u32)> = ball.seqs.iter().map(|s| (s.name.as_str(), s.start, s.end)).collect();
+    assert_eq!(seqs, vec![("roll", 0, 1), ("badname", 2, 2), ("pop", 3, 3)], "labels pair up with their _end; nonsense ones are left out");
+    assert_eq!((a.objects[1].name.as_str(), a.objects[1].frames[0].map(|f| (f.ox, f.oy)), a.objects[2].name.as_str()), ("post", Some((32768, -32768)), "object 2"));
+    assert_eq!(a.objects[2].bounds, (0, 0, 1, 1));
+
+    // The viewer steps inside what is playing and wraps round.
+    let mut v = atlas::View::new(a);
+    assert_eq!((v.object, v.range()), (0, (0, 3)));
+    v.step(-1);
+    assert_eq!(v.frame, 3);
+    v.play_seq(Some(0));
+    assert_eq!((v.frame, v.range()), (0, (0, 1)));
+    v.step(3);
+    assert_eq!(v.frame, 1);
+    v.select(1);
+    assert_eq!((v.object, v.seq, v.frame, v.range()), (1, None, 0, (0, 0)));
+    v.step(5);
+    v.select(2);
+    v.step(1);
+    v.select(99);
+    assert_eq!((v.object, v.frame), (2, 0));
+
+    // Nothing was written, and no command or tool knows the viewer exists.
+    assert_eq!(listing(&dir), before);
+    assert!(crate::commands::registry().iter().all(|c| !c.name.contains("atlas") && !c.desc.to_lowercase().contains("atlas")));
+    assert!(!crate::remote::tools().to_string().to_lowercase().contains("atlas"));
+
+    // The description can say anything. The page names come from it, so they may only ever
+    // be plain names in the atlas's own folder.
+    let head = |prefix: Value, ext: Value, pages: Value| atlas::header(&json!({"prefix": prefix, "ext": ext, "pages": pages}));
+    assert_eq!(head(json!("atlas_"), json!(".WEBP"), json!(3)).unwrap(), ("atlas_".to_string(), ".webp".to_string(), 3));
+    for (prefix, ext, pages) in [
+        (json!("../atlas_"), json!(".webp"), json!(1)), (json!("/etc/"), json!(".webp"), json!(1)), (json!("a/b"), json!(".png"), json!(1)), (json!("a\\b"), json!(".png"), json!(1)),
+        (json!(".."), json!(".png"), json!(1)), (json!(""), json!(".png"), json!(1)), (json!("x".repeat(65)), json!(".png"), json!(1)), (json!(7), json!(".png"), json!(1)),
+        (json!("a"), json!(".exe"), json!(1)), (json!("a"), json!("/../x.png"), json!(1)), (json!("a"), json!(""), json!(1)),
+        (json!("a"), json!(".png"), json!(0)), (json!("a"), json!(".png"), json!(17)), (json!("a"), json!(".png"), json!(1.5)), (json!("a"), json!(".png"), json!("3")), (json!("a"), json!(".png"), json!(-1)),
+    ] {
+        assert!(head(prefix.clone(), ext.clone(), pages.clone()).is_err(), "{prefix} {ext} {pages}");
+    }
+    let sizes = [(64u32, 32u32), (16, 16)];
+    let objs = |frames: Value| atlas::parse(&json!({"objects": [{"name": "o", "labels": [["a", 0]], "frames": frames}]}), &sizes);
+    assert!(objs(json!([[0, 0, 0, 64, 32]])).is_ok() && objs(json!([[1, 15, 15, 1, 1, 0, 0]])).is_ok() && objs(json!([[0, 5, 5, 0, 0]])).unwrap()[0].frames[0].is_none());
+    for frames in [
+        json!([[2, 0, 0, 1, 1]]), json!([[-2, 0, 0, 1, 1]]), json!([[0, 60, 0, 8, 8]]), json!([[0, 0, 30, 8, 8]]), json!([[1, 0, 0, 17, 1]]), json!([[0, -1, 0, 8, 8]]),
+        json!([[0, 0.5, 0, 8, 8]]), json!([[0, 0, 0, 1e300, 8]]), json!([[0, 4294967295u32, 0, 4294967295u32, 1]]), json!([[0, 0, 0, 8]]), json!([["0", 0, 0, 8, 8]]), json!([{"x": 0}]),
+        json!([7]), json!("frames"), json!(null), json!((0..atlas::FRAMES_MAX + 1).map(|_| json!([-1, 0, 0, 0, 0])).collect::<Vec<_>>()),
+    ] {
+        assert!(objs(frames.clone()).is_err(), "{:.60}", frames.to_string());
+    }
+    assert!(atlas::parse(&json!({"objects": (0..atlas::OBJECTS_MAX + 1).map(|_| json!({"frames": []})).collect::<Vec<_>>()}), &sizes).is_err());
+    assert!(atlas::parse(&json!({"objects": {"a": 1}}), &sizes).is_err() && atlas::parse(&json!([1, 2]), &sizes).is_err());
+    let odd = atlas::parse(&json!({"objects": [{"name": 5, "labels": "x", "frames": [[0, 0, 0, 4, 4, "w", null, "x", {}]]}, {"name": "l", "labels": [["a_end", 0], ["b", 1], ["b_end", 0], [], [[], 0]], "frames": [[-1, 0, 0, 0, 0], [-1, 0, 0, 0, 0]]}]}), &sizes).unwrap();
+    assert_eq!((odd[0].name.as_str(), odd[0].frames[0].map(|f| (f.ox, f.oy)), odd[0].seqs.len()), ("object 0", Some((0, 0)), 0));
+    assert!(odd[1].seqs.iter().all(|s| s.start <= s.end && (s.end as usize) < 2), "{:?}", odd[1].seqs);
+
+    // Files: a page that is missing, not an image, cut short, a link out of the folder, or too big.
+    let fails = |why: &str| {
+        let err = atlas::load(&file).err().unwrap_or_default();
+        assert!(err.contains(why), "expected '{why}', got '{err}'");
+    };
+    std::fs::write(dir.join("atlas_1.webp"), &webp[..webp.len() / 2]).unwrap();
+    fails("WebP");
+    std::fs::write(dir.join("atlas_1.webp"), b"RIFF\xff\xff\xff\x7fWEBPVP8 not really").unwrap();
+    fails("WebP");
+    std::fs::write(dir.join("atlas_1.webp"), b"").unwrap();
+    fails("WebP");
+    std::fs::remove_file(dir.join("atlas_1.webp")).unwrap();
+    fails("atlas_1.webp");
+    #[cfg(unix)]
+    {
+        let outside = tmp("outside_the_atlas.webp");
+        std::fs::write(&outside, &webp).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("atlas_1.webp")).unwrap();
+        fails("not a plain file");
+        std::fs::remove_file(dir.join("atlas_1.webp")).unwrap();
+    }
+    std::fs::create_dir_all(dir.join("atlas_1.webp")).unwrap();
+    fails("not a plain file");
+    std::fs::remove_dir_all(dir.join("atlas_1.webp")).unwrap();
+    std::fs::write(dir.join("atlas_1.webp"), &webp).unwrap();
+    assert!(atlas::load(&file).is_ok(), "a page may be larger than the frames need");
+    // The pixel budget is checked from the header, before a page is decoded.
+    let mut budget = 100;
+    assert!(atlas::decode_page(&webp, true, &mut budget).err().unwrap_or_default().contains("too large") && budget == 100);
+    let mut budget = 64 * 32;
+    assert!(atlas::decode_page(&webp, true, &mut budget).is_ok() && budget == 0);
+    // PNG pages work too, and the description itself has a size limit and must be a .json.
+    std::fs::write(dir.join("p0.png"), crate::io::encode_png_rgba(64, 32, &p0).unwrap()).unwrap();
+    std::fs::write(&file, json!({"prefix": "p", "pages": 1, "ext": ".png", "objects": [{"name": "o", "labels": [], "frames": [[0, 0, 0, 64, 32]]}]}).to_string()).unwrap();
+    assert!(atlas::load(&file).unwrap().pages[0].rgba == p0);
+    std::fs::write(&file, vec![b' '; (atlas::JSON_MAX + 1) as usize]).unwrap();
+    fails("larger than");
+    std::fs::write(&file, "{ nope").unwrap();
+    fails("not valid JSON");
+    assert!(atlas::load(&dir.join("p0.png")).is_err() && atlas::load(&dir).is_err() && atlas::load(&dir.join("missing.json")).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------- tabs
 
 #[test]
@@ -1676,7 +1818,7 @@ fn recent_files_and_settings() {
     assert!(g.status_err && matches!(g.pending, Some(Pending::Quit)) && widths(&e) == [12], "a drop during a prompt is refused");
     assert!(matches!(g.dialog, Dialog::None));
     g.pending = None;
-    for (bad, why) in [(vec![a.as_path(), png.as_path()], "one file at a time"), (vec![Path::new("/tmp/notes.txt")], "neither"), (vec![Path::new("/tmp")], "neither"), (vec![Path::new("/tmp/\u{202e}gnp.jmn")], "cannot be shown")] {
+    for (bad, why) in [(vec![a.as_path(), png.as_path()], "one file at a time"), (vec![Path::new("/tmp/notes.txt")], "none of them"), (vec![Path::new("/tmp")], "none of them"), (vec![Path::new("/tmp/\u{202e}gnp.jmn")], "cannot be shown")] {
         g.info("");
         drop(&mut e, &mut g, &bad);
         assert!(g.status_err && g.status.contains(why) && widths(&e) == [12] && g.pending.is_none() && g.recent == real, "{bad:?}: {}", g.status);

@@ -951,6 +951,23 @@ fn a_sprite_atlas_is_read_exactly_and_only_read() {
     fails("larger than");
     std::fs::write(&file, "{ nope").unwrap();
     fails("not valid JSON");
+    // A byte-order mark in front of the text is fine; a .json that is something else says what it is.
+    let png_atlas = json!({"prefix": "p", "pages": 1, "ext": ".png", "objects": [{"name": "o", "labels": [["x_end", 0], ["go", 0]], "frames": [[0, 0, 0, 64, 32]]}]}).to_string();
+    std::fs::write(&file, [b"\xef\xbb\xbf".as_slice(), png_atlas.as_bytes()].concat()).unwrap();
+    let seqs: Vec<String> = atlas::load(&file).unwrap().objects[0].seqs.iter().map(|s| s.name.clone()).collect();
+    assert_eq!(seqs, ["go"], "an _end with nothing to close is left out");
+    for (text, why) in [("{}", "not a sprite atlas"), ("[]", "not a sprite atlas"), ("null", "not a sprite atlas"), (r#"{"format": "jon-motion-animations", "animations": []}"#, "Animation tab")] {
+        std::fs::write(&file, text).unwrap();
+        fails(why);
+    }
+    // A PNG page's size is read from its header and refused before the pixels are decoded.
+    std::fs::write(&file, &png_atlas).unwrap();
+    let mut big = Vec::new();
+    png::Encoder::new(&mut big, 5000, 4).write_header().unwrap().write_image_data(&vec![0u8; 5000 * 4]).unwrap();
+    std::fs::write(dir.join("p0.png"), &big).unwrap();
+    fails("PNG pages can be up to 4096x4096");
+    std::fs::write(dir.join("p0.png"), b"\x89PNG\r\n\x1a\ngarbage that is not a png").unwrap();
+    fails("not a readable PNG image");
     assert!(atlas::load(&dir.join("p0.png")).is_err() && atlas::load(&dir).is_err() && atlas::load(&dir.join("missing.json")).is_err());
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -124,7 +124,7 @@ pub fn toolbar(ui: &mut egui::Ui, e: &mut Engine, _g: &mut Gui) {
             ui.painter().rect_filled(rect, 6.0, bg);
             let size = 17.0;
             icon(ui.painter(), Rect::from_center_size(rect.center(), vec2(size, size)), t, if on { Color32::WHITE } else { Color32::from_gray(196) });
-            let resp = resp.on_hover_text(format!("{}  ({})\nRight-click for options", t.label(), t.key()));
+            let resp = resp.on_hover_text(format!("{}\nRight-click for options", tool_title(e, t)));
             if resp.clicked() || resp.secondary_clicked() {
                 e.o.tool = t;
             }
@@ -147,10 +147,18 @@ pub fn toolbar(ui: &mut egui::Ui, e: &mut Engine, _g: &mut Gui) {
     });
 }
 
+/// A tool's name with its key in the active keymap, when it has one.
+fn tool_title(e: &Engine, t: Tool) -> String {
+    match crate::keys::tool_key(e.view.keymap, t) {
+        Some(k) => format!("{}  ({k})", t.label()),
+        None => t.label().to_string(),
+    }
+}
+
 /// Right-click menu for a toolbar button: the same settings as the options bar, for that tool.
 fn tool_menu(ui: &mut egui::Ui, e: &mut Engine, tool: Tool) {
     ui.set_min_width(190.0);
-    ui.label(RichText::new(format!("{}  ({})", tool.label(), tool.key())).strong());
+    ui.label(RichText::new(tool_title(e, tool)).strong());
     ui.separator();
     let paints = matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Line | Tool::Rect | Tool::Ellipse);
     if paints {

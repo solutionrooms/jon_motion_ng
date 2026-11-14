@@ -47,7 +47,9 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
 - **Files** - native `.jmn` projects (everything), PNG in and out. Exports are always indexed PNGs. An indexed
   PNG opens with its own palette; a true-colour PNG is converted to a generated palette of up to 256 colours.
 
-Help > Keyboard Shortcuts lists the keys.
+Help > Keyboard Shortcuts lists the keys. Help > Keyboard Preset switches the single-key shortcuts between the
+standard set and **Deluxe Paint** keys (`d` draw, `v` line, `r`/`R` rectangle, `[` `]` colours, `F1`-`F8` modes...);
+the choice is remembered in `~/.jon_motion/settings.json`.
 
 ## Scripting (Lua)
 

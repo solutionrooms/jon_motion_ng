@@ -153,8 +153,36 @@ pub struct Opts {
     pub gradient_dither: bool,
 }
 
+/// Which set of single-key shortcuts the window uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Keymap {
+    Standard,
+    /// Deluxe Paint's keys (see `keys::DPAINT`).
+    DPaint,
+}
+
+impl Keymap {
+    pub const ALL: [Keymap; 2] = [Keymap::Standard, Keymap::DPaint];
+    pub fn name(self) -> &'static str {
+        match self {
+            Keymap::Standard => "standard",
+            Keymap::DPaint => "dpaint",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Keymap::Standard => "Standard",
+            Keymap::DPaint => "Deluxe Paint",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Keymap> {
+        Keymap::ALL.into_iter().find(|k| k.name() == s.to_ascii_lowercase())
+    }
+}
+
 #[derive(Clone)]
 pub struct View {
+    pub keymap: Keymap,
     pub zoom: f32,
     pub cx: f32,
     pub cy: f32,
@@ -288,6 +316,7 @@ impl Engine {
                 gradient_dither: true,
             },
             view: View {
+                keymap: Keymap::Standard,
                 zoom: 2.0,
                 cx: 160.0,
                 cy: 120.0,

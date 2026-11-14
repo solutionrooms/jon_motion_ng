@@ -237,6 +237,10 @@ fn state_file() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".jon_motion").join("gui.json"))
 }
 
+pub fn settings_file() -> Option<PathBuf> {
+    Some(state_file()?.with_file_name("settings.json"))
+}
+
 pub fn scripts_dir() -> Option<PathBuf> {
     state_file().map(|p| p.with_file_name("scripts"))
 }

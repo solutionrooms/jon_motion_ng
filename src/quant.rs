@@ -98,8 +98,26 @@ pub fn median_cut(hist: &HashMap<[u8; 3], u32>, n: usize) -> Vec<[u8; 3]> {
 
 /// Map RGBA pixels onto palette indices. Alpha below 128 becomes transparent.
 pub fn to_indexed(rgba: &[[u8; 4]], w: usize, h: usize, pal: &Palette, dither: Dither) -> Vec<Cell> {
+    // Each distinct colour is looked up once. An image with a huge number of colours (a photo,
+    // noise) would make that slow, so past `EXACT` colours the rest share an answer per 6-bit bucket.
+    const EXACT: usize = 1 << 16;
     let mut cache: HashMap<[u8; 3], u8> = HashMap::new();
-    let mut near = |c: [u8; 3]| *cache.entry(c).or_insert_with(|| pal.nearest(c));
+    let mut coarse = vec![0u16; 1 << 18];
+    let mut near = |c: [u8; 3]| {
+        if let Some(&i) = cache.get(&c) {
+            return i;
+        }
+        if cache.len() < EXACT {
+            let i = pal.nearest(c);
+            cache.insert(c, i);
+            return i;
+        }
+        let slot = &mut coarse[(c[0] as usize >> 2) << 12 | (c[1] as usize >> 2) << 6 | c[2] as usize >> 2];
+        if *slot == 0 {
+            *slot = pal.nearest(c) as u16 + 1;
+        }
+        (*slot - 1) as u8
+    };
     let mut out = vec![TRANSP; w * h];
     match dither {
         Dither::None | Dither::Bayer => {
@@ -156,10 +174,32 @@ pub fn to_indexed(rgba: &[[u8; 4]], w: usize, h: usize, pal: &Palette, dither: D
 }
 
 /// A palette of at most `n` colours chosen for these pixels (transparent ones are ignored).
+/// Images with up to `EXACT` colours are counted exactly, so pixel art keeps its colours;
+/// beyond that the colours are pooled into 5-bit-per-channel bins first, which keeps a
+/// photograph or noise from taking many seconds.
 pub fn palette_for<'a>(px: impl Iterator<Item = &'a [u8; 4]>, n: usize) -> Palette {
+    const EXACT: usize = 1 << 14;
     let mut hist: HashMap<[u8; 3], u32> = HashMap::new();
+    let mut exact = true;
+    // Per bin: pixel count and channel sums, so each bin is represented by its mean colour.
+    let mut bins = vec![(0u32, [0u64; 3]); 1 << 15];
     for p in px.filter(|p| p[3] >= 128) {
-        *hist.entry([p[0], p[1], p[2]]).or_insert(0) += 1;
+        let b = &mut bins[(p[0] as usize >> 3) << 10 | (p[1] as usize >> 3) << 5 | p[2] as usize >> 3];
+        b.0 = b.0.saturating_add(1);
+        for k in 0..3 {
+            b.1[k] += p[k] as u64;
+        }
+        if exact {
+            *hist.entry([p[0], p[1], p[2]]).or_insert(0) += 1;
+            exact = hist.len() <= EXACT;
+        }
+    }
+    if !exact {
+        hist.clear();
+        for (count, sum) in bins.iter().filter(|b| b.0 > 0) {
+            let c = *count as u64;
+            *hist.entry([(sum[0] / c) as u8, (sum[1] / c) as u8, (sum[2] / c) as u8]).or_insert(0) += *count;
+        }
     }
     let mut colors = median_cut(&hist, n.clamp(1, 256));
     if colors.is_empty() {

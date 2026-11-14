@@ -674,3 +674,31 @@ fn right_clicking_a_tool_selects_it_and_opens_its_options() {
     }
     assert!(shown, "the options menu for the rectangle tool is showing");
 }
+
+#[test]
+fn many_colour_images_convert_quickly_and_closely() {
+    // Noise has far more colours than the exact paths handle; it takes the pooled route.
+    let n = 512usize;
+    let mut s = 12345u32;
+    let px: Vec<[u8; 4]> = (0..n * n)
+        .map(|_| {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let b = s.to_le_bytes();
+            [b[1], b[2], b[3], 255]
+        })
+        .collect();
+    let pal = crate::quant::palette_for(px.iter(), 256);
+    assert_eq!(pal.colors.len(), 256);
+    let cells = crate::quant::to_indexed(&px, n, n, &pal, crate::quant::Dither::None);
+    // Every pixel lands on a palette colour about as close as the true nearest one. Pixels that
+    // share a bucket differ by at most 3 per channel, which is 30 in `dist`'s weighted units,
+    // so the answer can be at most twice that further away than the best one.
+    let mut worse = 0;
+    for (p, &c) in px.iter().zip(&cells) {
+        let rgb = [p[0], p[1], p[2]];
+        let (got, best) = (crate::doc::dist(pal.colors[c as usize], rgb), crate::doc::dist(pal.colors[pal.nearest(rgb) as usize], rgb));
+        assert!((got as f64).sqrt() <= (best as f64).sqrt() + 60.0, "pixel {rgb:?} mapped far from its nearest colour");
+        worse += (got > best) as usize;
+    }
+    assert!(worse < px.len() / 4, "{worse} of {} pixels missed their nearest colour", px.len());
+}

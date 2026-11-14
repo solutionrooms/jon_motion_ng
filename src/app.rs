@@ -37,6 +37,8 @@ pub enum Dialog {
     Reduce { colors: u32, dither: usize, generate: bool },
     Shortcuts,
     Mcp,
+    /// A PNG was dropped on the window: open it, or add it as a layer?
+    Dropped(PathBuf),
 }
 
 pub enum Pending {
@@ -400,8 +402,9 @@ fn open_path(e: &mut Engine, g: &mut Gui, p: &Path) {
     }
 }
 
-/// A file dragged onto the window opens like File > Open, asking about unsaved changes first.
-/// Anything that cannot be opened is refused with the reason in the status bar.
+/// A file dragged onto the window: a project opens like File > Open (asking about unsaved
+/// changes first); for a PNG the user is asked whether to open it or add it as a layer.
+/// Anything that cannot be used is refused with the reason in the status bar.
 pub fn dropped(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     let files: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
     let [p] = files.as_slice() else {
@@ -417,11 +420,24 @@ pub fn dropped(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     if !p.to_str().is_some_and(listable) {
         return g.error("That file's name has characters that cannot be shown; rename it and drop it again");
     }
-    if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("jmn") || x.eq_ignore_ascii_case("png")) {
+    let is = |ext: &str| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext));
+    if is("png") {
+        g.dialog = Dialog::Dropped(p.clone());
+    } else if is("jmn") {
+        request(e, g, Pending::OpenFile(p.clone()));
+    } else {
         let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        return g.error(format!("Only .jmn and .png files can be opened; {name} is neither"));
+        g.error(format!("Only .jmn and .png files can be opened; {name} is neither"));
     }
-    request(e, g, Pending::OpenFile(p.clone()));
+}
+
+/// What the user chose for a dropped PNG.
+pub fn use_dropped(e: &mut Engine, g: &mut Gui, p: &Path, as_layer: bool) {
+    if !as_layer {
+        request(e, g, Pending::OpenFile(p.to_path_buf()));
+    } else if g.run(e, "import_png_layer", json!({ "path": p.display().to_string() })).is_some() {
+        g.info(format!("Added {} as a layer", p.display()));
+    }
 }
 
 /// Shown while a file is held over the window.
@@ -1151,6 +1167,27 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
                 close = g.run(e, "resize_canvas", json!({ "width": *w, "height": *h, "anchor": ANCHORS[*anchor] })).is_some();
             }
             close |= cancel;
+        }),
+        Dialog::Dropped(p) => window(ctx, "Dropped Image", |ui| {
+            let name: String = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = if name.chars().count() > 48 { format!("{}...", name.chars().take(45).collect::<String>()) } else { name };
+            ui.label(format!("Open \"{name}\" as a document, or add it to this one as a layer?"));
+            ui.weak("A layer is placed at the top left, uses this document's palette and is cropped to its size.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let mut choice = None;
+                if ui.add(egui::Button::new(egui::RichText::new("Open").color(Color32::WHITE)).fill(Color32::from_rgb(58, 104, 196))).clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Add as Layer").clicked() {
+                    choice = Some(true);
+                }
+                close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+                if let Some(as_layer) = choice {
+                    use_dropped(e, g, p, as_layer);
+                    close = true;
+                }
+            });
         }),
         Dialog::Scale { w, h } => window(ctx, "Scale Image", |ui| {
             size_fields(ui, w, h);

@@ -1054,7 +1054,7 @@ fn animation_keys_apply_over_its_tab_only() {
 
 #[test]
 fn recent_files_and_settings() {
-    use crate::app::{read_settings, request, write_settings, Pending, RECENT_MAX};
+    use crate::app::{read_settings, request, use_dropped, write_settings, Dialog, Pending, RECENT_MAX};
     use std::path::{Path, PathBuf};
     let abs = |name: &str| PathBuf::from(tmp(name));
 
@@ -1166,7 +1166,8 @@ fn recent_files_and_settings() {
     request(&mut e, &mut g, Pending::OpenFile(abs("gone.jmn")));
     assert!(g.status_err && e.doc.w == 16 && g.recent == vec![real]);
 
-    // Dropping a file on the window is the same request: one .jmn or .png, prompt first if unsaved.
+    // Dropping a project on the window is the same request (prompt first if unsaved); a dropped
+    // PNG asks whether to open it or add it as a layer.
     let drop = |e: &mut Engine, g: &mut Gui, paths: &[&Path]| {
         let dropped_files = paths.iter().map(|p| egui::DroppedFile { path: Some(p.to_path_buf()), ..Default::default() }).collect();
         let _ = egui::Context::default().run(egui::RawInput { dropped_files, ..Default::default() }, |ctx| crate::app::dropped(ctx, e, g));
@@ -1183,6 +1184,7 @@ fn recent_files_and_settings() {
     assert!(matches!(&g.pending, Some(Pending::OpenFile(p)) if *p == a) && e.doc.w == 12, "unsaved changes are asked about first");
     drop(&mut e, &mut g, &[&png]);
     assert!(g.status_err && matches!(&g.pending, Some(Pending::OpenFile(p)) if *p == a), "a drop during the prompt is refused");
+    assert!(matches!(g.dialog, Dialog::None));
     g.pending = None;
     e.modified = false;
     for (bad, why) in [(vec![a.as_path(), png.as_path()], "one file at a time"), (vec![Path::new("/tmp/notes.txt")], "neither"), (vec![Path::new("/tmp")], "neither"), (vec![Path::new("/tmp/\u{202e}gnp.jmn")], "cannot be shown")] {
@@ -1198,16 +1200,33 @@ fn recent_files_and_settings() {
         drop(&mut e, &mut g, &[Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff.jmn"))]);
         assert!(g.status_err && g.status.contains("cannot be shown") && e.doc.w == 12);
     }
+    // A PNG only asks; nothing changes until the user picks.
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": 3, "filled": true})).unwrap();
     g.info("");
     drop(&mut e, &mut g, &[&png]);
+    assert!(matches!(&g.dialog, Dialog::Dropped(p) if *p == png) && g.pending.is_none() && !g.status_err && e.doc.layers.len() == 1 && g.recent == real);
+    drop(&mut e, &mut g, &[&a]);
+    assert!(g.status_err && matches!(&g.dialog, Dialog::Dropped(p) if *p == png) && g.pending.is_none(), "a drop while a dialog is open is refused");
+    g.dialog = Dialog::None;
+    // As a layer: added to this document, one undo step, and not listed as an opened file.
+    g.info("");
+    use_dropped(&mut e, &mut g, &png, true);
+    assert!(!g.status_err && e.doc.layers.len() == 2 && e.doc.w == 12 && e.modified && g.recent == real, "{}", g.status);
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!(e.doc.layers.len(), 1);
+    use_dropped(&mut e, &mut g, &abs("gone.png"), true);
+    assert!(g.status_err && e.doc.layers.len() == 1);
+    // As a document: the usual prompt, then opened and remembered.
+    use_dropped(&mut e, &mut g, &png, false);
+    assert!(matches!(&g.pending, Some(Pending::OpenFile(p)) if *p == png) && e.modified);
+    g.pending = None;
+    e.modified = false;
+    g.info("");
+    use_dropped(&mut e, &mut g, &png, false);
     assert!(!g.status_err && e.doc.w == 12 && e.doc.h == 6 && !e.modified && e.path.is_none(), "{}", g.status);
     assert_eq!(g.recent.len(), 2, "a dropped file is remembered like any other the user opened");
     drop(&mut e, &mut g, &[&a]);
-    assert_eq!((e.doc.w, pixel(&mut e, 1, 1), g.recent.len()), (16, 9, 2));
-    g.dialog = crate::app::Dialog::New { w: 8, h: 8, preset: 0 };
-    drop(&mut e, &mut g, &[&png]);
-    assert!(g.status_err && e.doc.w == 16, "a drop while a dialog is open is refused");
-    g.dialog = crate::app::Dialog::None;
+    assert_eq!((e.doc.w, pixel(&mut e, 1, 1), g.recent.len()), (16, 9, 2), "a project opens straight away");
 
     // The menu lists file names, tells same-named files apart by folder, and offers Clear.
     let other = std::env::temp_dir().join("jmn_recent_other");

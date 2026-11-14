@@ -6,11 +6,16 @@ use std::path::Path;
 
 const MAGIC: &[u8; 6] = b"JMNG\x01\n";
 const MAX_EXPORT_PIXELS: u64 = 8192 * 8192;
+/// Largest uncompressed project accepted, so a small crafted file cannot inflate without bound.
+const MAX_RAW: u64 = 4 << 30;
 
 pub fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
     let mut d = doc.clone();
     d.float_commit();
     let raw = bincode::serialize(&d).map_err(|e| e.to_string())?;
+    if raw.len() as u64 > MAX_RAW {
+        return Err("the project is too large to save (over 4 GB of pixel data); merge or remove layers".into());
+    }
     let mut out = MAGIC.to_vec();
     let mut enc = flate2::write::DeflateEncoder::new(&mut out, flate2::Compression::default());
     enc.write_all(&raw).map_err(|e| e.to_string())?;
@@ -27,7 +32,10 @@ pub fn load_doc(path: &Path) -> Result<Doc, String> {
         return Err(format!("{}: not a Jon Motion project file", path.display()));
     }
     let mut raw = Vec::new();
-    flate2::read::DeflateDecoder::new(&bytes[MAGIC.len()..]).read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    flate2::read::DeflateDecoder::new(&bytes[MAGIC.len()..]).take(MAX_RAW + 1).read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    if raw.len() as u64 > MAX_RAW {
+        return Err(format!("{}: project file is too large", path.display()));
+    }
     let mut d: Doc = bincode::deserialize(&raw).map_err(|e| format!("corrupt project file: {e}"))?;
     validate(&mut d)?;
     Ok(d)

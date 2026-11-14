@@ -84,6 +84,8 @@ pub struct Gui {
     pub dialog: Dialog,
     pub pending: Option<Pending>,
     pub allow_close: bool,
+    /// The user asked to close the window while a script or AI request had the document.
+    pub busy_quit: bool,
     pub mcp_port: Option<u16>,
     pub title: String,
     pub tileset_size: (u32, u32),
@@ -120,6 +122,7 @@ impl Gui {
             dialog: Dialog::None,
             pending: None,
             allow_close: false,
+            busy_quit: false,
             mcp_port: None,
             title: String::new(),
             tileset_size: (16, 16),
@@ -1018,9 +1021,15 @@ fn lock_soon(m: &Mutex<Engine>, wait: Duration) -> Option<MutexGuard<'_, Engine>
 
 /// Shown while a script or a long AI request has the document: the window stays
 /// responsive and the script can be stopped.
-fn busy_screen(ctx: &egui::Context) {
+fn busy_screen(ctx: &egui::Context, g: &mut Gui) {
     if ctx.input(|i| i.viewport().close_requested()) {
+        if g.allow_close {
+            return;
+        }
+        // Stop the script if it can be stopped; if the window is still busy the user may quit anyway.
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        script::cancel();
+        g.busy_quit = true;
     }
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.vertical_centered(|ui| {
@@ -1031,6 +1040,18 @@ fn busy_screen(ctx: &egui::Context) {
             ui.add_space(8.0);
             if ui.button("Stop script").on_hover_text("Stops a running Lua script; its changes are rolled back").clicked() {
                 script::cancel();
+            }
+            if g.busy_quit {
+                ui.add_space(16.0);
+                ui.label("The document is still busy. Quitting now loses any unsaved changes.");
+                ui.add_space(4.0);
+                if ui.button("Quit anyway").clicked() {
+                    g.allow_close = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+                if ui.button("Keep waiting").clicked() {
+                    g.busy_quit = false;
+                }
             }
         });
     });
@@ -1057,9 +1078,10 @@ impl eframe::App for App {
         }
         // The engine is locked for the whole frame; MCP calls and scripts run between frames.
         let arc = self.engine.clone();
-        let Some(mut guard) = lock_soon(&arc, Duration::from_millis(200)) else { return busy_screen(ctx) };
+        let Some(mut guard) = lock_soon(&arc, Duration::from_millis(200)) else { return busy_screen(ctx, &mut self.gui) };
         let e = &mut *guard;
         let g = &mut self.gui;
+        g.busy_quit = false;
         g.flash_now = g.flash.take();
 
         let title = format!("{}{} - Jon Motion", e.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".into()), if e.modified { " *" } else { "" });

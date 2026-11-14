@@ -224,6 +224,8 @@ pub struct Engine {
     /// part-way through a script still leaves the document marked clean.
     edits: u64,
     pub saved_at: Option<u64>,
+    /// Where the current command, script or batch last saved the document.
+    saved_to: Option<PathBuf>,
     /// "gui" or "headless"; reported by get_info.
     pub host: &'static str,
 }
@@ -307,6 +309,7 @@ impl Engine {
             merge_undo: false,
             edits: 0,
             saved_at: None,
+            saved_to: None,
             host,
         }
     }
@@ -363,6 +366,13 @@ impl Engine {
         if old.mode != self.doc.mode || old.palette.colors != self.doc.palette.colors {
             self.o.fg = self.doc.from_rgba(fg);
             self.o.bg = self.doc.from_rgba(bg);
+            // The custom brush keeps its look too (undoing a palette sort or swap renumbers it).
+            if old.mode != self.doc.mode {
+                self.o.custom_brush = None;
+            } else if let Some(cells) = self.o.custom_brush.as_mut().and_then(|b| b.cells.as_mut()) {
+                let map: Vec<Cell> = (0..old.palette.colors.len()).map(|i| self.doc.from_rgba(old.palette.rgba(i))).collect();
+                cells.iter_mut().for_each(|c| *c = map.get(*c as usize).copied().unwrap_or(*c));
+            }
         }
         self.fix_state();
         old
@@ -474,6 +484,9 @@ impl Engine {
     }
 
     fn begin_top(&mut self) -> Option<Snapshot> {
+        if self.group == 0 {
+            self.saved_to = None;
+        }
         (self.group == 0).then(|| self.snapshot())
     }
 
@@ -494,7 +507,13 @@ impl Engine {
         } else {
             self.restore(s);
             self.tiles_dirty = None;
+            // A save made before the failure wrote changes that have now been rolled
+            // back, so the file no longer matches the document.
+            if self.saved_to.is_some() && self.saved_to == self.path {
+                self.modified = true;
+            }
         }
+        self.saved_to = None;
         self.reset_history = false;
         self.saved_at = None;
         self.fix_state();
@@ -589,6 +608,7 @@ impl Engine {
     pub fn mark_saved(&mut self) {
         self.modified = false;
         self.saved_at = Some(self.edits);
+        self.saved_to = self.path.clone();
     }
 
     /// Direct pixel read for scripts.

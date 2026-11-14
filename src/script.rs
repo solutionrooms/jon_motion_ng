@@ -37,25 +37,55 @@ Fast pixel access on the active layer:
 print(...) output and the script's return value are returned to the caller.
 A script is atomic and is one undo step; an error rolls everything back.";
 
-// The wrappers keep the sandbox's limits firm: `load` only takes source text (Lua does
-// not verify bytecode), and pcall/xpcall/coroutine.resume re-raise the time-limit or
-// cancel error, so a script cannot swallow it and carry on.
+// The wrappers keep the sandbox's limits firm:
+// * `load` only takes source text (Lua does not verify bytecode).
+// * Everything that can catch an error (pcall, xpcall, coroutine.resume/close, load
+//   with a reader function) re-raises the time-limit or cancel error, so a script
+//   cannot swallow it and carry on.
+// * The instruction hook that enforces the limits belongs to one Lua thread at a time,
+//   so it is moved onto a coroutine while that coroutine runs and back afterwards;
+//   `hook` also checks the limits itself, as moving the hook restarts its count.
 const PRELUDE: &str = r#"
 do
-  local load_, pcall_, xpcall_, resume_, error_, select_, dead = load, pcall, xpcall, coroutine.resume, error, select, __jm_dead
-  load = function(chunk, name, mode, ...)
-    if select_('#', ...) > 0 then return load_(chunk, name, 't', (...)) end
-    return load_(chunk, name, 't')
-  end
+  local load_, pcall_, xpcall_, error_, select_ = load, pcall, xpcall, error, select
+  local create_, resume_, close_, running_ = coroutine.create, coroutine.resume, coroutine.close, coroutine.running
+  local dead, hook = __jm_dead, __jm_hook
   local function pass(ok, ...)
     if not ok and dead() then error_((...), 0) end
     return ok, ...
   end
+  local function loaded(f, ...)
+    if not f and dead() then error_((...), 0) end
+    return f, ...
+  end
+  load = function(chunk, name, mode, ...)
+    if select_('#', ...) > 0 then return loaded(load_(chunk, name, 't', (...))) end
+    return loaded(load_(chunk, name, 't'))
+  end
   pcall = function(f, ...) return pass(pcall_(f, ...)) end
   xpcall = function(f, h, ...) return pass(xpcall_(f, h, ...)) end
-  coroutine.resume = function(co, ...) return pass(resume_(co, ...)) end
+  -- Run fn(co, ...) with the hook on `co`, then put the hook back on the caller.
+  local function back(ok, ...)
+    hook(running_())
+    if not ok then error_((...), 0) end
+    return ...
+  end
+  local function on(fn, co, ...)
+    hook(co)
+    return back(pcall_(fn, co, ...))
+  end
+  local function unwrap(ok, ...)
+    if not ok then error_((...), 0) end
+    return ...
+  end
+  coroutine.resume = function(co, ...) return pass(on(resume_, co, ...)) end
+  coroutine.close = function(co) return pass(on(close_, co)) end
+  coroutine.wrap = function(f)
+    local co = create_(f)
+    return function(...) return unwrap(on(resume_, co, ...)) end
+  end
   string.dump = nil
-  __jm_dead = nil
+  __jm_dead, __jm_hook = nil, nil
 end
 jm = setmetatable({}, { __index = function(t, k)
   local f = function(p) return __jm_exec(k, p) end
@@ -101,18 +131,35 @@ fn run_inner(eng: &RefCell<&mut Engine>, out: &RefCell<String>, code: &str, limi
     CANCEL.store(false, Ordering::Relaxed);
     // Once set, the script is over: every later check fails too.
     let dead = Rc::new(Flag::new(false));
-    let hook_dead = dead.clone();
-    lua.set_hook(HookTriggers::new().every_nth_instruction(20_000), move |_, _| {
-        if CANCEL.load(Ordering::Relaxed) {
-            hook_dead.set(true);
-            Err(mlua::Error::runtime("script cancelled"))
-        } else if start.elapsed() > limit {
-            hook_dead.set(true);
-            Err(mlua::Error::runtime(format!("script exceeded the {} second time limit", limit.as_secs())))
-        } else {
-            Ok(VmState::Continue)
+    let check = {
+        let dead = dead.clone();
+        move || -> mlua::Result<()> {
+            if CANCEL.load(Ordering::Relaxed) {
+                dead.set(true);
+                Err(mlua::Error::runtime("script cancelled"))
+            } else if start.elapsed() > limit {
+                dead.set(true);
+                Err(mlua::Error::runtime(format!("script exceeded the {} second time limit", limit.as_secs())))
+            } else {
+                Ok(())
+            }
         }
-    });
+    };
+    let triggers = || HookTriggers::new().every_nth_instruction(20_000);
+    let hook_check = check.clone();
+    lua.set_hook(triggers(), move |_, _| hook_check().map(|_| VmState::Continue));
+    // mlua keeps one hook, tied to one Lua thread; the prelude calls this to move it
+    // to whichever coroutine is about to run (see PRELUDE).
+    let move_hook = lua
+        .create_function(move |_, v: LV| {
+            if let LV::Thread(t) = v {
+                let c = check.clone();
+                t.set_hook(triggers(), move |_, _| c().map(|_| VmState::Continue));
+            }
+            check()
+        })
+        .map_err(|e| e.to_string())?;
+    lua.globals().set("__jm_hook", move_hook).map_err(|e| e.to_string())?;
     let r: mlua::Result<Value> = lua.scope(|scope| {
         let g = lua.globals();
         for k in ["dofile", "loadfile", "collectgarbage"] {

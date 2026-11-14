@@ -1108,6 +1108,46 @@ fn several_documents_open_as_tabs() {
     let mut g = Gui::new();
     request(&mut clean, &mut g, Pending::Quit);
     assert!(g.allow_close && g.pending.is_none());
+
+    // A quit answer meant for one document never waves another through: if the document on
+    // show changed while the question was up, the question is asked again.
+    let mut e = Engine::new("headless");
+    for name in ["w1.jmn", "w2.jmn"] {
+        e.exec("tab_new", &json!({"width": 8, "height": 8, "reuse_blank": true})).unwrap();
+        e.exec("save_document", &json!({"path": tmp(name)})).unwrap();
+        e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": 4, "filled": true})).unwrap();
+    }
+    let mut g = Gui::new();
+    request(&mut e, &mut g, Pending::Quit);
+    assert_eq!((tabs(&e), g.quit_asked), ("1* 2!*".to_string(), 2));
+    e.exec("tab_select", &json!({"id": 1})).unwrap();
+    answer(&mut e, &mut g, 1);
+    assert!(g.quit_skip.is_empty() && !g.allow_close && matches!(g.pending, Some(Pending::Quit)), "nothing was waved through");
+    answer(&mut e, &mut g, 1);
+    answer(&mut e, &mut g, 1);
+    assert!(g.allow_close && g.quit_skip.len() == 2, "each document was asked about once it was the one on show");
+
+    // A remote call on a background document leaves the user's tools and clipboard as they were.
+    e.exec("set_options", &json!({"tool": "rect", "brush_size": 7})).unwrap();
+    e.exec("select_rect", &json!({"x": 0, "y": 0, "w": 2, "h": 2})).unwrap();
+    e.exec("copy", &json!({})).unwrap();
+    let (me, other) = (e.id, if e.id == 1 { 2 } else { 1 });
+    let clip = e.clipboard.as_ref().map(|c| (c.w, c.h));
+    for (cmd, params) in [("set_options", json!({"tool": "fill", "brush_size": 2})), ("select_all", json!({})), ("copy", json!({}))] {
+        assert!(!crate::remote::call_tool(&mut e, "execute_command", &json!({"command": cmd, "params": params, "document": other})).is_error, "{cmd}");
+    }
+    assert_eq!((e.id, e.o.tool, e.o.brush_size, e.clipboard.as_ref().map(|c| (c.w, c.h))), (me, Tool::Rect, 7, clip));
+
+    // One file, one tab: a document is not opened or saved over a file another tab holds.
+    let held = e.tab(other).unwrap().path.clone().unwrap();
+    let err = e.exec("open_document", &json!({"path": held, "force": true})).unwrap_err();
+    assert!(err.contains("open in another tab"), "{err}");
+    let err = e.exec("save_document", &json!({"path": held})).unwrap_err();
+    assert!(err.contains("open in another tab"), "{err}");
+    let r = script::run_lua(&mut e, &format!("return (pcall(jm.save_document, {{ path = {:?} }}))", held.display().to_string()));
+    assert_eq!((r.result, r.error), (json!(false), None), "a script is refused the same way");
+    e.exec("save_document", &json!({})).unwrap();
+    assert!(e.exec("open_document", &json!({"path": e.path.clone().unwrap()})).is_ok(), "reloading a document's own file is still allowed");
 }
 
 // ---------------------------------------------------------------- animation

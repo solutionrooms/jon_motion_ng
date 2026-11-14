@@ -510,18 +510,40 @@ impl Engine {
     /// The open document showing this file, if any.
     pub fn tab_with_path(&self, p: &std::path::Path) -> Option<u32> {
         let same = |a: &std::path::Path| a == p || std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(p).ok()).is_some_and(|(x, y)| x == y);
+        if let Some(r) = &self.roster {
+            // A script's working copy knows the other documents only by this list.
+            return r.iter().find(|t| t["path"].as_str().is_some_and(|a| same(std::path::Path::new(a)))).and_then(|t| t["id"].as_u64()).map(|id| id as u32);
+        }
         self.order.iter().copied().find(|&id| self.tab(id).and_then(|t| t.path.as_deref()).is_some_and(same))
+    }
+
+    /// Refuse a file that another open document holds: two tabs on one file would each
+    /// overwrite the other's work when saved.
+    pub fn path_free(&self, p: &std::path::Path) -> Result<(), String> {
+        match self.tab_with_path(p) {
+            Some(id) if id != self.id => Err(format!("{} is open in another tab (document {id}); use that tab, or close it first", p.display())),
+            _ => Ok(()),
+        }
     }
 
     /// Run `f` on document `id` and come back to the active one, so a remote call can work on
     /// a tab the user is not looking at without changing what they see.
     pub fn on_tab<R>(&mut self, id: u32, f: impl FnOnce(&mut Engine) -> R) -> Result<R, String> {
         let back = self.id;
+        if id == back {
+            return Ok(f(self));
+        }
+        // The tools and clipboard travel from tab to tab, so they are put back afterwards:
+        // what the call set or copied on the other document lasts for that call only.
+        let mine = (self.o.clone(), self.clipboard.clone());
         self.tab_select(id)?;
         let r = f(self);
         if self.id != back && self.parked.iter().any(|p| p.id == back) {
-            // The tools the call set on the other document stay there; the user's own come back.
             let _ = self.tab_select(back);
+        }
+        if self.id == back {
+            (self.o, self.clipboard) = mine;
+            self.fix_state();
         }
         Ok(r)
     }

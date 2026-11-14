@@ -134,8 +134,11 @@ claude mcp add jon-motion -- /path/to/jon_motion mcp
 - If the editor is not open, the same command works on a headless document (`save_document` to keep it).
 - With several tabs open, tools work on the **active tab** and each answer says which document that was. Pass
   `"document": <id>` (ids from `tab_list` / `get_info`) to keep working on one document whatever the user is
-  looking at; their view does not change. `tab_new`, `tab_open`, `tab_select` and `tab_close` manage tabs
-  (not inside `batch` or `run_lua`). `new_document` / `open_document` still replace the active document.
+  looking at; their view, tools and clipboard do not change (so tool options set, or pixels copied, on a background
+  document last for that call only - use `batch` to copy and paste there). `tab_new`, `tab_open`, `tab_select` and
+  `tab_close` manage tabs (not inside `batch` or `run_lua`), and `tab_list` gives the file path of every open document.
+  `new_document` / `open_document` still replace the active document. A file is held by one tab at a time: opening
+  or saving a document over a file that another tab has open is refused.
 - The window also serves MCP directly at `http://127.0.0.1:47800/mcp` (port shown in the status bar;
   Help > AI / MCP Setup has copy-paste commands). It listens on localhost only and requires the token
   in `~/.jon_motion/token` as an `Authorization: Bearer` header, so other users of the machine and web

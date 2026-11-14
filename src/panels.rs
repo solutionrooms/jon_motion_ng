@@ -125,9 +125,11 @@ pub fn toolbar(ui: &mut egui::Ui, e: &mut Engine, _g: &mut Gui) {
             ui.painter().rect_filled(rect, 6.0, bg);
             let size = 17.0;
             icon(ui.painter(), Rect::from_center_size(rect.center(), vec2(size, size)), t, if on { Color32::WHITE } else { Color32::from_gray(196) });
-            if resp.on_hover_text(format!("{}  ({})", t.label(), t.key())).clicked() {
+            let resp = resp.on_hover_text(format!("{}  ({})\nRight-click for options", t.label(), t.key()));
+            if resp.clicked() || resp.secondary_clicked() {
                 e.o.tool = t;
             }
+            resp.context_menu(|ui| tool_menu(ui, e, t));
         }
         ui.add_space(10.0);
         // Foreground over background; click to swap.
@@ -144,6 +146,105 @@ pub fn toolbar(ui: &mut egui::Ui, e: &mut Engine, _g: &mut Gui) {
             std::mem::swap(&mut e.o.fg, &mut e.o.bg);
         }
     });
+}
+
+/// Right-click menu for a toolbar button: the same settings as the options bar, for that tool.
+fn tool_menu(ui: &mut egui::Ui, e: &mut Engine, tool: Tool) {
+    ui.set_min_width(190.0);
+    ui.label(RichText::new(format!("{}  ({})", tool.label(), tool.key())).strong());
+    ui.separator();
+    let paints = matches!(tool, Tool::Pencil | Tool::Eraser | Tool::Line | Tool::Rect | Tool::Ellipse);
+    if paints {
+        if let Some((w, h)) = e.o.custom_brush.as_ref().map(|b| (b.w, b.h)) {
+            ui.horizontal(|ui| {
+                ui.label(format!("Custom brush {w}x{h}"));
+                if ui.small_button("x").on_hover_text("Back to the standard brush (Esc)").clicked() {
+                    e.o.custom_brush = None;
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Size");
+                ui.add(egui::DragValue::new(&mut e.o.brush_size).range(1..=128).speed(0.2)).on_hover_text("[ and ]");
+                ui.selectable_value(&mut e.o.brush_shape, BrushShape::Round, "Round");
+                ui.selectable_value(&mut e.o.brush_shape, BrushShape::Square, "Square");
+            });
+        }
+    }
+    if (paints && tool != Tool::Eraser) || tool == Tool::Fill {
+        ui.label("Mode");
+        // A plain list: a drop-down inside a menu would close the menu.
+        egui::Grid::new("tool_menu_modes").num_columns(2).spacing([6.0, 2.0]).show(ui, |ui| {
+            for (i, m) in PaintMode::ALL.into_iter().enumerate() {
+                ui.selectable_value(&mut e.o.mode, m, m.name()).on_hover_text(m.hint());
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        if e.o.mode == PaintMode::Dither {
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut e.o.dither, 1..=15).show_value(false)).on_hover_text(format!("Dither density {}/16", e.o.dither));
+                ui.checkbox(&mut e.o.dither_bg, "2-colour").on_hover_text("Paint the background colour in the gaps");
+            });
+        }
+    }
+    match tool {
+        Tool::Rect | Tool::Ellipse => {
+            ui.checkbox(&mut e.o.filled, "Filled");
+        }
+        Tool::Pencil => {
+            ui.checkbox(&mut e.o.pixel_perfect, "Pixel perfect").on_hover_text("Remove corner pixels from 1 px freehand lines");
+        }
+        Tool::Fill | Tool::Wand => {
+            ui.checkbox(&mut e.o.contiguous, "Contiguous");
+            if e.doc.mode == ColorMode::Rgba {
+                ui.horizontal(|ui| {
+                    ui.label("Tolerance");
+                    ui.add(egui::DragValue::new(&mut e.o.tolerance).range(0..=255));
+                });
+            }
+        }
+        Tool::Gradient => {
+            ui.checkbox(&mut e.o.gradient_radial, "Radial");
+            ui.checkbox(&mut e.o.gradient_dither, "Dither");
+            ui.label("Colours");
+            ui.selectable_value(&mut e.o.active_ramp, None, "FG to BG");
+            for (i, r) in e.doc.palette.ramps.iter().enumerate() {
+                ui.selectable_value(&mut e.o.active_ramp, Some(i), &r.name);
+            }
+        }
+        Tool::Picker => {
+            ui.weak("Alt-click with a drawing tool also picks.");
+        }
+        Tool::Select => {
+            ui.weak("Shift adds, Alt subtracts.");
+        }
+        Tool::Move => {
+            ui.weak("Drag to move the selection or layer.\nEnter commits, Esc cancels.");
+        }
+        Tool::TileStamp => {
+            ui.weak(format!("Stamping tile {}.\nRight-click the canvas to pick a tile.", e.o.active_tile));
+        }
+        Tool::Pan => {
+            ui.weak("Middle-drag pans with any tool.");
+        }
+        _ => {}
+    }
+    if paints {
+        ui.horizontal(|ui| {
+            ui.label("Mirror");
+            ui.toggle_value(&mut e.o.sym_x, "X");
+            ui.toggle_value(&mut e.o.sym_y, "Y");
+        });
+    }
+    if e.doc.tileset.is_some() && (paints || matches!(tool, Tool::Fill | Tool::Gradient)) {
+        ui.horizontal(|ui| {
+            ui.label("Tiles");
+            ui.selectable_value(&mut e.o.tile_mode, TileMode::Auto, "Auto").on_hover_text("Edited cells become new tiles (or match existing ones)");
+            ui.selectable_value(&mut e.o.tile_mode, TileMode::Sync, "Sync").on_hover_text("Editing a cell edits its tile everywhere it is used");
+        });
+    }
 }
 
 // ------------------------------------------------------------------ options bar
@@ -324,8 +425,11 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if ui.color_edit_button_srgba_unmultiplied(&mut c).changed() {
                 e.o.fg = pack(c);
             }
-            if ui.small_button("Add to palette").clicked() && n < 256 {
-                g.run(e, "palette_set", json!({ "index": n, "color": [c[0], c[1], c[2]] }));
+            // The palette holds at most 256 colours; when it is full the button says why it is off.
+            let add = ui.add_enabled(n < 256, egui::Button::new("Add to palette").small());
+            let add = add.on_hover_text("Append the foreground colour to the palette").on_disabled_hover_text("The palette is full (256 colours). Click a colour in the grid to change it instead, or load a smaller preset from the Palette menu.");
+            if add.clicked() && g.run(e, "palette_set", json!({ "index": n, "color": [c[0], c[1], c[2]] })).is_some() {
+                g.info(format!("Added colour {n} to the palette"));
             }
         });
     }

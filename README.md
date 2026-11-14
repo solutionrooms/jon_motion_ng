@@ -23,7 +23,8 @@ Or clear the download flag in Terminal: `xattr -dr com.apple.quarantine "/path/t
 
 To cut a release, bump `version` in `Cargo.toml` and push a matching tag (`git tag v0.1.0 && git push --tags`);
 macOS builds are signed and notarised when the signing secrets listed at the top of
-`.github/workflows/release.yml` are set; without them the build is unsigned.
+`.github/workflows/release.yml` are set in the repository's `release` environment; without them the build is unsigned. A published release is never
+overwritten, and each one carries a `SHA256SUMS.txt`.
 CI tests, builds both platforms and publishes them. Local packages: `./scripts/package.sh` (run on macOS;
 writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-windows-gnu` and `brew install mingw-w64`).
 

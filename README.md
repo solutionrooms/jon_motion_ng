@@ -56,6 +56,8 @@ Help > Keyboard Shortcuts lists the keys. Help > Keyboard Preset switches the si
 standard set and **Deluxe Paint** keys (`d` draw, `v` line, `r`/`R` rectangle, `[` `]` colours, `F1`-`F8` modes...);
 the choice is remembered in `~/.jon_motion/settings.json`.
 
+Drag a `.jmn` or `.png` file onto the window to open it (one at a time; unsaved changes are asked about first).
+
 File > Open Recent lists the last 10 files opened or saved from the window (not ones a script or AI client
 opened). The list lives in `~/.jon_motion/settings.json` (created private to your account on macOS and Linux;
 on Windows it is protected by your user profile folder), and no command exposes it.

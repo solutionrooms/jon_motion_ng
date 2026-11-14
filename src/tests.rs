@@ -233,6 +233,32 @@ fn lua_sandbox_limits_hold() {
         assert!(out.error.as_deref().is_some_and(|m| m.contains("time limit")), "{code}\n-> {:?} {:?}", out.error, out.result);
         assert!(t.elapsed().as_secs() < 5, "{code} took {:?}", t.elapsed());
     }
+    // Lua runs error handlers and finalizers with hooks off; these are closed off instead.
+    let out = script::run_lua_limited(&mut e, "xpcall(function() while true do end end, function() while true do end end)", ms);
+    assert!(out.error.unwrap().contains("time limit"));
+    let out = script::run_lua_limited(
+        &mut e,
+        "local co = coroutine.create(function() while true do coroutine.yield() end end)
+         local x <close> = setmetatable({}, { __close = function() while true do end end })
+         while true do for i = 1, 5000 do end coroutine.resume(co) end",
+        ms,
+    );
+    assert!(out.error.unwrap().contains("time limit"));
+    let out = script::run_lua(&mut e, "KEEP = setmetatable({}, { __gc = function() while true do end end }) return 1");
+    assert!(out.error.unwrap().contains("__gc"));
+    let out = script::run_lua(&mut e, "local mt = {} local t = setmetatable({}, mt) mt.__gc = function() end return pcall(setmetatable, t, mt)");
+    assert_eq!(out.result, json!(false));
+    // Whatever else a script finds, the host abandons it: here a slow C library call
+    // that no Lua hook can interrupt. The document is untouched and stays usable.
+    let before = e.doc.clone();
+    let t = std::time::Instant::now();
+    let out = script::run_lua_limited(&mut e, "jm.set(1, 1, 7) return string.rep('a', 400):find('^a*a*a*a*b')", ms);
+    assert!(out.error.unwrap().contains("abandoned"));
+    assert!(t.elapsed().as_secs() < 4, "took {:?}", t.elapsed());
+    assert!(e.doc == before && e.group == 0);
+    assert_eq!(script::run_lua(&mut e, "jm.set(2, 2, 8) return jm.get(2, 2)").result, json!(8));
+    assert_eq!(script::run_lua(&mut e, "return jm.get_info().undo_steps").result, json!(e.undo.len()), "a script sees the real history length");
+    e.exec("undo", &json!({})).unwrap();
     // Coroutines still behave like coroutines.
     let out = script::run_lua(
         &mut e,

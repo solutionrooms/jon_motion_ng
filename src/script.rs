@@ -32,8 +32,9 @@ Every editor command is a function on the global `jm` taking one table of named 
     local info = jm.get_info()            -- commands return tables
     jm.layer_add{ name='Shadows' }
 Fast pixel access on the active layer:
-    jm.get(x, y)            -> palette index (-1 = transparent)
-    jm.set(x, y, color)     -- color: palette index, -1 to erase, or '#rrggbb' / jm.set(x, y, r, g, b) for the nearest palette colour
+    jm.get(x, y)            -> palette index (-1 = transparent); in a true-colour document r, g, b, a (a = 0 is transparent)
+    jm.set(x, y, color)     -- color: palette index, -1 to erase, or '#rrggbb' / jm.set(x, y, r, g, b) for the nearest palette colour;
+                            -- in a true-colour document '#rrggbb', '#rrggbbaa' or jm.set(x, y, r, g, b [, a]) set exactly that colour
     jm.size()               -> width, height
     jm.help('text')         -> command reference, optionally filtered
 print(...) output and the script's return value are returned to the caller.
@@ -249,6 +250,7 @@ fn run_inner(eng: &RefCell<&mut Engine>, out: &RefCell<String>, code: &str, limi
                 let mut ret = Variadic::new();
                 match e.raw_get(x.floor() as i64, y.floor() as i64) {
                     None => ret.push(LV::Nil),
+                    Some(c) if e.doc.rgba() => ret.extend(crate::doc::unpack(c).map(|v| LV::Integer(v as i64))),
                     Some(c) => ret.push(LV::Integer(if c >= 256 { -1 } else { c as i64 })),
                 }
                 Ok(ret)

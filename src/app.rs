@@ -31,7 +31,7 @@ pub enum Tab {
 
 pub enum Dialog {
     None,
-    New { w: u32, h: u32, preset: usize },
+    New { w: u32, h: u32, preset: usize, rgba: bool },
     Resize { w: u32, h: u32, anchor: usize },
     Scale { w: u32, h: u32 },
     Reduce { colors: u32, dither: usize, generate: bool },
@@ -420,7 +420,25 @@ fn open(e: &mut Engine, g: &mut Gui) {
 /// project that is already open is shown instead of being loaded a second time.
 fn open_path(e: &mut Engine, g: &mut Gui, p: &Path) {
     if let Some(v) = g.run(e, "tab_open", json!({ "path": p.display().to_string(), "reuse_blank": true })) {
-        g.info(if v["already_open"] == true { format!("{} is already open", p.display()) } else { format!("Opened {}", p.display()) });
+        g.info(if v["already_open"] == true {
+            format!("{} is already open", p.display())
+        } else if v["converted_to_indexed"] == true {
+            format!("Opened {} as a {}-colour palette image (File > Open as True Colour keeps every colour)", p.display(), e.doc.palette.colors.len())
+        } else {
+            format!("Opened {}", p.display())
+        });
+        g.remember(p);
+    }
+}
+
+/// Open a PNG as a true-colour document, every pixel exactly as the file has it. Only ever
+/// done because the user chose it by name; a project file opens as whatever it was saved as.
+pub fn open_true(e: &mut Engine, g: &mut Gui, p: &Path) {
+    if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")) {
+        return open_path(e, g, p);
+    }
+    if g.run(e, "tab_open", json!({ "path": p.display().to_string(), "mode": "truecolor", "reuse_blank": true })).is_some() {
+        g.info(format!("Opened {} in true colour", p.display()));
         g.remember(p);
     }
 }
@@ -510,7 +528,7 @@ pub fn request(e: &mut Engine, g: &mut Gui, what: Pending) {
 
 fn proceed(e: &mut Engine, g: &mut Gui, what: Pending) {
     match what {
-        Pending::New => g.dialog = Dialog::New { w: e.doc.w, h: e.doc.h, preset: 0 },
+        Pending::New => g.dialog = Dialog::New { w: e.doc.w, h: e.doc.h, preset: 0, rgba: false },
         Pending::Open => open(e, g),
         Pending::OpenFile(p) => open_path(e, g, &p),
         Pending::CloseTab(id) => {
@@ -565,7 +583,8 @@ fn tab_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui, modal: bool) {
                     // A file name can hold anything; the tab shows a short, single-line form of it.
                     let name: String = t["name"].as_str().unwrap_or("").chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
                     let name = if name.chars().count() > 28 { format!("{}...", name.chars().take(25).collect::<String>()) } else { name };
-                    let label = format!("{name}{}", if t["modified"] == true { " *" } else { "" });
+                    // A true-colour document says so on its tab, so the two kinds are never mistaken.
+                    let label = format!("{name}{}{}", if t["mode"] == "truecolor" { "  [true colour]" } else { "" }, if t["modified"] == true { " *" } else { "" });
                     let r = ui.selectable_label(active, label).on_hover_text(t["path"].as_str().unwrap_or("Not saved yet"));
                     if r.clicked() && !active {
                         select = Some(id);
@@ -609,7 +628,7 @@ fn paste_from_system(e: &mut Engine, g: &mut Gui) {
         return g.error("clipboard image is too large");
     }
     let data = img.bytes.chunks_exact(4).map(|c| e.doc.from_rgba([c[0], c[1], c[2], c[3]])).collect();
-    e.clipboard = Some(Clip { x: 0, y: 0, w: img.width as u32, h: img.height as u32, data, pal: e.doc.palette.colors.clone() });
+    e.clipboard = Some(Clip { x: 0, y: 0, w: img.width as u32, h: img.height as u32, data, pal: e.doc.palette.colors.clone(), rgba: e.doc.rgba() });
     if g.run(e, "paste", json!({ "float": true })).is_some() {
         e.o.tool = Tool::Move;
         g.info("Pasted from the system clipboard - drag to place, Enter to commit");
@@ -970,6 +989,11 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
                 request(e, g, Pending::Open);
             }
             ui.menu_button("Open Recent", |ui| recent_menu(ui, e, g));
+            if item(ui, "Open as True Colour...", "") {
+                if let Some(p) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).pick_file() {
+                    open_true(e, g, &p);
+                }
+            }
             if item(ui, "Open Sprite Atlas...", "") {
                 if let Some(p) = rfd::FileDialog::new().add_filter("Sprite atlas (JSON)", &["json"]).pick_file() {
                     open_atlas(g, &p);
@@ -1075,8 +1099,18 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if item(ui, "Scale Image...", "") {
                 g.dialog = Dialog::Scale { w: e.doc.w, h: e.doc.h };
             }
-            if item(ui, "Reduce Colours...", "") {
-                g.dialog = Dialog::Reduce { colors: e.doc.palette.colors.len().min(256) as u32, dither: 0, generate: true };
+            if e.doc.rgba() {
+                // The same dialog, used to choose the palette the image is reduced to.
+                if item(ui, "Convert to Indexed...", "") {
+                    g.dialog = Dialog::Reduce { colors: 256, dither: 0, generate: true };
+                }
+            } else {
+                if item(ui, "Reduce Colours...", "") {
+                    g.dialog = Dialog::Reduce { colors: e.doc.palette.colors.len().min(256) as u32, dither: 0, generate: true };
+                }
+                if item(ui, "Convert to True Colour", "") && g.run(e, "convert_mode", json!({ "mode": "truecolor" })).is_some() {
+                    g.info("This document is now true colour: pixels are colours and the palette is a set of swatches (Edit > Undo goes back)");
+                }
             }
             ui.separator();
             if item(ui, "Flip Horizontal", "") {
@@ -1134,12 +1168,15 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if item(ui, "Merge Duplicate Colours", "") {
                 g.run(e, "palette_cleanup", json!({}));
             }
-            if item(ui, "Remove Unused Colours", "") {
+            let indexed = !e.doc.rgba();
+            let why = "Needs an indexed document: in true colour no pixel refers to the palette";
+            if ui.add_enabled(indexed, egui::Button::new("Remove Unused Colours")).on_disabled_hover_text(why).clicked() {
+                ui.close_menu();
                 g.run(e, "palette_cleanup", json!({ "unused": true }));
             }
             ui.separator();
             let mut cyc = e.view.cycling;
-            if ui.checkbox(&mut cyc, "Preview Colour Cycling").changed() {
+            if ui.add_enabled(indexed, egui::Checkbox::new(&mut cyc, "Preview Colour Cycling")).on_disabled_hover_text(why).changed() {
                 e.view.cycling = cyc;
                 e.rev += 1;
             }
@@ -1264,7 +1301,7 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     let mut close = false;
     match &mut dialog {
         Dialog::None => {}
-        Dialog::New { w, h, preset } => window(ctx, "New Document", |ui| {
+        Dialog::New { w, h, preset, rgba } => window(ctx, "New Document", |ui| {
             size_fields(ui, w, h);
             ui.horizontal(|ui| {
                 for (label, pw, ph) in [("16", 16, 16), ("32", 32, 32), ("64", 64, 64), ("128", 128, 128), ("256", 256, 256), ("320x240", 320, 240)] {
@@ -1282,9 +1319,17 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
                     }
                 });
             });
+            ui.horizontal(|ui| {
+                ui.label("Colour");
+                ui.selectable_value(rgba, false, "Indexed").on_hover_text("A palette image: up to 256 colours, ramps, colour cycling, palette edits recolour the picture");
+                ui.selectable_value(rgba, true, "True colour").on_hover_text("Every pixel is its own colour, with opacity; the palette is a set of swatches");
+            });
+            if *rgba {
+                ui.weak("True-colour projects cannot be opened by versions 0.1.4 and older.");
+            }
             let (ok, cancel) = buttons(ui, "Create");
             if ok {
-                let p = json!({ "width": *w, "height": *h, "palette": PRESETS[*preset], "reuse_blank": true });
+                let p = json!({ "width": *w, "height": *h, "palette": PRESETS[*preset], "mode": if *rgba { "truecolor" } else { "indexed" }, "reuse_blank": true });
                 close = g.run(e, "tab_new", p).is_some();
             }
             close |= cancel;
@@ -1312,21 +1357,31 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             let name: String = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let name = if name.chars().count() > 48 { format!("{}...", name.chars().take(45).collect::<String>()) } else { name };
             ui.label(format!("Open \"{name}\" as a document, or add it to this one as a layer?"));
-            ui.weak("A layer is placed at the top left, uses this document's palette and is cropped to its size.");
+            ui.weak(if e.doc.rgba() {
+                "A layer is placed at the top left, keeps its exact colours (this document is true colour) and is cropped to its size."
+            } else {
+                "A layer is placed at the top left, uses this document's palette and is cropped to its size."
+            });
+            ui.weak("Open makes a palette image (a true-colour picture is reduced to up to 256 colours); Open as True Colour keeps every pixel as it is.");
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let mut choice = None;
                 if ui.add(egui::Button::new(egui::RichText::new("Open").color(Color32::WHITE)).fill(Color32::from_rgb(58, 104, 196))).clicked() {
-                    choice = Some(false);
+                    choice = Some(0);
+                }
+                if ui.button("Open as True Colour").clicked() {
+                    choice = Some(1);
                 }
                 if ui.button("Add as Layer").clicked() {
-                    choice = Some(true);
+                    choice = Some(2);
                 }
                 close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
-                if let Some(as_layer) = choice {
-                    use_dropped(e, g, p, as_layer);
-                    close = true;
+                match choice {
+                    Some(1) => open_true(e, g, p),
+                    Some(c) => use_dropped(e, g, p, c == 2),
+                    None => {}
                 }
+                close |= choice.is_some();
             });
         }),
         Dialog::Scale { w, h } => window(ctx, "Scale Image", |ui| {
@@ -1346,7 +1401,11 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             }
             close |= cancel;
         }),
-        Dialog::Reduce { colors, dither, generate } => window(ctx, "Reduce Colours", |ui| {
+        Dialog::Reduce { colors, dither, generate } => window(ctx, if e.doc.rgba() { "Convert to Indexed" } else { "Reduce Colours" }, |ui| {
+            let convert = e.doc.rgba();
+            if convert {
+                ui.weak("The image becomes a palette image. Part-transparent pixels become opaque or transparent.");
+            }
             ui.horizontal(|ui| {
                 ui.selectable_value(generate, true, "Build palette from image");
                 ui.selectable_value(generate, false, "Use current palette");
@@ -1358,10 +1417,13 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
                     ui.selectable_value(dither, i, *d);
                 }
             });
-            let (ok, cancel) = buttons(ui, "Reduce");
+            let (ok, cancel) = buttons(ui, if convert { "Convert" } else { "Reduce" });
             if ok {
-                let p = json!({ "colors": *colors, "dither": DITHERS[*dither], "palette": if *generate { "generate" } else { "current" } });
-                close = g.run(e, "reduce_colors", p).is_some();
+                let mut p = json!({ "colors": *colors, "dither": DITHERS[*dither], "palette": if *generate { "generate" } else { "current" } });
+                if convert {
+                    p["mode"] = json!("indexed");
+                }
+                close = g.run(e, if convert { "convert_mode" } else { "reduce_colors" }, p).is_some();
             }
             close |= cancel;
         }),
@@ -1662,7 +1724,7 @@ impl eframe::App for App {
         dialogs(ctx, e, g);
 
         e.fix_state();
-        let cycling = e.view.cycling && e.doc.palette.ramps.iter().any(|r| r.cycle);
+        let cycling = e.view.cycling && !e.doc.rgba() && e.doc.palette.ramps.iter().any(|r| r.cycle);
         if cycling || g.flash.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         } else if e.doc.selection.is_some() || e.doc.float.is_some() {

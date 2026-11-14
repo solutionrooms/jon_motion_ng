@@ -3,23 +3,79 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// One pixel: a palette index 0..=255, or `TRANSP`.
+/// One pixel. In an indexed document: a palette index 0..=255, or `TRANSP`. In a true-colour
+/// document: `TRANSP`, or the colour packed by `pack` (its alpha, 1..=255, is the top byte, so
+/// a colour is never below 2^24 and can never be mistaken for an index or for `TRANSP`).
 pub type Cell = u32;
 pub const TRANSP: Cell = 256;
 pub const MAX_DIM: u32 = 4096;
 
-/// Kept for the project file format only. Documents are always indexed; `Rgba`
-/// appears in files written by 0.1.x true-colour documents, which are converted to
-/// indexed when they are opened (see `io::load_doc`).
+/// What a document's pixels are. A document is one or the other for its whole life unless
+/// `convert_mode` is called; nothing converts it implicitly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum ColorMode {
     Indexed,
     Rgba,
 }
 
+impl ColorMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            ColorMode::Indexed => "indexed",
+            ColorMode::Rgba => "truecolor",
+        }
+    }
+    pub fn parse(s: &str) -> Option<ColorMode> {
+        match s.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
+            "indexed" | "index" | "palette" => Some(ColorMode::Indexed),
+            "truecolor" | "truecolour" | "rgba" | "rgb" => Some(ColorMode::Rgba),
+            _ => None,
+        }
+    }
+}
+
+/// True for a transparent pixel, in either kind of document: `TRANSP`, and any other value
+/// that is neither an index nor a packed colour.
 #[inline]
 pub fn cell_empty(c: Cell) -> bool {
-    c >= 256
+    (256..1 << 24).contains(&c)
+}
+/// A true-colour pixel from r, g, b, a. Alpha 0 is `TRANSP` whatever the colour.
+#[inline]
+pub fn pack(c: [u8; 4]) -> Cell {
+    if c[3] == 0 {
+        TRANSP
+    } else {
+        u32::from_le_bytes(c)
+    }
+}
+/// r, g, b, a of a true-colour pixel.
+#[inline]
+pub fn unpack(c: Cell) -> [u8; 4] {
+    if c >> 24 == 0 {
+        [0, 0, 0, 0]
+    } else {
+        c.to_le_bytes()
+    }
+}
+/// Draw `s` over `dst` (both straight, not premultiplied, alpha).
+#[inline]
+pub fn blend(dst: &mut [u8], s: [u8; 4]) {
+    let sa = s[3] as u32;
+    if sa == 0 {
+        return;
+    }
+    let da = dst[3] as u32;
+    if sa == 255 || da == 0 {
+        dst[..4].copy_from_slice(&s);
+        return;
+    }
+    let db = da * (255 - sa) / 255;
+    let oa = sa + db;
+    for i in 0..3 {
+        dst[i] = ((s[i] as u32 * sa + dst[i] as u32 * db) / oa) as u8;
+    }
+    dst[3] = oa as u8;
 }
 pub fn luma(c: [u8; 3]) -> i32 {
     (c[0] as i32 * 299 + c[1] as i32 * 587 + c[2] as i32 * 114) / 1000
@@ -434,7 +490,6 @@ impl Anim {
 pub struct Doc {
     pub w: u32,
     pub h: u32,
-    /// Always `Indexed` once loaded; see `ColorMode`.
     pub mode: ColorMode,
     pub palette: Palette,
     pub layers: Vec<Layer>,
@@ -468,19 +523,34 @@ impl Doc {
         d.layers.push(l);
         d
     }
+    /// A blank true-colour document. Its palette is a set of swatches: no pixel refers to it.
+    pub fn new_rgba(w: u32, h: u32, palette: Palette) -> Doc {
+        let mut d = Doc::new(w, h, palette);
+        d.mode = ColorMode::Rgba;
+        d
+    }
     pub fn len(&self) -> usize {
         (self.w * self.h) as usize
     }
+    /// True for a true-colour document.
+    pub fn rgba(&self) -> bool {
+        self.mode == ColorMode::Rgba
+    }
     pub fn to_rgba(&self, c: Cell) -> [u8; 4] {
-        if c >= 256 {
+        if self.rgba() {
+            unpack(c)
+        } else if c >= 256 {
             [0, 0, 0, 0]
         } else {
             self.palette.rgba(c as usize)
         }
     }
-    /// The nearest palette colour (transparent for mostly transparent input).
+    /// The pixel for a colour. Indexed: the nearest palette colour (transparent for mostly
+    /// transparent input). True colour: exactly that colour.
     pub fn from_rgba(&self, c: [u8; 4]) -> Cell {
-        if c[3] < 128 {
+        if self.rgba() {
+            pack(c)
+        } else if c[3] < 128 {
             TRANSP
         } else {
             self.palette.nearest([c[0], c[1], c[2]]) as Cell
@@ -515,11 +585,15 @@ impl Doc {
                     continue;
                 }
                 let c = cells[(cy * cw + cx) as usize];
+                let o = ((y * w + x) * 4) as usize;
+                if self.rgba() {
+                    blend(&mut out[o..o + 4], unpack(c));
+                    continue;
+                }
                 if c >= 256 {
                     continue;
                 }
                 let p = pal.get(c as usize).copied().unwrap_or([0, 0, 0]);
-                let o = ((y * w + x) * 4) as usize;
                 out[o..o + 4].copy_from_slice(&[p[0], p[1], p[2], 255]);
             }
         }
@@ -556,6 +630,12 @@ impl Doc {
 
     /// Flattened cells: the topmost visible non-transparent pixel wins.
     pub fn flat_cells(&self) -> Vec<Cell> {
+        if self.rgba() {
+            // Layers with part-transparent pixels blend, as they do on screen.
+            let mut d = self.clone();
+            d.float = None;
+            return d.composite(&[], None, false).chunks_exact(4).map(|c| pack([c[0], c[1], c[2], c[3]])).collect();
+        }
         let mut out = vec![TRANSP; self.len()];
         for l in self.layers.iter().filter(|l| l.visible) {
             for (o, &c) in out.iter_mut().zip(l.data.iter()) {

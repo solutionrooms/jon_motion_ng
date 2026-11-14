@@ -35,7 +35,7 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
   Right mouse button paints with the background colour.
 - **Paint modes** - normal, dither (ordered, 15 densities, optional two-colour), lighten/darken
   (steps pixels along their colour ramp), smooth, smear, replace-colour, behind.
-- **Palette** - every document is indexed, with up to 256 colours (there is no true-colour mode). Blend, sort, swap, de-duplicate, remove unused,
+- **Palette** - a document is indexed, with up to 256 colours, unless you ask for true colour (below). Blend, sort, swap, de-duplicate, remove unused,
   11 presets, colour ramps, live colour-cycling preview, quantise/reduce colours with ordered or
   Floyd-Steinberg dithering. Palette edits renumber pixels so the image keeps its look.
 - **Layers** - visibility, lock, transparency lock, reorder, merge, flatten. Layers are fully opaque where they have pixels.
@@ -67,8 +67,21 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
   itself an animations file and nothing else, and never writes into `~/.jon_motion`. Versions 0.1.4 and older open these projects
   but know one grid animation at most: 0.1.4 shows the first grid animation, and saving from an old version
   drops the rest.
-- **Files** - native `.jmn` projects (everything), PNG in and out. Exports are always indexed PNGs. An indexed
-  PNG opens with its own palette; a true-colour PNG is converted to a generated palette of up to 256 colours.
+- **Files** - native `.jmn` projects (everything), PNG in and out. An indexed document always exports an indexed PNG. An indexed
+  PNG opens with its own palette; a true-colour PNG is converted to a generated palette of up to 256 colours, unless
+  you open it as true colour.
+- **True colour** - a separate kind of document, for pictures that are not palette images. You only get one by asking:
+  **True colour** in File > New, File > Open as True Colour... (or that choice when a PNG is dropped), or Image >
+  Convert to True Colour. Its tab and the status bar say "true colour". Every pixel is its own colour with its own
+  opacity, a PNG opens and exports with every pixel exactly as it is (RGBA), and the palette is a set of swatches:
+  editing it never changes the picture. Painting sets exactly the colour in hand - it replaces the pixel rather than
+  blending over it - while layers do blend where pixels are part transparent. Gradients blend smoothly, lighten /
+  darken and smooth work on the colours themselves, and tile maps, selections, animations and scripts work as usual.
+  What needs palette indices is switched off with the reason shown: colour cycling, reduce colours, remove unused
+  colours, palette usage. Image > Convert to Indexed... turns it into a palette image (part-transparent pixels become
+  opaque or transparent); both conversions are one undo step, and nothing else ever changes a document's kind.
+  True-colour projects are saved in a form that versions 0.1.4 and older refuse to open, rather than opening them
+  wrongly; indexed projects are written exactly as before. Layers have no opacity setting in either kind.
 
 Help > Keyboard Shortcuts lists the keys. Help > Keyboard Preset switches the single-key shortcuts between the
 standard set and **Deluxe Paint** keys (`d` draw, `v` line, `r`/`R` rectangle, `[` `]` colours, `F1`-`F8` modes...);
@@ -143,6 +156,12 @@ claude mcp add jon-motion -- /path/to/jon_motion mcp
   Help > AI / MCP Setup has copy-paste commands). It listens on localhost only and requires the token
   in `~/.jon_motion/token` as an `Authorization: Bearer` header, so other users of the machine and web
   pages cannot drive the editor. The `jon_motion mcp` bridge sends it for you.
+
+- `get_info` reports `"mode"`: `indexed` or `truecolor`. In a true-colour document colours are `'#rrggbb'` /
+  `'#rrggbbaa'` (a number picks that swatch's colour) and pixels read back as `'#rrggbbaa'` or `'transparent'`;
+  `jm.get` returns `r, g, b, a`. `new_document`, `tab_new`, `open_document` and `tab_open` take `mode = "truecolor"`
+  (PNG files only for the last two), and `convert_mode` changes a document's kind. Opening a true-colour PNG the
+  default way answers `converted_to_indexed: true`.
 
 Tools: `get_info`, `list_commands`, `execute_command`, `batch` (atomic), `run_lua`, `screenshot`
 (returns an image so the model can see its work). Replacing a document that has unsaved changes is

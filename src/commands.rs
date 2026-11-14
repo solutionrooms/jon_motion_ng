@@ -308,7 +308,7 @@ fn write_file(p: &PathBuf, bytes: &[u8]) -> Result<(), String> {
 pub fn info(e: &Engine) -> Value {
     let d = &e.doc;
     json!({
-        "width": d.w, "height": d.h, "mode": "indexed",
+        "width": d.w, "height": d.h, "mode": d.mode.name(),
         "layers": d.layers.iter().enumerate().map(|(i, l)| json!({
             "index": i, "name": l.name, "visible": l.visible,
             "locked": l.locked, "alpha_lock": l.alpha_lock, "tile_mapped": l.map.is_some() })).collect::<Vec<_>>(),
@@ -377,6 +377,60 @@ pub fn doc_from_png(img: io::PngImage) -> Doc {
     }
 }
 
+/// A PNG as a true-colour document: every pixel exactly as the file has it, part-transparent
+/// ones included. An indexed PNG's palette becomes the document's swatches.
+pub fn doc_from_png_rgba(img: io::PngImage) -> Doc {
+    match img.pixels {
+        io::PngPixels::Indexed { data, palette, trns } => {
+            let px = |i: u8| palette.get(i as usize).map_or(TRANSP, |c| pack([c[0], c[1], c[2], trns.get(i as usize).copied().unwrap_or(255)]));
+            let mut d = Doc::new_rgba(img.w, img.h, Palette { colors: palette.iter().copied().take(256).collect(), ramps: vec![] });
+            d.layers[0].data = Arc::new(data.iter().map(|&i| px(i)).collect());
+            d
+        }
+        io::PngPixels::Rgba(px) => {
+            let mut d = Doc::new_rgba(img.w, img.h, Palette::default_256());
+            d.layers[0].data = Arc::new(px.into_iter().map(pack).collect());
+            d
+        }
+    }
+}
+
+/// The `mode` parameter: indexed unless true colour is asked for by name.
+fn mode_arg(a: &Args) -> Result<ColorMode, String> {
+    match a.os("mode")? {
+        None => Ok(ColorMode::Indexed),
+        Some(m) => ColorMode::parse(m).ok_or_else(|| format!("unknown mode '{m}' (indexed or truecolor)")),
+    }
+}
+
+/// Palette commands that renumber or count pixels have nothing to work on in a true-colour document.
+fn need_indexed(e: &Engine, what: &str) -> Result<(), String> {
+    if e.doc.rgba() {
+        return Err(format!("{what} needs an indexed document; this one is true colour, where the palette is a set of swatches and no pixel refers to it (convert_mode makes it indexed)"));
+    }
+    Ok(())
+}
+
+/// Turn an indexed document into a true-colour one: every pixel takes its palette colour.
+fn to_truecolor(e: &mut Engine) {
+    let (fg, bg) = (e.doc.to_rgba(e.o.fg), e.doc.to_rgba(e.o.bg));
+    let d = &mut e.doc;
+    let pal = d.palette.clone();
+    let conv = |data: &Arc<Vec<Cell>>| Arc::new(data.iter().map(|&c| if c < 256 { pack(pal.rgba(c as usize)) } else { TRANSP }).collect::<Vec<Cell>>());
+    for l in &mut d.layers {
+        l.data = conv(&l.data);
+    }
+    if let Some(ts) = &mut d.tileset {
+        for t in &mut ts.tiles {
+            *t = conv(t);
+        }
+    }
+    d.mode = ColorMode::Rgba;
+    e.o.fg = e.doc.from_rgba(fg);
+    e.o.bg = e.doc.from_rgba(bg);
+    e.o.custom_brush = None;
+}
+
 /// Rebuild every layer by pulling each destination pixel from a source position.
 fn transform(e: &mut Engine, nw: u32, nh: u32, src: impl Fn(i32, i32) -> (i32, i32)) {
     let (ow, oh) = (e.doc.w as i32, e.doc.h as i32);
@@ -412,6 +466,8 @@ fn reduce(e: &mut Engine, colors: usize, dither: Dither, generate: bool) {
     if generate {
         d.palette = quant::palette_for(layers.iter().flatten(), colors);
     }
+    // The pixels below are indices whatever they were before.
+    d.mode = ColorMode::Indexed;
     for (l, px) in d.layers.iter_mut().zip(&layers) {
         l.data = Arc::new(quant::to_indexed(px, w, h, &d.palette, dither));
     }
@@ -426,9 +482,16 @@ fn reduce(e: &mut Engine, colors: usize, dither: Dither, generate: bool) {
     e.o.custom_brush = None;
 }
 
-/// Renumber palette indices everywhere they are stored.
+/// Renumber palette indices everywhere they are stored. In a true-colour document only the
+/// ramps hold indices: pixels, colours and brushes are colours and are left alone.
 fn remap_indices(e: &mut Engine, map: &[Cell]) {
     let f = |c: Cell| if c < 256 { map.get(c as usize).copied().unwrap_or(c) } else { c };
+    if e.doc.rgba() {
+        for r in &mut e.doc.palette.ramps {
+            r.indices = r.indices.iter().map(|&i| f(i as Cell)).filter(|&n| n < 256).map(|n| n as u8).collect();
+        }
+        return;
+    }
     for l in &mut e.doc.layers {
         if l.data.iter().any(|&c| f(c) != c) {
             Arc::make_mut(&mut l.data).iter_mut().for_each(|c| *c = f(*c));
@@ -658,14 +721,15 @@ fn document_cmds(b: &mut B) {
         "new_document",
         Edit,
         "width:int Width in pixels; height:int Height in pixels; \
-         palette:str? Palette preset name (default 'default'); force:bool? Discard unsaved changes",
-        "Replace the open document with a blank one. Clears undo history.",
+         palette:str? Palette preset name (default 'default'); mode:str? indexed (default) or truecolor; force:bool? Discard unsaved changes",
+        "Replace the open document with a blank one. Clears undo history. mode=truecolor makes a true-colour document: pixels are '#rrggbbaa' colours and the palette is a set of swatches.",
         |e, a| {
             check_discard(e, a)?;
             let (w, h) = (dim(a.i("width")?)?, dim(a.i("height")?)?);
             let name = a.os("palette")?.unwrap_or("default");
             let pal = Palette::preset(name).ok_or_else(|| format!("unknown palette preset '{name}' ({})", PRESETS.join(", ")))?;
-            install_doc(e, Doc::new(w, h, pal), None, true);
+            let doc = if mode_arg(a)? == ColorMode::Rgba { Doc::new_rgba(w, h, pal) } else { Doc::new(w, h, pal) };
+            install_doc(e, doc, None, true);
             Ok(info(e))
         },
     );
@@ -673,14 +737,25 @@ fn document_cmds(b: &mut B) {
         "document",
         "open_document",
         Edit,
-        "path:str A .jmn project or a .png image; force:bool? Discard unsaved changes",
-        "Open a project file, or a PNG as a new document. An indexed PNG keeps its palette; a true-colour PNG is converted to a generated palette of up to 256 colours. Clears undo history.",
+        "path:str A .jmn project or a .png image; mode:str? For a PNG: indexed (default) or truecolor; force:bool? Discard unsaved changes",
+        "Open a project file, or a PNG as a new document. An indexed PNG keeps its palette; a true-colour PNG is converted to a generated palette of up to 256 colours \
+         unless mode=truecolor, which opens any PNG as a true-colour document with every pixel exactly as it is. A project opens as the kind of document it was saved as. Clears undo history.",
         |e, a| {
             check_discard(e, a)?;
             let p = PathBuf::from(a.s("path")?);
+            let mode = mode_arg(a)?;
             if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png")) {
-                install_doc(e, doc_from_png(io::load_png(&p)?), None, false);
+                let img = io::load_png(&p)?;
+                // Say so when colours were given up, so the caller can open it the other way.
+                let converted = mode == ColorMode::Indexed && matches!(img.pixels, io::PngPixels::Rgba(_));
+                install_doc(e, if mode == ColorMode::Rgba { doc_from_png_rgba(img) } else { doc_from_png(img) }, None, false);
+                let mut v = info(e);
+                v["converted_to_indexed"] = json!(converted);
+                return Ok(v);
             } else {
+                if a.get("mode").is_some() {
+                    return Err("'mode' is for PNG files; a project opens as the kind of document it was saved as (convert_mode changes it afterwards)".into());
+                }
                 e.path_free(&p)?;
                 install_doc(e, io::load_doc(&p)?, Some(p), false);
             }
@@ -710,7 +785,7 @@ fn document_cmds(b: &mut B) {
         "export_png",
         Read,
         "path:str Destination file; scale:int? Integer upscale 1-64 (default 1); layer:layer? Export a single layer",
-        "Export a flattened PNG. Indexed documents export as indexed PNGs at scale 1. The scaled image may be at most 8192x8192 pixels in area.",
+        "Export a flattened PNG: an indexed PNG from an indexed document, an RGBA PNG (every pixel exactly as it is) from a true-colour one. The scaled image may be at most 8192x8192 pixels in area.",
         |e, a| {
             let p = path_arg(a, "png")?;
             let layer = if a.get("layer").is_some() { Some(layer_arg(e, a)?) } else { None };
@@ -724,10 +799,11 @@ fn document_cmds(b: &mut B) {
         "import_png_layer",
         Edit,
         "path:str PNG file; x:int? Left offset (default 0); y:int? Top offset (default 0); name:str? Layer name",
-        "Add a PNG as a new layer, mapped onto the document's palette.",
+        "Add a PNG as a new layer: mapped onto the palette in an indexed document, exactly as it is in a true-colour one.",
         |e, a| {
             let p = PathBuf::from(a.s("path")?);
-            let src = doc_from_png(io::load_png(&p)?);
+            let img = io::load_png(&p)?;
+            let src = if e.doc.rgba() { doc_from_png_rgba(img) } else { doc_from_png(img) };
             let (ox, oy) = (a.oc("x")?.unwrap_or(0), a.oc("y")?.unwrap_or(0));
             let name = a.os("name")?.map(str::to_string).unwrap_or_else(|| p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("Imported".into()));
             let mut l = e.doc.new_layer(&name);
@@ -834,8 +910,9 @@ fn document_cmds(b: &mut B) {
         Edit,
         "colors:int? Palette size when generating (default 256); dither:str? none (default), bayer or floyd; \
          palette:str? generate (default) builds a palette from the image, current remaps onto the existing palette",
-        "Reduce the image to fewer colours, or remap it onto the current palette, with optional dithering.",
+        "Reduce the image to fewer colours, or remap it onto the current palette, with optional dithering. Indexed documents only.",
         |e, a| {
+            need_indexed(e, "reduce_colors")?;
             let d = a.os("dither")?.unwrap_or("none");
             let dither = Dither::parse(d).ok_or_else(|| format!("unknown dither '{d}' (none, bayer, floyd)"))?;
             let generate = match a.os("palette")?.unwrap_or("generate") {
@@ -845,6 +922,37 @@ fn document_cmds(b: &mut B) {
             };
             reduce(e, a.oi("colors")?.unwrap_or(256).clamp(1, 256) as usize, dither, generate);
             Ok(json!({"palette_count": e.doc.palette.colors.len()}))
+        },
+    );
+    b.add(
+        "document",
+        "convert_mode",
+        Edit,
+        "mode:str indexed or truecolor; colors:int? To indexed: palette size when generating (default 256); dither:str? To indexed: none (default), bayer or floyd; \
+         palette:str? To indexed: generate (default) builds a palette from the image, current maps onto the existing palette",
+        "Change what kind of document this is, as one undo step. To truecolor: every pixel takes its palette colour and the image looks the same. \
+         To indexed: the image is reduced to a palette of up to 256 colours, and part-transparent pixels become opaque or transparent. Nothing else ever converts a document.",
+        |e, a| {
+            let m = a.s("mode")?;
+            let mode = ColorMode::parse(m).ok_or_else(|| format!("unknown mode '{m}' (indexed or truecolor)"))?;
+            if mode == e.doc.mode {
+                return Err(format!("the document is already {}", mode.name()));
+            }
+            e.doc.float_commit();
+            if mode == ColorMode::Rgba {
+                to_truecolor(e);
+            } else {
+                let d = a.os("dither")?.unwrap_or("none");
+                let dither = Dither::parse(d).ok_or_else(|| format!("unknown dither '{d}' (none, bayer, floyd)"))?;
+                let generate = match a.os("palette")?.unwrap_or("generate") {
+                    "generate" => true,
+                    "current" => false,
+                    o => return Err(format!("unknown palette option '{o}' (generate or current)")),
+                };
+                reduce(e, a.oi("colors")?.unwrap_or(256).clamp(1, 256) as usize, dither, generate);
+            }
+            e.fix_state();
+            Ok(json!({"mode": e.doc.mode.name(), "palette_count": e.doc.palette.colors.len()}))
         },
     );
     b.add("document", "undo", Read, "steps:int? How many steps (default 1)", "Undo. Each command, batch, script or user stroke is one step.", |e, a| {
@@ -947,9 +1055,15 @@ fn layer_cmds(b: &mut B) {
             return Err("there is no layer below to merge into".into());
         }
         let upper = e.doc.layers.remove(li);
+        let rgba = e.doc.rgba();
         let lower = layer_data(e, li - 1)?;
         for (d, &s) in lower.iter_mut().zip(upper.data.iter()) {
-            if s < 256 {
+            if rgba {
+                // Part-transparent pixels blend, as they do on screen.
+                let mut px = unpack(*d);
+                blend(&mut px, unpack(s));
+                *d = pack(px);
+            } else if s < 256 {
                 *d = s;
             }
         }
@@ -981,7 +1095,7 @@ fn draw_cmds(b: &mut B) {
         "get_pixel",
         Read,
         "x:int X; y:int Y; layer:layer? Layer to read (default: active); merged:bool? Read the topmost visible pixel across all layers",
-        "Read one pixel: its palette index (-1 = transparent) and its colour as '#rrggbbaa'.",
+        "Read one pixel: 'color' is its palette index (-1 = transparent), or in a true-colour document '#rrggbbaa' ('transparent' for none); 'rgba' is always '#rrggbbaa'.",
         |e, a| {
             let (x, y) = (a.i("x")?, a.i("y")?);
             if x < 0 || y < 0 || x >= e.doc.w as i64 || y >= e.doc.h as i64 {
@@ -1120,9 +1234,9 @@ fn draw_cmds(b: &mut B) {
         "gradient",
         Paint,
         "x0:int Start X; y0:int Start Y; x1:int End X; y1:int End Y; colors:array? Colour stops in order (default: foreground to background); \
-         ramp:int? Use a palette ramp's colours as the stops; radial:bool? Radial instead of linear; dither:bool? Ordered dithering between stops (default true); \
+         ramp:int? Use a palette ramp's colours as the stops; radial:bool? Radial instead of linear; dither:bool? Ordered dithering between stops (default true, or false in a true-colour document); \
          layer:layer? Target layer (default: active)",
-        "Fill the selection (or the whole layer) with a gradient. Indexed documents step through the stops with optional dithering.",
+        "Fill the selection (or the whole layer) with a gradient. Indexed documents step through the stops with optional dithering; true-colour documents blend smoothly unless dither is on.",
         |e, a| {
             let (x0, y0, x1, y1) = (a.c("x0")?, a.c("y0")?, a.c("x1")?, a.c("y1")?);
             let stops: Vec<Cell> = if let Some(c) = a.get("colors") {
@@ -1136,7 +1250,7 @@ fn draw_cmds(b: &mut B) {
             if stops.is_empty() {
                 return Err("gradient needs at least one colour".into());
             }
-            let (radial, dither) = (a.b("radial")?, a.ob("dither")?.unwrap_or(true));
+            let (radial, dither) = (a.b("radial")?, a.ob("dither")?.unwrap_or(!e.doc.rgba()));
             let none = Map::new();
             let o = paint_args(e, &Args(&none))?;
             draw(e, a, o, |e| e.stroke_gradient(x0, y0, x1, y1, &stops, radial, dither))
@@ -1472,6 +1586,7 @@ fn palette_cmds(b: &mut B) {
             remap_indices(e, &map);
         }
         if a.b("unused")? {
+            need_indexed(e, "removing unused colours")?;
             let u = usage(e);
             let mut map = vec![0 as Cell; u.len()];
             let mut cols = vec![];
@@ -1493,7 +1608,8 @@ fn palette_cmds(b: &mut B) {
         }
         Ok(json!({"before": before, "after": e.doc.palette.colors.len()}))
     });
-    b.add("palette", "palette_usage", Read, "", "Count how many pixels use each palette index.", |e, _| {
+    b.add("palette", "palette_usage", Read, "", "Count how many pixels use each palette index (indexed documents).", |e, _| {
+        need_indexed(e, "palette_usage")?;
         let u = usage(e);
         Ok(json!({"counts": u, "used": u.iter().filter(|n| **n > 0).count()}))
     });
@@ -2284,12 +2400,12 @@ fn tab_cmds(b: &mut B) {
         "tab_new",
         Tab,
         "width:int? Width in pixels (default: the active document's); height:int? Height in pixels (default: the active document's); \
-         palette:str? Palette preset name (default 'default'); reuse_blank:bool? Use the active tab instead when it is a blank document nobody has touched",
+         palette:str? Palette preset name (default 'default'); mode:str? indexed (default) or truecolor; reuse_blank:bool? Use the active tab instead when it is a blank document nobody has touched",
         "Open a blank document in a new tab and make it active. Nothing is replaced, so nothing is lost. Up to 32 documents can be open. \
          Tab commands cannot be used inside a script or batch, which work on one document from start to finish.",
         |e, a| {
             let p = json!({"width": a.oi("width")?.unwrap_or(e.doc.w as i64), "height": a.oi("height")?.unwrap_or(e.doc.h as i64),
-                           "palette": a.os("palette")?.unwrap_or("default"), "force": true});
+                           "palette": a.os("palette")?.unwrap_or("default"), "mode": mode_arg(a)?.name(), "force": true});
             if a.b("reuse_blank")? && e.pristine() {
                 e.exec("new_document", &p)?;
                 return Ok(json!({"id": e.id, "reused": true}));
@@ -2303,7 +2419,7 @@ fn tab_cmds(b: &mut B) {
         "tabs",
         "tab_open",
         Tab,
-        "path:str A .jmn project or a .png image; reuse_blank:bool? Use the active tab instead when it is a blank document nobody has touched",
+        "path:str A .jmn project or a .png image; mode:str? For a PNG: indexed (default) or truecolor; reuse_blank:bool? Use the active tab instead when it is a blank document nobody has touched",
         "Open a file in a new tab and make it active. If that project is already open, its tab is made active instead (already_open is true) and it is not reloaded.",
         |e, a| {
             let p = PathBuf::from(a.s("path")?);
@@ -2311,17 +2427,20 @@ fn tab_cmds(b: &mut B) {
                 e.tab_select(id)?;
                 return Ok(json!({"id": id, "already_open": true}));
             }
-            let open = json!({"path": a.s("path")?, "force": true});
+            let mut open = json!({"path": a.s("path")?, "force": true});
+            if let Some(m) = a.os("mode")? {
+                open["mode"] = json!(m);
+            }
             if a.b("reuse_blank")? && e.pristine() {
-                e.exec("open_document", &open)?;
-                return Ok(json!({"id": e.id, "reused": true}));
+                let v = e.exec("open_document", &open)?;
+                return Ok(json!({"id": e.id, "reused": true, "converted_to_indexed": v["converted_to_indexed"] == true}));
             }
             if e.order.len() >= MAX_TABS {
                 return Err(format!("{MAX_TABS} documents are open, which is the limit; close one first"));
             }
             let mut t = Engine::new(e.host);
-            t.exec("open_document", &open)?;
-            Ok(json!({"id": e.tab_add(t)?}))
+            let v = t.exec("open_document", &open)?;
+            Ok(json!({"id": e.tab_add(t)?, "converted_to_indexed": v["converted_to_indexed"] == true}))
         },
     );
     b.add("tabs", "tab_select", Tab, "id:int The document's id (see tab_list)", "Make another open document the active one. Its own undo history, selection, view and colours come with it.", |e, a| {

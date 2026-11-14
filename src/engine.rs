@@ -215,6 +215,8 @@ pub struct Clip {
     pub data: Vec<Cell>,
     /// The palette the cells were copied under, so a paste into another palette keeps its look.
     pub pal: Vec<[u8; 3]>,
+    /// True when the cells are colours, copied from a true-colour document.
+    pub rgba: bool,
 }
 
 pub struct Stroke {
@@ -401,7 +403,7 @@ impl Engine {
 
     fn tab_json(&self, active: bool) -> Value {
         json!({"id": self.id, "name": self.title(), "path": self.path.as_ref().map(|p| p.display().to_string()),
-               "modified": self.modified, "width": self.doc.w, "height": self.doc.h, "active": active})
+               "modified": self.modified, "width": self.doc.w, "height": self.doc.h, "mode": self.doc.mode.name(), "active": active})
     }
 
     /// The open documents in tab order.
@@ -603,13 +605,20 @@ impl Engine {
                 if i as usize >= self.doc.palette.colors.len() {
                     return Err(format!("palette index {i} out of range (palette has {} colours)", self.doc.palette.colors.len()));
                 }
-                Ok(i as Cell)
+                // In a true-colour document an index names a swatch: the pixel gets its colour.
+                Ok(if self.doc.rgba() { pack(self.doc.palette.rgba(i as usize)) } else { i as Cell })
             }
             Value::String(s) => match s.as_str() {
                 "transparent" | "none" | "clear" => Ok(TRANSP),
                 "fg" => Ok(self.o.fg),
                 "bg" => Ok(self.o.bg),
-                _ => parse_hex(s).map(|c| self.doc.from_rgba(c)).ok_or_else(|| format!("bad colour '{s}' (use a palette index, '#rrggbb' for the nearest palette colour, 'transparent', 'fg' or 'bg')")),
+                _ => parse_hex(s).map(|c| self.doc.from_rgba(c)).ok_or_else(|| {
+                    if self.doc.rgba() {
+                        format!("bad colour '{s}' (use '#rrggbb', '#rrggbbaa', a palette swatch number, 'transparent', 'fg' or 'bg')")
+                    } else {
+                        format!("bad colour '{s}' (use a palette index, '#rrggbb' for the nearest palette colour, 'transparent', 'fg' or 'bg')")
+                    }
+                }),
             },
             Value::Array(a) if a.len() == 3 || a.len() == 4 => {
                 let ch = |i: usize| a.get(i).and_then(|v| v.as_f64()).map(|v| v.clamp(0.0, 255.0) as u8);
@@ -620,7 +629,12 @@ impl Engine {
         }
     }
 
+    /// A pixel as commands report it: a palette index (-1 = transparent), or in a
+    /// true-colour document '#rrggbbaa' ('transparent' for an empty pixel).
     pub fn cell_json(&self, c: Cell) -> Value {
+        if self.doc.rgba() {
+            return if cell_empty(c) { Value::from("transparent") } else { Value::from(hex8(unpack(c))) };
+        }
         if c >= 256 {
             Value::from(-1)
         } else {
@@ -632,7 +646,13 @@ impl Engine {
     pub fn replace_doc(&mut self, new: Doc) -> Doc {
         let (fg, bg) = (self.doc.to_rgba(self.o.fg), self.doc.to_rgba(self.o.bg));
         let old = std::mem::replace(&mut self.doc, new);
-        if old.palette.colors != self.doc.palette.colors {
+        if old.mode != self.doc.mode {
+            // Indices and colours are not interchangeable: the colours are carried over by
+            // look, and a brush cut from the other kind of document is dropped.
+            self.o.fg = self.doc.from_rgba(fg);
+            self.o.bg = self.doc.from_rgba(bg);
+            self.o.custom_brush = None;
+        } else if !old.rgba() && old.palette.colors != self.doc.palette.colors {
             self.o.fg = self.doc.from_rgba(fg);
             self.o.bg = self.doc.from_rgba(bg);
             // The custom brush keeps its look too (undoing a palette sort or swap renumbers it).
@@ -660,11 +680,33 @@ impl Engine {
     pub fn fix_state(&mut self) {
         let d = &self.doc;
         let n = d.palette.colors.len() as Cell;
-        if self.o.fg != TRANSP && self.o.fg >= n {
-            self.o.fg = n - 1;
-        }
-        if self.o.bg != TRANSP && self.o.bg >= n {
-            self.o.bg = 0;
+        if d.rgba() {
+            // A true-colour document's colours are colours; a stray index becomes its swatch.
+            for c in [&mut self.o.fg, &mut self.o.bg] {
+                if *c < 256 {
+                    *c = pack(d.palette.rgba(*c as usize));
+                } else if cell_empty(*c) {
+                    *c = TRANSP;
+                }
+            }
+            if self.o.custom_brush.as_ref().and_then(|b| b.cells.as_ref()).is_some_and(|cells| cells.iter().any(|&c| c < 256)) {
+                self.o.custom_brush = None;
+            }
+        } else {
+            for c in [&mut self.o.fg, &mut self.o.bg] {
+                if *c >= 1 << 24 {
+                    *c = d.from_rgba(c.to_le_bytes());
+                }
+            }
+            if self.o.custom_brush.as_ref().and_then(|b| b.cells.as_ref()).is_some_and(|cells| cells.iter().any(|&c| c >= 1 << 24)) {
+                self.o.custom_brush = None;
+            }
+            if self.o.fg != TRANSP && self.o.fg >= n {
+                self.o.fg = n - 1;
+            }
+            if self.o.bg != TRANSP && self.o.bg >= n {
+                self.o.bg = 0;
+            }
         }
         if self.o.active_ramp.is_some_and(|r| r >= d.palette.ramps.len()) {
             self.o.active_ramp = None;
@@ -1012,6 +1054,7 @@ impl Engine {
         let mut p = Painter {
             w: doc.w as i32,
             h: doc.h as i32,
+            rgba: doc.mode == ColorMode::Rgba,
             pal: &doc.palette,
             data,
             base: &st.base.layers[li].data,
@@ -1126,7 +1169,9 @@ impl Engine {
     /// Colours the gradient tool runs through with the current settings.
     pub fn gradient_stops(&self, secondary: bool) -> Vec<Cell> {
         if let Some(r) = self.o.active_ramp.and_then(|r| self.doc.palette.ramps.get(r)) {
-            let mut v: Vec<Cell> = r.indices.iter().map(|&i| i as Cell).collect();
+            // In a true-colour document the ramp's swatches give the colours.
+            let d = &self.doc;
+            let mut v: Vec<Cell> = r.indices.iter().map(|&i| if d.rgba() { pack(d.palette.rgba(i as usize)) } else { i as Cell }).collect();
             if secondary {
                 v.reverse();
             }
@@ -1150,7 +1195,7 @@ impl Engine {
     pub fn grab(&self) -> Result<Clip, String> {
         let d = &self.doc;
         if let Some(f) = &d.float {
-            return Ok(Clip { x: f.x, y: f.y, w: f.w, h: f.h, data: f.data.to_vec(), pal: d.palette.colors.clone() });
+            return Ok(Clip { x: f.x, y: f.y, w: f.w, h: f.h, data: f.data.to_vec(), pal: d.palette.colors.clone(), rgba: d.rgba() });
         }
         let li = d.active;
         let (x0, y0, x1, y1) = match d.sel_bounds() {
@@ -1168,13 +1213,20 @@ impl Engine {
                 }
             }
         }
-        Ok(Clip { x: x0, y: y0, w: cw as u32, h: ch as u32, data, pal: d.palette.colors.clone() })
+        Ok(Clip { x: x0, y: y0, w: cw as u32, h: ch as u32, data, pal: d.palette.colors.clone(), rgba: d.rgba() })
     }
 
     /// Clipboard cells converted to this document's palette.
     pub fn clip_cells(&self) -> Option<Vec<Cell>> {
         let c = self.clipboard.as_ref()?;
         let d = &self.doc;
+        if c.rgba {
+            // Colours: kept exactly in a true-colour document, matched to the palette in an indexed one.
+            return Some(if d.rgba() { c.data.clone() } else { c.data.iter().map(|&cell| d.from_rgba(unpack(cell))).collect() });
+        }
+        if d.rgba() {
+            return Some(c.data.iter().map(|&cell| c.pal.get(cell as usize).map_or(TRANSP, |p| pack([p[0], p[1], p[2], 255]))).collect());
+        }
         if c.pal == d.palette.colors {
             return Some(c.data.clone());
         }

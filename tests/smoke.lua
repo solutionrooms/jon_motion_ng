@@ -159,10 +159,30 @@ jm.tiles_remove_unused{}
 eq(jm.tiles_info{}.count <= before, true)
 jm.layer_detach_tiles{}; jm.tileset_delete{}
 
--- indexed only: colours snap to the palette, and the image can be reduced to fewer
-fails(function() jm.new_document{ width = 16, height = 16, mode = "rgba", force = true } end, "no true-colour documents")
-fails(function() jm.convert_mode{ mode = "rgba" } end, "no mode conversion")
+-- true colour is a separate kind of document, only ever asked for by name
+jm.new_document{ width = 16, height = 16, mode = "truecolor", force = true }
+eq(jm.get_info().mode, "truecolor")
+jm.set(0, 0, "#12345678"); local r, g, b, al = jm.get(0, 0); eq(r, 0x12); eq(g, 0x34); eq(b, 0x56); eq(al, 0x78)
+jm.set(1, 0, 10, 20, 30); eq(jm.get_pixel{ x = 1, y = 0 }.color, "#0a141eff")
+eq(jm.get_pixel{ x = 5, y = 5 }.color, "transparent"); eq(select("#", jm.get(5, 5)), 4)
+jm.draw_rect{ x = 0, y = 4, w = 8, h = 8, color = "#ff000080", filled = true }
+eq(jm.get_pixel{ x = 1, y = 5 }.color, "#ff000080", "a colour is painted exactly, opacity included")
+jm.draw_rect{ x = 0, y = 4, w = 2, h = 2, color = 15, filled = true }
+eq(jm.get_pixel{ x = 0, y = 4 }.color, jm.palette_get{ start = 15, count = 1 }.colors[1] .. "ff", "a number picks that swatch's colour")
+jm.tileset_create{ tile_w = 8, tile_h = 8 }; jm.layer_to_tiles{}
+eq(jm.tiles_info{}.count >= 2, true, "tile maps work on colours too")
+jm.layer_detach_tiles{}; jm.tileset_delete{}
+fails(function() jm.reduce_colors{ colors = 8 } end, "reduce_colors on a true-colour document")
+fails(function() jm.palette_usage{} end, "palette_usage on a true-colour document")
+fails(function() jm.convert_mode{ mode = "truecolor" } end, "converting to the mode it already has")
+fails(function() jm.convert_mode{ mode = "cmyk" } end, "unknown mode")
+eq(jm.convert_mode{ mode = "indexed", colors = 16 }.mode, "indexed")
+eq(jm.get(1, 0) >= 0, true, "pixels are indices again")
+
+-- indexed: colours snap to the palette, and the image can be reduced to fewer
+fails(function() jm.new_document{ width = 16, height = 16, mode = "cmyk", force = true } end, "unknown mode")
 jm.new_document{ width = 16, height = 16, force = true }
+eq(jm.get_info().mode, "indexed", "indexed unless true colour is asked for")
 jm.palette_set{ index = 1, color = "#ff0000" }
 jm.set(0, 0, 255, 0, 0); eq(jm.get(0, 0), 1, "rgb snaps to the nearest palette colour")
 jm.set(1, 0, "#ff0000"); eq(jm.get(1, 0), 1)

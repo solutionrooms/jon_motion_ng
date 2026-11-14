@@ -702,3 +702,108 @@ fn many_colour_images_convert_quickly_and_closely() {
     }
     assert!(worse < px.len() / 4, "{worse} of {} pixels missed their nearest colour", px.len());
 }
+
+#[test]
+fn deluxe_paint_keys() {
+    use crate::engine::Keymap;
+    use crate::paint::PaintMode;
+    let ctx = egui::Context::default();
+    let (mut e, mut g) = (Engine::new("gui"), Gui::new());
+    let mut time = 0.0;
+    let mut frame = |e: &mut Engine, g: &mut Gui, events: Vec<Event>| {
+        time += 1.0 / 60.0;
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0))), time: Some(time), events, ..Default::default() };
+        let _ = ctx.run(raw, |ctx| crate::app::shortcuts(ctx, e, g));
+    };
+    let text = |s: &str| vec![Event::Text(s.to_string())];
+    let key = |key: egui::Key| vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }];
+
+    // The standard preset is untouched: R is the rectangle, and DPaint's characters do nothing.
+    frame(&mut e, &mut g, key(egui::Key::R));
+    assert_eq!(e.o.tool, Tool::Rect);
+    frame(&mut e, &mut g, text("v"));
+    assert_eq!(e.o.tool, Tool::Rect, "typed characters are not standard shortcuts");
+
+    // Switching is a view setting, so scripts and AI clients can do it too.
+    assert!(e.exec("set_view", &json!({"keymap": "amiga"})).is_err());
+    e.exec("set_view", &json!({"keymap": "dpaint"})).unwrap();
+    assert_eq!(e.exec("get_view", &json!({})).unwrap()["keymap"], "dpaint");
+    assert_eq!(e.view.keymap, Keymap::DPaint);
+
+    // Upper and lower case differ: r is an outlined rectangle, R a filled one.
+    frame(&mut e, &mut g, text("R"));
+    assert_eq!((e.o.tool, e.o.filled), (Tool::Rect, true));
+    frame(&mut e, &mut g, text("r"));
+    assert_eq!((e.o.tool, e.o.filled), (Tool::Rect, false));
+    frame(&mut e, &mut g, text("v"));
+    assert_eq!(e.o.tool, Tool::Line);
+    frame(&mut e, &mut g, text("d"));
+    assert_eq!(e.o.tool, Tool::Pencil);
+    // A standard-only key does nothing: L would have been the line tool.
+    frame(&mut e, &mut g, key(egui::Key::L));
+    assert_eq!(e.o.tool, Tool::Pencil);
+
+    // [ ] step the foreground colour (they are brush size in the standard preset), { } the background.
+    let (fg, bg, size) = (e.o.fg, e.o.bg, e.o.brush_size);
+    frame(&mut e, &mut g, text("["));
+    assert_eq!((e.o.fg, e.o.brush_size), (fg - 1, size));
+    frame(&mut e, &mut g, text("]"));
+    assert_eq!(e.o.fg, fg);
+    e.o.fg = e.doc.palette.colors.len() as u32 - 1;
+    frame(&mut e, &mut g, text("]"));
+    assert_eq!(e.o.fg, 0, "stepping past the last colour wraps");
+    e.o.fg = fg;
+    frame(&mut e, &mut g, text("}"));
+    assert_eq!(e.o.bg, bg + 1);
+    frame(&mut e, &mut g, text("="));
+    assert_eq!(e.o.brush_size, size + 1);
+    frame(&mut e, &mut g, text("."));
+    assert_eq!(e.o.brush_size, 1);
+
+    // Function keys pick paint modes; u undoes; K clears the layer.
+    frame(&mut e, &mut g, key(egui::Key::F8));
+    assert_eq!(e.o.mode, PaintMode::Smooth);
+    frame(&mut e, &mut g, key(egui::Key::F1));
+    assert_eq!(e.o.mode, PaintMode::Normal);
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4, "color": 9, "filled": true})).unwrap();
+    frame(&mut e, &mut g, text("K"));
+    assert_eq!(e.doc.layers[0].data[0], crate::doc::TRANSP, "K clears");
+    frame(&mut e, &mut g, text("u"));
+    assert_eq!(e.doc.layers[0].data[0], 9, "u undoes");
+    frame(&mut e, &mut g, text("g"));
+    assert!(e.view.grid);
+    // Keys DPaint has but this editor does not are left alone.
+    frame(&mut e, &mut g, text("a"));
+    frame(&mut e, &mut g, text("q"));
+    assert_eq!(e.o.tool, Tool::Pencil);
+    // Every key in the table is distinct, and each tool's tooltip key is the one that selects it.
+    let mut seen = std::collections::HashSet::new();
+    assert!(crate::keys::DPAINT.iter().all(|b| seen.insert(b.key)), "duplicate key in the preset");
+    assert_eq!(crate::keys::tool_key(Keymap::DPaint, Tool::Rect).as_deref(), Some("r"));
+    assert_eq!(crate::keys::tool_key(Keymap::DPaint, Tool::Eraser), None);
+    assert_eq!(crate::keys::tool_key(Keymap::Standard, Tool::Eraser).as_deref(), Some("E"));
+
+    // Help > Keyboard Shortcuts lists the active preset's keys.
+    fn has(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
+        fn walk(s: &egui::Shape, needle: &str) -> bool {
+            match s {
+                egui::Shape::Text(t) => t.galley.text().contains(needle),
+                egui::Shape::Vec(v) => v.iter().any(|s| walk(s, needle)),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|c| walk(&c.shape, needle))
+    }
+    g.dialog = crate::app::Dialog::Shortcuts;
+    for (map, shown, hidden) in [(Keymap::DPaint, "Filled rectangle", "Swap colours"), (Keymap::Standard, "Swap colours", "Filled rectangle")] {
+        e.view.keymap = map;
+        let mut out = None;
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0))), ..Default::default() };
+            out = Some(ctx.run(raw, |ctx| crate::app::dialogs(ctx, &mut e, &mut g)));
+        }
+        let shapes = out.unwrap().shapes;
+        assert!(has(&shapes, shown), "{map:?}: '{shown}' is listed");
+        assert!(!has(&shapes, hidden), "{map:?}: '{hidden}' is not listed");
+    }
+}

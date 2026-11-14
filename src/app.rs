@@ -4,6 +4,7 @@
 use crate::canvas;
 use crate::doc::*;
 use crate::engine::*;
+use crate::keys;
 use crate::panels;
 use crate::remote;
 use crate::script;
@@ -60,6 +61,8 @@ pub struct Gui {
     pub tile_key: u64,
     pub drag: Option<Drag>,
     pub hover: Option<(i32, i32)>,
+    /// The keymap last written to the settings file; `None` (tests) never touches the file.
+    pub saved_keymap: Option<Keymap>,
     pub last_pos: Option<egui::Pos2>,
     pub zoom_accum: f32,
     pub canvas_rect: egui::Rect,
@@ -94,6 +97,7 @@ pub struct Gui {
 impl Gui {
     pub fn new() -> Gui {
         Gui {
+            saved_keymap: None,
             tex: None,
             tex_key: (0, 0, -1),
             tile_tex: None,
@@ -241,6 +245,8 @@ impl App {
         theme(&cc.egui_ctx);
         let mut engine = Engine::new("gui");
         let mut gui = Gui::new();
+        load_settings(&mut engine);
+        gui.saved_keymap = Some(engine.view.keymap);
         if let Some(f) = file {
             if let Err(e) = engine.exec("open_document", &json!({ "path": f.display().to_string() })) {
                 gui.error(e);
@@ -401,7 +407,33 @@ pub fn zoom(e: &mut Engine, dir: i32) {
 
 // ------------------------------------------------------------------ shortcuts
 
-fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
+/// Preferences that outlive the window, in ~/.jon_motion/settings.json.
+fn load_settings(e: &mut Engine) {
+    let Some(p) = remote::settings_file() else { return };
+    let Ok(text) = std::fs::read_to_string(p) else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    if let Some(k) = v["keymap"].as_str().and_then(Keymap::parse) {
+        e.view.keymap = k;
+    }
+}
+
+/// Write the preferences when one changed (from the menu, the dialog, a script or an AI client).
+fn save_settings(e: &Engine, g: &mut Gui) {
+    if g.saved_keymap == Some(e.view.keymap) {
+        return;
+    }
+    g.saved_keymap = Some(e.view.keymap);
+    if let Some(p) = remote::settings_file() {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        if let Err(err) = std::fs::write(&p, json!({ "keymap": e.view.keymap.name() }).to_string()) {
+            g.error(format!("could not save settings to {}: {err}", p.display()));
+        }
+    }
+}
+
+pub fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     let cmd = Modifiers::COMMAND;
     let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
     let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
@@ -471,32 +503,55 @@ fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
         }
     }
     let plain = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
-    for t in Tool::ALL {
-        if let Some(k) = Key::from_name(&t.key().to_string()) {
-            if plain(k) {
-                e.o.tool = t;
+    match e.view.keymap {
+        Keymap::Standard => {
+            for t in Tool::ALL {
+                if let Some(k) = Key::from_name(&t.key().to_string()) {
+                    if plain(k) {
+                        e.o.tool = t;
+                    }
+                }
+            }
+            if plain(Key::X) {
+                g.run(e, "swap_colors", json!({}));
+            }
+            if plain(Key::OpenBracket) {
+                e.o.brush_size = e.o.brush_size.saturating_sub(1).max(1);
+                e.o.custom_brush = None;
+            }
+            if plain(Key::CloseBracket) {
+                e.o.brush_size = (e.o.brush_size + 1).min(128);
+                e.o.custom_brush = None;
+            }
+            if plain(Key::Plus) || plain(Key::Equals) {
+                zoom(e, 1);
+            }
+            if plain(Key::Minus) {
+                zoom(e, -1);
+            }
+            if plain(Key::Num0) {
+                e.view.fit = true;
             }
         }
-    }
-    if plain(Key::X) {
-        g.run(e, "swap_colors", json!({}));
-    }
-    if plain(Key::OpenBracket) {
-        e.o.brush_size = e.o.brush_size.saturating_sub(1).max(1);
-        e.o.custom_brush = None;
-    }
-    if plain(Key::CloseBracket) {
-        e.o.brush_size = (e.o.brush_size + 1).min(128);
-        e.o.custom_brush = None;
-    }
-    if plain(Key::Plus) || plain(Key::Equals) {
-        zoom(e, 1);
-    }
-    if plain(Key::Minus) {
-        zoom(e, -1);
-    }
-    if plain(Key::Num0) {
-        e.view.fit = true;
+        Keymap::DPaint => {
+            // Characters come from text events, so r and R (or [ and {) are told apart on any
+            // keyboard layout. Nothing is typed while Cmd/Ctrl is held, so those shortcuts are unaffected.
+            let mut acts: Vec<keys::Act> = ctx.input(|i| {
+                i.events.iter().filter_map(|ev| if let egui::Event::Text(t) = ev { keys::find(t) } else { None }).collect()
+            });
+            for k in [Key::Tab, Key::F1, Key::F2, Key::F3, Key::F4, Key::F5, Key::F6, Key::F7, Key::F8] {
+                if let Some(a) = keys::find(k.name()) {
+                    if plain(k) {
+                        acts.push(a);
+                    }
+                }
+            }
+            for a in acts {
+                if let Some(cmd) = keys::apply(e, a, g.hover) {
+                    g.run(e, cmd, json!({}));
+                }
+            }
+        }
     }
     if plain(Key::Delete) || plain(Key::Backspace) {
         g.run(e, "selection_delete", json!({}));
@@ -771,6 +826,13 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if item(ui, "Keyboard Shortcuts", "") {
                 g.dialog = Dialog::Shortcuts;
             }
+            ui.menu_button("Keyboard Preset", |ui| {
+                for k in Keymap::ALL {
+                    if ui.radio_value(&mut e.view.keymap, k, k.label()).clicked() {
+                        ui.close_menu();
+                    }
+                }
+            });
             if item(ui, "AI / MCP Setup", "") {
                 g.dialog = Dialog::Mcp;
             }
@@ -815,7 +877,7 @@ fn window(ctx: &egui::Context, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
+pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     let mut dialog = std::mem::replace(&mut g.dialog, Dialog::None);
     let mut close = false;
     match &mut dialog {
@@ -901,21 +963,41 @@ fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             close |= cancel;
         }),
         Dialog::Shortcuts => window(ctx, "Keyboard Shortcuts", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Preset");
+                for k in Keymap::ALL {
+                    ui.selectable_value(&mut e.view.keymap, k, k.label());
+                }
+            });
+            ui.add_space(4.0);
+            let dpaint = e.view.keymap == Keymap::DPaint;
+            egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
             egui::Grid::new("keys").num_columns(2).spacing([24.0, 5.0]).striped(true).show(ui, |ui| {
-                for t in Tool::ALL {
-                    ui.label(t.label());
-                    ui.monospace(t.key().to_string());
-                    ui.end_row();
+                if dpaint {
+                    for b in keys::DPAINT {
+                        ui.label(b.what);
+                        ui.monospace(b.key);
+                        ui.end_row();
+                    }
+                } else {
+                    for t in Tool::ALL {
+                        ui.label(t.label());
+                        ui.monospace(t.key().to_string());
+                        ui.end_row();
+                    }
+                    for (a, b) in [("Brush size", "[ and ]"), ("Swap colours", "X"), ("Zoom", "+ / -, 0 to fit")] {
+                        ui.label(a);
+                        ui.monospace(b);
+                        ui.end_row();
+                    }
                 }
                 for (a, b) in [
                     ("Draw with background colour", "Right mouse button"),
                     ("Pick colour while drawing", "Alt + click"),
                     ("Pan", "Space + drag, or middle mouse"),
-                    ("Zoom", "Scroll, pinch, + / -, 0 to fit"),
+                    ("Zoom", "Scroll or pinch; Cmd/Ctrl + 0 fits, Cmd/Ctrl + 1 is 100%"),
                     ("Constrain shape / line angle", "Shift while dragging"),
                     ("Add / subtract selection", "Shift / Alt with Select or Wand"),
-                    ("Brush size", "[ and ]"),
-                    ("Swap colours", "X"),
                     ("Grab selection as brush", "Cmd/Ctrl + B"),
                     ("Nudge selection", "Arrow keys (Shift = 8 px)"),
                     ("Commit / cancel floating pixels", "Enter / Esc"),
@@ -927,6 +1009,12 @@ fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
                     ui.monospace(b);
                     ui.end_row();
                 }
+            });
+            if dpaint {
+                ui.add_space(4.0);
+                ui.weak("Tools without a Deluxe Paint key (eraser, gradient, wand, move, tile stamp, pan) are on the toolbar.");
+                ui.weak(format!("Deluxe Paint keys with no equivalent here do nothing: {}.", keys::DPAINT_UNBOUND));
+            }
             });
             close = buttons(ui, "Close") != (false, false);
         }),
@@ -1089,6 +1177,9 @@ impl eframe::App for App {
         let modal = !matches!(g.dialog, Dialog::None) || g.pending.is_some();
         if !modal {
             shortcuts(ctx, e, g);
+            if g.saved_keymap.is_some() {
+                save_settings(e, g);
+            }
         }
         egui::TopBottomPanel::top("menu").show(ctx, |ui| menu_bar(ui, e, g));
         egui::TopBottomPanel::top("options").exact_height(34.0).show(ctx, |ui| panels::options(ui, e, g));

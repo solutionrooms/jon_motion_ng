@@ -6,6 +6,7 @@ mod commands;
 mod doc;
 mod engine;
 mod io;
+mod keys;
 mod paint;
 mod panels;
 mod quant;

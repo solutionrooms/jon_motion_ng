@@ -6,6 +6,9 @@
 # UNIVERSAL=1 makes the macOS app run on both Apple Silicon and Intel
 #   (needs: rustup target add aarch64-apple-darwin x86_64-apple-darwin).
 # Cross-compiling Windows needs: rustup target add x86_64-pc-windows-gnu && brew install mingw-w64
+# macOS signing (optional; without it the app is ad-hoc signed and Gatekeeper warns on first open):
+#   MACOS_SIGN_IDENTITY="Developer ID Application: Name (TEAMID)"   sign with the hardened runtime
+#   APPLE_ID, APPLE_APP_PASSWORD, APPLE_TEAM_ID                     also notarise and staple
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -53,9 +56,25 @@ package_mac() {
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
-  codesign --force --deep -s - "$app"
-  rm -f "dist/JonMotion-$VERSION-macos-$arch.zip"
-  (cd dist && zip -qry "JonMotion-$VERSION-macos-$arch.zip" "Jon Motion.app")
+  local zip="dist/JonMotion-$VERSION-macos-$arch.zip"
+  rm -f "$zip"
+  if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+    codesign --force --options runtime --timestamp -s "$MACOS_SIGN_IDENTITY" "$app"
+    codesign --verify --strict --verbose=2 "$app"
+    if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+      # Apple checks a zip of the app; the ticket is then stapled to the app itself, so it opens offline too.
+      local upload
+      upload=$(mktemp -d)/notarize.zip
+      ditto -c -k --keepParent "$app" "$upload"
+      xcrun notarytool submit "$upload" --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+      xcrun stapler staple "$app"
+    else
+      echo "signed but NOT notarised (set APPLE_ID, APPLE_APP_PASSWORD and APPLE_TEAM_ID)" >&2
+    fi
+  else
+    codesign --force --deep -s - "$app"
+  fi
+  ditto -c -k --keepParent "$app" "$zip"
 }
 
 package_windows() {

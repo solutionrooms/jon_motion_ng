@@ -181,6 +181,16 @@ local fr = jm.anim_control{ frame = 3, playing = false }
 eq(fr.frame_x, 0); eq(fr.frame_y, 16)
 eq(jm.anim_control{ step = 2 }.frame, 0, "stepping wraps")
 fails(function() jm.anim_set{ frame_w = 100 } end, "frame larger than the region")
+-- several named animations; a frame list gives every frame its own rectangle
+eq(jm.anim_info().name, "Animation")
+jm.anim_rename{ to = "walk" }
+local j = jm.anim_frames{ name = "jump", frames = { {0, 0, 10, 12}, {10, 0, 14, 16, -2, -4} }, fps = 12 }
+eq(j.kind, "frames"); eq(j.frames, 2); eq(j.box_w, 14); eq(j.box_h, 16)
+eq(#jm.anim_list().animations, 2); eq(jm.anim_info().name, "jump")
+eq(jm.anim_control{ name = "walk", frame = 1 }.frame_x, 16)
+fails(function() jm.anim_frames{ frames = { {60, 0, 10, 10} } } end, "frame outside the image")
+fails(function() jm.anim_rename{ to = "jump" } end, "name in use")
+jm.anim_clear{ name = "jump" }; eq(#jm.anim_list().animations, 1)
 jm.anim_clear{}; eq(jm.anim_info().active, false)
 fails(function() jm.anim_control{ step = 1 } end, "no animation")
 

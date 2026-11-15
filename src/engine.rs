@@ -198,6 +198,10 @@ pub struct View {
     /// setup lives in the document (`Doc::anim`); this playback position does not.
     pub anim_frame: u32,
     pub anim_playing: bool,
+    /// Which of the document's animations is on show, and its name: after an undo or a
+    /// removal changes the list, the same animation stays on show if it is still there.
+    pub anim_index: usize,
+    pub anim_shown: String,
     /// Draw the animation's frame cuts on the canvas.
     pub anim_guides: bool,
 }
@@ -336,6 +340,8 @@ impl Engine {
                 cycling: false,
                 anim_frame: 0,
                 anim_playing: false,
+                anim_index: 0,
+                anim_shown: String::new(),
                 anim_guides: true,
             },
             clipboard: None,
@@ -452,6 +458,17 @@ impl Engine {
         old
     }
 
+    /// Put animation `i` on show.
+    pub fn show_anim(&mut self, i: usize) {
+        self.view.anim_index = i;
+        self.view.anim_shown = self.doc.anims.get(i).map(|a| a.name.clone()).unwrap_or_default();
+    }
+
+    /// The animation on show, if the document has any.
+    pub fn anim(&self) -> Option<&Anim> {
+        self.doc.anims.get(self.view.anim_index)
+    }
+
     /// Clamp editor state that refers into the document.
     pub fn fix_state(&mut self) {
         let d = &self.doc;
@@ -472,11 +489,22 @@ impl Engine {
         if self.doc.active >= self.doc.layers.len() {
             self.doc.active = self.doc.layers.len() - 1;
         }
-        // An animation whose frames no longer lie inside the image (after a crop or resize) is dropped.
-        if self.doc.anim.is_some_and(|a| !a.fits(self.doc.w, self.doc.h)) {
-            self.doc.anim = None;
+        // Animations whose frames no longer lie inside the image (after a crop or resize) are dropped.
+        let (w, h) = (self.doc.w, self.doc.h);
+        if self.doc.anims.iter().any(|a| !a.fits(w, h)) {
+            self.doc.anims.retain(|a| a.fits(w, h));
         }
-        let frames = self.doc.anim.map(|a| a.count()).unwrap_or(0);
+        match self.doc.anims.iter().position(|a| a.name == self.view.anim_shown) {
+            Some(i) => self.view.anim_index = i,
+            None => {
+                let i = self.view.anim_index.min(self.doc.anims.len().saturating_sub(1));
+                if i != self.view.anim_index {
+                    self.view.anim_frame = 0;
+                }
+                self.show_anim(i);
+            }
+        }
+        let frames = self.anim().map(|a| a.count()).unwrap_or(0);
         self.view.anim_frame = self.view.anim_frame.min(frames.saturating_sub(1));
         if frames == 0 {
             self.view.anim_playing = false;

@@ -422,8 +422,9 @@ pub fn show(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     painter.rect_stroke(img_rect, 0.0, Stroke::new(1.0_f32, Color32::from_white_alpha(40)), StrokeKind::Outside);
 
     // ---- animation frames: where the cuts fall, which cells play, and the frame on show
-    if let Some(a) = e.doc.anim.filter(|_| e.view.anim_guides) {
-        let amber = Color32::from_rgb(255, 190, 70);
+    let amber = Color32::from_rgb(255, 190, 70);
+    let shown = e.anim().filter(|_| e.view.anim_guides);
+    if let Some(a) = shown.and_then(|a| a.grid()) {
         let (cols, rows, n) = (a.cols(), a.rows(), a.count());
         let at = |c: u32, r: u32| to_screen((a.x + c * a.fw) as f32, (a.y + r * a.fh) as f32);
         let used = Rect::from_min_max(at(0, 0), at(cols, rows));
@@ -453,11 +454,19 @@ pub fn show(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             painter.rect_filled(Rect::from_min_max(at(0, below), at(cols, rows)), 0.0, dim);
         }
         painter.rect_stroke(used, 0.0, Stroke::new(1.0_f32, amber), StrokeKind::Outside);
-        if !e.view.anim_playing && n > 0 {
-            let f = e.view.anim_frame.min(n - 1);
-            let (c, r) = (f % cols.max(1), f / cols.max(1));
-            painter.rect_stroke(Rect::from_min_max(at(c, r), at(c + 1, r + 1)), 0.0, Stroke::new(2.0_f32, amber), StrokeKind::Inside);
+    } else if let Some(crate::doc::Frames::List(list)) = shown.map(|a| &a.frames) {
+        // A frame list: each frame's own rectangle.
+        let thin = Stroke::new(1.0_f32, amber.gamma_multiply(0.6));
+        for f in list.iter() {
+            let r = Rect::from_min_max(to_screen(f.x as f32, f.y as f32), to_screen((f.x + f.w) as f32, (f.y + f.h) as f32));
+            if r.intersects(rect) {
+                painter.rect_stroke(r, 0.0, thin, StrokeKind::Inside);
+            }
         }
+    }
+    if let Some(f) = shown.filter(|_| !e.view.anim_playing).and_then(|a| a.frame(e.view.anim_frame.min(a.count().saturating_sub(1)))) {
+        let r = Rect::from_min_max(to_screen(f.x as f32, f.y as f32), to_screen((f.x + f.w) as f32, (f.y + f.h) as f32));
+        painter.rect_stroke(r, 0.0, Stroke::new(2.0_f32, amber), StrokeKind::Inside);
     }
 
     let guide = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 120, 200, 150));

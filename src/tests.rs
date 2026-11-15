@@ -866,18 +866,18 @@ fn animation_setup_is_part_of_the_document_and_playback_is_not() {
     // It is saved in the project, and comes back on open.
     let p = tmp("anim.jmn");
     e.exec("save_document", &json!({"path": p})).unwrap();
-    let saved = e.doc.anim;
-    assert!(saved.is_some());
+    let saved = e.doc.anims.clone();
+    assert_eq!(saved.len(), 1);
     e.exec("new_document", &json!({"width": 8, "height": 8, "force": true})).unwrap();
     assert_eq!(e.exec("anim_info", &json!({})).unwrap()["active"], false);
     e.exec("open_document", &json!({"path": p})).unwrap();
-    assert_eq!(e.doc.anim, saved);
+    assert_eq!(e.doc.anims, saved);
 
     // An animation that no longer fits the image goes, and undo brings it back.
     e.exec("resize_canvas", &json!({"width": 100, "height": 64})).unwrap();
     assert_eq!(e.exec("anim_info", &json!({})).unwrap()["active"], false);
     e.exec("undo", &json!({})).unwrap();
-    assert_eq!(e.doc.anim, saved);
+    assert_eq!(e.doc.anims, saved);
 
     // Scripts drive it too.
     let out = script::run_lua(&mut e, "jm.anim_set{ x = 0, y = 0, w = 64, h = 32, frame_w = 32, frame_h = 32 } jm.anim_control{ frame = 1 } return jm.anim_info().frame_x");
@@ -911,57 +911,384 @@ fn project_files_stay_compatible_with_published_builds() {
     let (magic, raw) = inflate(&p);
     assert_eq!(raw, plain);
 
-    // With one, the document comes first and unchanged, so 0.1.3's loader - bincode::deserialize
-    // of the whole buffer - still reads it; it just does not see the animation.
-    d.anim = Some(Anim { x: 0, y: 0, w: 64, h: 32, fw: 16, fh: 16, limit: 5, fps: 10.0 });
-    crate::io::save_doc(&d, std::path::Path::new(&p)).unwrap();
+    // With animations, the document comes first and unchanged, so 0.1.3's loader -
+    // bincode::deserialize of the whole buffer - still reads it; it just does not see them.
+    let grid = Grid { x: 0, y: 0, w: 64, h: 32, fw: 16, fh: 16, limit: 5 };
+    let list = Frames::List(std::sync::Arc::new(vec![Frame { x: 1, y: 2, w: 9, h: 7, ox: -3, oy: 4 }, Frame { x: 20, y: 0, w: 30, h: 32, ox: 0, oy: 0 }]));
+    d.anims = vec![Anim { name: "jump".into(), fps: 24.0, frames: list }, Anim { name: "walk".into(), fps: 10.0, frames: Frames::Grid(grid) }];
+    let path = std::path::Path::new(&p);
+    crate::io::save_doc(&d, path).unwrap();
     let (_, raw) = inflate(&p);
     assert!(raw.len() > plain.len() && raw[..plain.len()] == plain[..]);
     let old: Doc = bincode::deserialize(&raw).unwrap();
-    assert!(old.layers == d.layers && old.anim.is_none());
-    assert_eq!(crate::io::load_doc(std::path::Path::new(&p)).unwrap().anim, d.anim);
+    assert!(old.layers == d.layers && old.anims.is_empty());
+    assert_eq!(crate::io::load_doc(path).unwrap().anims, d.anims);
 
-    // Chunks this build does not know are skipped, in any order; damaged ones are ignored.
-    let anim = &raw[plain.len()..];
-    let unknown = [b"WHAT".as_slice(), &3u32.to_le_bytes(), &[1, 2, 3]].concat();
-    for (extra, kept) in [
-        ([unknown.as_slice(), anim].concat(), true),
-        ([anim, unknown.as_slice()].concat(), true),
-        (anim[..anim.len() - 1].to_vec(), false),
-        ([b"ANIM".as_slice(), &u32::MAX.to_le_bytes(), &[0; 40]].concat(), false),
-        ([b"ANIM".as_slice(), &2u32.to_le_bytes(), &[7, 7]].concat(), false),
-        ([anim, b"ANIM".as_slice(), &2u32.to_le_bytes(), &[7, 7]].concat(), true),
-        (vec![0xff; 5], false),
+    // 0.1.4 reads one grid animation from an "ANIM" chunk and skips chunks it does not know.
+    // This is its reader; it finds the first grid animation in a file this build wrote.
+    type V1 = (u32, u32, u32, u32, u32, u32, u32, f32);
+    let as_014 = |mut rest: &[u8]| {
+        let mut got: Option<V1> = None;
+        while rest.len() >= 8 {
+            let len = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+            let Some(payload) = rest[8..].get(..len) else { break };
+            if &rest[..4] == b"ANIM" {
+                if let Ok(a) = bincode::deserialize(payload) {
+                    got = Some(a);
+                }
+            }
+            rest = &rest[8 + len..];
+        }
+        got
+    };
+    let tail = &raw[plain.len()..];
+    assert_eq!(as_014(tail), Some((0, 0, 64, 32, 16, 16, 5, 10.0)));
+    // A document with only frame lists has nothing 0.1.4 can show, so no "ANIM" chunk is written.
+    let mut lists_only = d.clone();
+    lists_only.anims.truncate(1);
+    crate::io::save_doc(&lists_only, path).unwrap();
+    assert_eq!(as_014(&inflate(&p).1[plain.len()..]), None);
+    assert_eq!(crate::io::load_doc(path).unwrap().anims, lists_only.anims);
+
+    // And a file 0.1.4 saved - its one chunk - opens with that animation.
+    let v1 = |a: V1| [b"ANIM".as_slice(), &32u32.to_le_bytes(), &bincode::serialize(&a).unwrap()].concat();
+    let chunk = |tag: &[u8; 4], body: &[u8]| [tag.as_slice(), &(body.len() as u32).to_le_bytes(), body].concat();
+    let from_014 = Anim { name: "Animation".into(), fps: 10.0, frames: Frames::Grid(grid) };
+    write(&p, &magic, &[plain.as_slice(), &v1((0, 0, 64, 32, 16, 16, 5, 10.0))].concat());
+    assert_eq!(crate::io::load_doc(path).unwrap().anims, vec![from_014.clone()]);
+
+    // Chunks this build does not know are skipped, in any order; damaged ones are ignored, and
+    // when the full list cannot be read the single animation 0.1.4 would see is used.
+    let unknown = chunk(b"WHAT", &[1, 2, 3]);
+    let names = |a: &[Anim]| a.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(",");
+    for (extra, expect) in [
+        ([unknown.as_slice(), tail].concat(), "jump,walk"),
+        ([tail, unknown.as_slice()].concat(), "jump,walk"),
+        (tail[..tail.len() - 1].to_vec(), "Animation"),
+        ([b"ANIM".as_slice(), &u32::MAX.to_le_bytes(), &[0; 40]].concat(), ""),
+        (chunk(b"ANIM", &[7, 7]), ""),
+        ([tail, &chunk(b"ANIM", &[7, 7])].concat(), "jump,walk"),
+        ([tail, &chunk(b"ANMS", b"{ not json")].concat(), "jump,walk"),
+        (chunk(b"ANMS", b"[1, 2, 3]"), ""),
+        (chunk(b"ANMS", br#"{"format":"something-else","animations":[]}"#), ""),
+        (vec![0xff; 5], ""),
     ] {
         write(&p, &magic, &[plain.as_slice(), &extra].concat());
-        let got = crate::io::load_doc(std::path::Path::new(&p)).unwrap();
-        assert_eq!(got.anim.is_some(), kept, "extra bytes {extra:?}");
+        let got = crate::io::load_doc(path).unwrap();
+        assert_eq!(names(&got.anims), expect, "extra bytes {:?}", &extra[..extra.len().min(24)]);
         assert!(got.layers == d.layers);
     }
 
-    // The stored setup is checked like the rest of the file.
-    let good = d.anim.unwrap();
-    for (a, expect) in [
-        (Anim { fps: f32::NAN, ..good }, Some(Anim { fps: 8.0, ..good })),
-        (Anim { fps: -3.0, ..good }, Some(Anim { fps: 8.0, ..good })),
-        (Anim { fps: f32::INFINITY, ..good }, Some(Anim { fps: 8.0, ..good })),
-        (Anim { limit: u32::MAX, ..good }, Some(Anim { limit: 0, ..good })),
-        (Anim { fw: 0, ..good }, None),
-        (Anim { fh: 0, ..good }, None),
-        (Anim { fw: 65, ..good }, None),
-        (Anim { x: 1, ..good }, None),
-        (Anim { x: u32::MAX, y: u32::MAX, ..good }, None),
-        (Anim { w: u32::MAX, h: u32::MAX, fw: 1, fh: 1, ..good }, None),
+    // A stored list far larger than this program writes is not parsed at all, and a list with
+    // nothing usable in it does not hide the animation 0.1.4 would show.
+    let padded = format!("{}{}", " ".repeat((crate::io::ANIM_JSON_MAX + 1) as usize), std::str::from_utf8(&tail[tail.len() - 40..]).map(|_| "").unwrap_or(""));
+    let walk_only = json!({"format": "jon-motion-animations", "animations": [{"name": "kept", "frames": [[0, 0, 4, 4]]}]}).to_string();
+    for (extra, expect) in [
+        (chunk(b"ANMS", format!("{padded}{walk_only}").as_bytes()), ""),
+        ([v1((0, 0, 64, 32, 16, 16, 5, 10.0)), chunk(b"ANMS", format!("{padded}{walk_only}").as_bytes())].concat(), "Animation"),
+        (chunk(b"ANMS", walk_only.as_bytes()), "kept"),
+        ([v1((0, 0, 64, 32, 16, 16, 5, 10.0)), chunk(b"ANMS", br#"{"format":"jon-motion-animations","animations":[]}"#)].concat(), "Animation"),
+        ([v1((0, 0, 64, 32, 16, 16, 5, 10.0)), chunk(b"ANMS", br#"{"format":"jon-motion-animations","animations":[{"name":"bad","frames":[[99,0,4,4]]}]}"#)].concat(), "Animation"),
     ] {
-        d.anim = Some(a);
-        crate::io::save_doc(&d, std::path::Path::new(&p)).unwrap();
+        write(&p, &magic, &[plain.as_slice(), &extra].concat());
+        assert_eq!(names(&crate::io::load_doc(path).unwrap().anims), expect);
+    }
+
+    // 0.1.4's chunk is checked like the rest of the file.
+    let good: V1 = (0, 0, 64, 32, 16, 16, 5, 10.0);
+    let g = |f: &dyn Fn(&mut V1)| { let mut a = good; f(&mut a); a };
+    for (a, expect) in [
+        (g(&|a| a.7 = f32::NAN), Some((5, 8.0))),
+        (g(&|a| a.7 = -3.0), Some((5, 8.0))),
+        (g(&|a| a.7 = f32::INFINITY), Some((5, 8.0))),
+        (g(&|a| a.6 = u32::MAX), Some((0, 10.0))),
+        (g(&|a| a.4 = 0), None),
+        (g(&|a| a.5 = 0), None),
+        (g(&|a| a.4 = 65), None),
+        (g(&|a| a.0 = 1), None),
+        (g(&|a| (a.0, a.1) = (u32::MAX, u32::MAX)), None),
+        (g(&|a| (a.2, a.3, a.4, a.5) = (u32::MAX, u32::MAX, 1, 1)), None),
+    ] {
+        write(&p, &magic, &[plain.as_slice(), &v1(a)].concat());
         let mut e = Engine::new("headless");
         e.exec("open_document", &json!({"path": p})).unwrap();
-        assert_eq!(e.doc.anim, expect, "{a:?}");
+        assert_eq!(e.anim().map(|x| (x.grid().unwrap().limit, x.fps)), expect, "{a:?}");
         // Whatever survived can be shown and stepped without trouble.
         e.exec("anim_info", &json!({})).unwrap();
         let _ = e.exec("anim_control", &json!({"step": 1}));
     }
+
+    // The full list is JSON written by this program, but a file can say anything: entries that
+    // are not sound for the image are left out one by one, and nothing is trusted to be in range.
+    let hostile = json!({"format": "jon-motion-animations", "version": 99, "animations": [
+        {"name": "ok", "fps": 12, "grid": {"x": 0, "y": 0, "w": 64, "h": 32, "frame_w": 8, "frame_h": 8, "frames": 4000000000u64}},
+        {"name": "ok", "fps": 12, "frames": [[0, 0, 4, 4]]},
+        {"name": "off the image", "frames": [[60, 0, 8, 8]]},
+        {"name": "negative", "frames": [[-1, 0, 8, 8]]},
+        {"name": "fraction", "frames": [[0.5, 0, 8, 8]]},
+        {"name": "huge", "frames": [[0, 0, 1e300, 8]]},
+        {"name": "wild offset", "frames": [[0, 0, 8, 8, 99999999, 0]]},
+        {"name": "zero", "grid": {"x": 0, "y": 0, "w": 64, "h": 32, "frame_w": 0, "frame_h": 8}},
+        {"name": "fast", "fps": 1e9, "frames": [[0, 0, 4, 4]]},
+        {"name": "text", "fps": "12", "frames": [[0, 0, 4, 4]]},
+        {"name": "both", "grid": {"x": 0, "y": 0, "w": 8, "h": 8, "frame_w": 8, "frame_h": 8}, "frames": [[0, 0, 4, 4]]},
+        {"name": "neither"},
+        {"name": "empty", "frames": []},
+        {"name": " padded ", "frames": [[0, 0, 4, 4]]},
+        {"name": "", "frames": [[0, 0, 4, 4]]},
+        {"name": "bidi\u{202e}", "frames": [[0, 0, 4, 4]]},
+        {"name": "x".repeat(65), "frames": [[0, 0, 4, 4]]},
+        {"name": 7, "frames": [[0, 0, 4, 4]]},
+        {"frames": [[0, 0, 4, 4]]},
+        "text", null, 4, [],
+        {"name": "last", "frames": [{"x": 3, "y": 3, "w": 5, "h": 5, "offset_x": -2, "offset_y": 2}, [0, 0, 4, 4]]},
+    ]});
+    write(&p, &magic, &[plain.as_slice(), &chunk(b"ANMS", hostile.to_string().as_bytes())].concat());
+    let mut e = Engine::new("headless");
+    e.exec("open_document", &json!({"path": p})).unwrap();
+    assert_eq!(names(&e.doc.anims), "ok,last");
+    assert_eq!((e.doc.anims[0].grid().unwrap().limit, e.doc.anims[1].bounds()), (0, (-2, 0, 6, 7)));
+    for i in 0..2 {
+        e.exec("anim_control", &json!({"name": e.doc.anims[i].name, "step": -1})).unwrap();
+    }
+    // Too many of anything is cut off, not allocated.
+    let many: Vec<Value> = (0..Anim::MAX + 50).map(|i| json!({"name": format!("a{i}"), "frames": [[0, 0, 1, 1]]})).collect();
+    let long: Vec<Value> = (0..Anim::MAX_FRAMES + 1).map(|_| json!([0, 0, 1, 1])).collect();
+    for (body, n) in [(json!({"format": "jon-motion-animations", "animations": many}), 0), (json!({"format": "jon-motion-animations", "animations": [{"name": "long", "frames": long}]}), 0)] {
+        write(&p, &magic, &[plain.as_slice(), &chunk(b"ANMS", body.to_string().as_bytes())].concat());
+        assert_eq!(crate::io::load_doc(path).unwrap().anims.len(), n);
+    }
+}
+
+#[test]
+fn a_document_holds_many_named_animations() {
+    use crate::doc::*;
+    let mut e = eng(128, 64);
+    let names = |e: &mut Engine| e.exec("anim_list", &json!({})).unwrap()["animations"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap().to_string()).collect::<Vec<_>>().join(",");
+    assert_eq!(e.exec("anim_list", &json!({})).unwrap(), json!({"current": null, "animations": []}));
+
+    // A name that is not in use makes a new animation and puts it on show; with no name the
+    // one on show is changed.
+    let v = e.exec("anim_set", &json!({"name": "walk", "x": 0, "y": 0, "w": 64, "h": 16, "frame_w": 16, "frame_h": 16})).unwrap();
+    assert_eq!((v["name"].as_str(), v["kind"].as_str(), v["frames"].as_i64(), v["index"].as_i64(), v["count"].as_i64()), (Some("walk"), Some("grid"), Some(4), Some(0), Some(1)));
+    let v = e.exec("anim_set", &json!({"name": "run", "x": 0, "y": 16, "w": 96, "h": 16, "frame_w": 16, "frame_h": 16, "fps": 20})).unwrap();
+    assert_eq!((v["name"].as_str(), v["frames"].as_i64(), v["index"].as_i64(), v["current"].as_bool(), v["playing"].as_bool()), (Some("run"), Some(6), Some(1), Some(true), Some(true)));
+    e.exec("anim_set", &json!({"frames": 5})).unwrap();
+    assert_eq!((e.doc.anims[0].count(), e.doc.anims[1].count()), (4, 5), "no name means the one on show");
+    // Naming another one changes it without taking over the display.
+    let v = e.exec("anim_set", &json!({"name": "walk", "fps": 30})).unwrap();
+    assert_eq!((v["fps"].as_f64(), v["current"].as_bool(), v["playing"].as_bool(), e.view.anim_index), (Some(30.0), Some(false), Some(false), 1));
+    assert_eq!(e.exec("anim_info", &json!({})).unwrap()["name"], "run");
+    assert_eq!(e.exec("anim_info", &json!({"name": "walk"})).unwrap()["frames"], 4);
+    assert!(e.exec("anim_info", &json!({"name": "nope"})).is_err());
+
+    // A frame list: every frame its own rectangle, with offsets that keep trimmed frames lined up.
+    let v = e.exec("anim_frames", &json!({"name": "jump", "fps": 12, "frames": [[0, 32, 10, 20], [10, 32, 14, 24, -2, -4], {"x": 24, "y": 32, "w": 8, "h": 8, "offset_x": 1, "offset_y": 12}]})).unwrap();
+    assert_eq!((v["kind"].as_str(), v["frames"].as_i64(), v["box_w"].as_i64(), v["box_h"].as_i64(), v["index"].as_i64()), (Some("frames"), Some(3), Some(14), Some(24), Some(2)));
+    let v = e.exec("anim_control", &json!({"step": 1, "playing": false})).unwrap();
+    assert_eq!((v["frame_x"].as_i64(), v["frame_w"].as_i64(), v["frame_h"].as_i64(), v["offset_x"].as_i64(), v["offset_y"].as_i64()), (Some(10), Some(14), Some(24), Some(-2), Some(-4)));
+    assert_eq!(e.exec("anim_control", &json!({"step": 2})).unwrap()["frame"], 0, "stepping wraps");
+    // On a frame list anim_set changes the speed and nothing else, and a name that is not in
+    // use is only a new animation when it comes with a region or frame size.
+    assert_eq!(e.exec("anim_set", &json!({"fps": 6})).unwrap()["kind"], "frames");
+    assert!(e.exec("anim_set", &json!({"frames": 1})).unwrap_err().contains("frame list"));
+    assert!(e.exec("anim_set", &json!({"name": "jump", "frame_w": 8, "fps": 3})).is_err());
+    assert_eq!((e.doc.anims[2].fps, e.doc.anims[2].count()), (6.0, 3));
+    assert!(e.exec("anim_set", &json!({"name": "wlak", "fps": 20})).unwrap_err().contains("no animation named"));
+    e.exec("anim_set", &json!({"name": "walk", "fps": 8.3})).unwrap();
+    assert_eq!(e.exec("anim_info", &json!({"name": "walk"})).unwrap()["fps"], 8.3, "a speed reads back as it was given");
+    e.exec("anim_set", &json!({"name": "walk", "fps": 30})).unwrap();
+    for bad in [
+        json!({"frames": []}), json!({"frames": [[0, 0, 4]]}), json!({"frames": [[0, 0, 0, 4]]}), json!({"frames": [[120, 0, 16, 4]]}), json!({"frames": [[-1, 0, 4, 4]]}),
+        json!({"frames": [[0.5, 0, 4, 4]]}), json!({"frames": [[0, 0, 4, 4, 5000, 0]]}), json!({"frames": [["a", 0, 4, 4]]}), json!({"frames": "all"}), json!({"frames": [[0, 0, 4, 4]], "fps": 0}),
+        json!({"frames": [[0, 0, 4, 4]], "name": ""}), json!({"frames": [[0, 0, 4, 4]], "name": " x"}), json!({"frames": [[0, 0, 4, 4]], "name": "a\nb"}), json!({"frames": [[0, 0, 4, 4]], "name": "y".repeat(65)}),
+        json!({"frames": (0..Anim::MAX_FRAMES + 1).map(|_| json!([0, 0, 1, 1])).collect::<Vec<_>>()}),
+    ] {
+        assert!(e.exec("anim_frames", &bad).is_err(), "{:.80} is refused", bad.to_string());
+    }
+    assert_eq!((names(&mut e), e.doc.anims[2].count()), ("walk,run,jump".to_string(), 3), "a refused change leaves everything alone");
+
+    // Choosing which is on show is playback, not a document change.
+    let (undo, doc) = (e.undo.len(), e.doc.clone());
+    e.modified = false;
+    let v = e.exec("anim_control", &json!({"name": "walk", "frame": 2})).unwrap();
+    assert_eq!((v["name"].as_str(), v["frame"].as_i64(), v["frame_x"].as_i64(), e.view.anim_index), (Some("walk"), Some(2), Some(32), 0));
+    assert_eq!(e.exec("anim_control", &json!({"name": "run"})).unwrap()["frame"], 0, "another animation starts at its first frame");
+    assert!(e.exec("anim_control", &json!({"name": "nope"})).is_err());
+    assert!(e.undo.len() == undo && !e.modified && e.doc == doc);
+
+    // Rename, remove, undo.
+    assert!(e.exec("anim_rename", &json!({"to": "walk"})).is_err(), "names are unique");
+    assert!(e.exec("anim_rename", &json!({"to": "bad\u{202e}"})).is_err());
+    e.exec("anim_rename", &json!({"to": "run"})).unwrap();
+    e.exec("anim_rename", &json!({"name": "walk", "to": "stroll"})).unwrap();
+    assert_eq!(names(&mut e), "stroll,run,jump");
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!(names(&mut e), "walk,run,jump");
+    e.exec("anim_control", &json!({"name": "jump"})).unwrap();
+    e.exec("anim_clear", &json!({"name": "walk"})).unwrap();
+    assert_eq!((names(&mut e), e.exec("anim_info", &json!({})).unwrap()["name"].as_str().map(str::to_string)), ("run,jump".to_string(), Some("jump".to_string())), "the one on show stays on show");
+    assert!(e.exec("anim_clear", &json!({"name": "walk"})).is_err());
+    e.exec("anim_clear", &json!({})).unwrap();
+    assert_eq!(names(&mut e), "run");
+    e.exec("anim_clear", &json!({"all": true})).unwrap();
+    assert_eq!(e.exec("anim_info", &json!({})).unwrap()["active"], false);
+    e.exec("anim_clear", &json!({})).unwrap();
+    for _ in 0..3 {
+        e.exec("undo", &json!({})).unwrap();
+    }
+    assert_eq!(names(&mut e), "walk,run,jump");
+    // New ones get a name of their own.
+    e.exec("anim_clear", &json!({"all": true})).unwrap();
+    e.exec("anim_set", &json!({})).unwrap();
+    e.exec("anim_set", &json!({"name": "Animation 2", "frame_w": 8})).unwrap();
+    assert_eq!(crate::commands::fresh_anim_name(&e.doc), "Animation 3");
+    e.exec("undo", &json!({})).unwrap();
+    e.exec("undo", &json!({})).unwrap();
+    e.exec("undo", &json!({})).unwrap();
+
+    // All of it is saved in the project.
+    let p = tmp("named.jmn");
+    e.exec("save_document", &json!({"path": p})).unwrap();
+    let saved = e.doc.anims.clone();
+    e.exec("new_document", &json!({"width": 8, "height": 8, "force": true})).unwrap();
+    e.exec("open_document", &json!({"path": p})).unwrap();
+    assert_eq!(e.doc.anims, saved);
+
+    // An animation that no longer fits the image goes (the others stay), and undo brings it back.
+    e.exec("resize_canvas", &json!({"width": 80, "height": 64})).unwrap();
+    assert_eq!(names(&mut e), "walk,jump");
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!(e.doc.anims, saved);
+    // A document may hold only so many.
+    let mut full = eng(8, 8);
+    for i in 0..Anim::MAX {
+        full.doc.anims.push(Anim { name: format!("a{i}"), fps: 8.0, frames: Frames::Grid(Grid { x: 0, y: 0, w: 8, h: 8, fw: 8, fh: 8, limit: 0 }) });
+    }
+    assert!(full.exec("anim_set", &json!({"name": "one more", "frame_w": 8, "frame_h": 8})).unwrap_err().contains("at most"));
+
+    // ---- JSON: export, edit by hand, import
+    let file = tmp("anims.json");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(e.exec("anim_export_json", &json!({"path": file})).unwrap()["animations"], 3);
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!((v["format"].as_str(), v["version"].as_i64(), v["image"]["width"].as_i64(), v["animations"].as_array().unwrap().len()), (Some("jon-motion-animations"), Some(1), Some(128), 3));
+    assert_eq!(v["animations"][0], json!({"name": "walk", "fps": 30, "grid": {"x": 0, "y": 0, "w": 64, "h": 16, "frame_w": 16, "frame_h": 16, "frames": 0}}));
+    assert_eq!((&v["animations"][2]["frames"][0], &v["animations"][2]["frames"][1]), (&json!([0, 32, 10, 20]), &json!([10, 32, 14, 24, -2, -4])));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("\n      [10, 32, 14, 24, -2, -4],\n") && text.contains("\"fps\": 30,"), "one frame per line, speeds as typed:\n{text}");
+    // It round-trips, onto an empty document or over the same names.
+    e.exec("anim_clear", &json!({"all": true})).unwrap();
+    assert_eq!(e.exec("anim_import_json", &json!({"path": file})).unwrap()["imported"], 3);
+    assert_eq!(e.doc.anims, saved);
+    e.exec("anim_set", &json!({"name": "walk", "fps": 2})).unwrap();
+    e.exec("anim_set", &json!({"name": "mine", "x": 0, "y": 0, "w": 8, "h": 8, "frame_w": 8, "frame_h": 8})).unwrap();
+    let v = e.exec("anim_import_json", &json!({"path": file})).unwrap();
+    assert_eq!((v["imported"].as_i64(), v["count"].as_i64(), names(&mut e), e.doc.anims[0].fps), (Some(3), Some(4), "walk,run,jump,mine".to_string(), 30.0), "same names are replaced, the rest kept");
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!(e.doc.anims[0].fps, 2.0, "an import is one undo step");
+    e.exec("anim_import_json", &json!({"path": file, "replace": true})).unwrap();
+    assert_eq!(e.doc.anims, saved);
+
+    // Export never writes over a file that is not an animations file, and only writes .json.
+    let other = tmp("package.json");
+    std::fs::write(&other, r#"{"name": "someone else's"}"#).unwrap();
+    assert!(e.exec("anim_export_json", &json!({"path": other})).is_err());
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), r#"{"name": "someone else's"}"#);
+    std::fs::write(&other, "").unwrap();
+    assert!(e.exec("anim_export_json", &json!({"path": other})).is_err(), "not even an empty one");
+    assert!(e.exec("anim_export_json", &json!({"path": tmp("anims.txt")})).is_err());
+    let dir = tmp("folder.json");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(e.exec("anim_export_json", &json!({"path": dir})).is_err() && std::path::Path::new(&dir).is_dir());
+    e.exec("anim_export_json", &json!({"path": file})).unwrap();
+    let mut none = eng(8, 8);
+    assert!(none.exec("anim_export_json", &json!({"path": file})).is_err(), "nothing to export leaves the file alone");
+
+    // Nor over a file that merely carries the format marker among other things, nor into the app's own folder.
+    std::fs::write(&other, json!({"format": "jon-motion-animations", "animations": [], "keymap": "dpaint", "recent": []}).to_string()).unwrap();
+    assert!(e.exec("anim_export_json", &json!({"path": other})).is_err());
+    assert!(std::fs::read_to_string(&other).unwrap().contains("keymap"));
+    let app_dir = std::path::Path::new(&dir);
+    assert!(crate::commands::anim_export_allowed(&app_dir.join("settings.json"), Some(app_dir)).unwrap_err().contains("settings folder"));
+    assert!(crate::commands::anim_export_allowed(&app_dir.join("..").join("folder.json").join("x.json"), Some(app_dir)).is_err(), "however the folder is spelled");
+    assert!(crate::commands::anim_export_allowed(std::path::Path::new(&tmp("fresh.json")), Some(app_dir)).is_ok());
+
+    // A document holds only so many frame-list frames, so its largest export can be read back.
+    let mut big = eng(8, 8);
+    let frames: Vec<Value> = (0..Anim::MAX_FRAMES).map(|i| json!([i % 4, 0, 4, 8, -1, i % 3])).collect();
+    for i in 0..Anim::MAX_LIST_FRAMES / Anim::MAX_FRAMES {
+        big.exec("anim_frames", &json!({"name": format!("n{i}"), "frames": frames})).unwrap();
+    }
+    assert!(big.exec("anim_frames", &json!({"name": "over", "frames": [[0, 0, 1, 1]]})).unwrap_err().contains("in all"));
+    big.exec("anim_set", &json!({"name": "grids are not counted", "frame_w": 4, "frame_h": 4})).unwrap();
+    big.exec("anim_frames", &json!({"name": "n0", "frames": frames})).unwrap();
+    let (max_file, max_jmn) = (tmp("max.json"), tmp("max.jmn"));
+    let _ = std::fs::remove_file(&max_file);
+    big.exec("anim_export_json", &json!({"path": max_file})).unwrap();
+    assert!(std::fs::metadata(&max_file).unwrap().len() < crate::io::ANIM_JSON_MAX);
+    let all = big.doc.anims.clone();
+    big.exec("anim_import_json", &json!({"path": max_file, "replace": true})).unwrap();
+    assert_eq!(big.doc.anims, all);
+    big.exec("save_document", &json!({"path": max_jmn})).unwrap();
+    assert_eq!(crate::io::load_doc(std::path::Path::new(&max_jmn)).unwrap().anims, all);
+    let mut small = eng(8, 8);
+    small.exec("anim_frames", &json!({"name": "mine", "frames": [[0, 0, 1, 1]]})).unwrap();
+    assert!(small.exec("anim_import_json", &json!({"path": max_file})).unwrap_err().contains("frame-list frames"));
+
+    // After an undo changes the list, the animation that was on show stays on show.
+    let mut u = eng(32, 32);
+    for n in ["a", "b", "c"] {
+        u.exec("anim_set", &json!({"name": n, "frame_w": 8})).unwrap();
+    }
+    u.exec("anim_control", &json!({"name": "c"})).unwrap();
+    u.exec("anim_clear", &json!({"name": "a"})).unwrap();
+    assert_eq!(u.anim().unwrap().name, "c");
+    u.exec("undo", &json!({})).unwrap();
+    assert_eq!((u.anim().unwrap().name.as_str(), u.view.anim_index), ("c", 2));
+    u.exec("anim_rename", &json!({"to": "sea"})).unwrap();
+    u.exec("anim_clear", &json!({"name": "b"})).unwrap();
+    assert_eq!(u.anim().unwrap().name, "sea");
+
+    // Import is all or nothing, and a file can say anything.
+    let before = e.doc.anims.clone();
+    let wrap = |anims: Value| json!({"format": "jon-motion-animations", "version": 1, "animations": anims}).to_string();
+    let one = json!({"name": "new", "frames": [[0, 0, 4, 4]]});
+    for (text, why) in [
+        (wrap(json!([one, {"name": "off", "frames": [[127, 0, 4, 4]]}])), "\"off\""),
+        (wrap(json!([one, one])), "two animations"),
+        (wrap(json!([{"name": "neg", "frames": [[0, -4, 4, 4]]}])), "\"neg\""),
+        (wrap(json!([{"name": "frac", "grid": {"x": 0, "y": 0, "w": 8.5, "h": 8, "frame_w": 4, "frame_h": 4}}])), "whole number"),
+        (wrap(json!([{"name": "big", "grid": {"x": 0, "y": 0, "w": 1e12, "h": 8, "frame_w": 4, "frame_h": 4}}])), "whole number"),
+        (wrap(json!([{"name": "fps", "fps": -1, "frames": [[0, 0, 4, 4]]}])), "fps"),
+        (wrap(json!([{"name": "", "frames": [[0, 0, 4, 4]]}])), "animation 0"),
+        (wrap(json!([{"name": "ctl\u{7}", "frames": [[0, 0, 4, 4]]}])), "animation 0"),
+        (wrap(json!([7])), "animation 0"),
+        (wrap(json!((0..Anim::MAX + 1).map(|i| json!({"name": format!("n{i}"), "frames": [[0, 0, 1, 1]]})).collect::<Vec<_>>())), "limit"),
+        (wrap(json!("no")), "animations"),
+        (json!({"animations": [one]}).to_string(), "format"),
+        (json!({"scale": 1, "prefix": "atlas_", "pages": 3, "objects": []}).to_string(), "format"),
+        ("[1, 2".to_string(), "not valid JSON"),
+        (String::new(), "not valid JSON"),
+    ] {
+        let bad = tmp("bad.json");
+        std::fs::write(&bad, &text).unwrap();
+        let err = e.exec("anim_import_json", &json!({"path": bad})).unwrap_err();
+        assert!(err.contains(why), "{:.60}: {err}", text);
+        assert!(!err.contains('\u{7}') && e.doc.anims == before);
+    }
+    assert!(e.exec("anim_import_json", &json!({"path": tmp("missing.json")})).is_err());
+    assert!(e.exec("anim_import_json", &json!({"path": p})).unwrap_err().contains(".json"), "only .json files are read");
+    let big = tmp("big.json");
+    std::fs::write(&big, vec![b' '; (8 << 20) + 1]).unwrap();
+    assert!(e.exec("anim_import_json", &json!({"path": big})).is_err());
+    std::fs::remove_file(&big).ok();
+    // The limit counts what the document would end up with.
+    assert!(full.exec("anim_import_json", &json!({"path": file})).is_err() && full.doc.anims.len() == Anim::MAX);
+
+    // Scripts can do all of it.
+    let out = script::run_lua(&mut e, "jm.anim_frames{ name = 'lua', frames = { {0, 0, 8, 8}, {8, 0, 8, 8, 1, 1} } } local n = 0 for _, a in ipairs(jm.anim_list().animations) do n = n + a.frames end return n");
+    assert_eq!((out.error, out.result), (None, json!(4 + 5 + 3 + 2)));
 }
 
 #[test]
@@ -990,7 +1317,7 @@ fn animation_keys_apply_over_its_tab_only() {
     assert_eq!(sel_x(&e), 9);
 
     crate::panels::animate_selection(&mut e, &mut g);
-    let a = e.doc.anim.unwrap();
+    let a = e.anim().unwrap().grid().unwrap();
     assert_eq!((a.x, a.y, a.w, a.h, a.count()), (9, 8, 32, 16, 2), "the selection is the strip; frames are grid sized");
     assert_eq!(g.show_tab, Some(crate::app::Tab::Anim));
     e.exec("anim_set", &json!({"frame_w": 8, "frame_h": 8, "fps": 10})).unwrap();

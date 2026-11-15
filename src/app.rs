@@ -106,6 +106,8 @@ pub struct Gui {
     pub anim_clock: f64,
     /// Frame size typed in before an animation exists; `None` follows the grid size.
     pub anim_size: Option<(u32, u32)>,
+    /// The animation's name while it is being typed in the Animation tab.
+    pub anim_name: Option<(String, String)>,
     /// A tab to bring to the front.
     pub show_tab: Option<Tab>,
     /// Files opened or saved from this window, newest first. Window state only: no command,
@@ -160,6 +162,7 @@ impl Gui {
             anim_rect: egui::Rect::NOTHING,
             anim_clock: 0.0,
             anim_size: None,
+            anim_name: None,
             show_tab: None,
             recent: vec![],
             recent_dirty: false,
@@ -677,7 +680,7 @@ pub fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
     let plain = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
     // With the pointer over the Animation tab, Left / Right and Space drive the animation. Anywhere
     // else they keep their usual jobs: the arrows nudge the selection, and Space held pans the canvas.
-    if e.doc.anim.is_some() && ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| anim_rect.contains(p)) {
+    if e.anim().is_some() && ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| anim_rect.contains(p)) {
         if plain(Key::Space) {
             g.run(e, "anim_control", json!({ "playing": !e.view.anim_playing }));
         }

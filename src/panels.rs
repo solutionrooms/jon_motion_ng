@@ -814,17 +814,27 @@ pub fn preview(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
 // ------------------------------------------------------------------ animation
 
 /// Point the animation at the selection, or at the whole image when nothing is selected.
+/// Make a new animation from the selection (or the whole image) and put it on show.
 pub fn animate_selection(e: &mut Engine, g: &mut Gui) {
     let (x, y, w, h) = match e.doc.sel_bounds() {
         Some((x0, y0, x1, y1)) => (x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32),
         None => (0, 0, e.doc.w, e.doc.h),
     };
-    // Keep the frame size in use, shrunk if the new region is smaller than one frame.
-    let (fw, fh) = e.doc.anim.map(|a| (a.fw, a.fh)).or(g.anim_size).unwrap_or((e.view.grid_w, e.view.grid_h));
-    let p = json!({ "x": x, "y": y, "w": w, "h": h, "frame_w": fw.clamp(1, w), "frame_h": fh.clamp(1, h) });
+    // Start from the frame size in use, shrunk if the region is smaller than one frame.
+    let (fw, fh) = e.anim().and_then(|a| a.grid()).map(|a| (a.fw, a.fh)).or(g.anim_size).unwrap_or((e.view.grid_w, e.view.grid_h));
+    let name = crate::commands::fresh_anim_name(&e.doc);
+    let p = json!({ "name": name, "x": x, "y": y, "w": w, "h": h, "frame_w": fw.clamp(1, w), "frame_h": fh.clamp(1, h) });
     if let Some(v) = g.run(e, "anim_set", p) {
-        g.info(format!("Animating {} frames of {}x{} - Left / Right step and Space plays over the Animation tab", v["frames"], v["frame_w"], v["frame_h"]));
+        g.info(format!("{name}: {} frames of {}x{} - Left / Right step and Space plays over the Animation tab", v["frames"], v["frame_w"], v["frame_h"]));
         g.show_tab = Some(crate::app::Tab::Anim);
+    }
+}
+
+fn anim_import(e: &mut Engine, g: &mut Gui) {
+    if let Some(p) = rfd::FileDialog::new().add_filter("Animations (JSON)", &["json"]).pick_file() {
+        if let Some(v) = g.run(e, "anim_import_json", json!({ "path": p.display().to_string() })) {
+            g.info(format!("Imported {} animations from {}", v["imported"], p.display()));
+        }
     }
 }
 
@@ -832,7 +842,7 @@ pub fn animation(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     g.anim_rect = ui.max_rect();
     ui.add_space(2.0);
     let source = if e.doc.sel_bounds().is_some() { "selection" } else { "whole image" };
-    let Some(a) = e.doc.anim else {
+    let Some(a) = e.anim().cloned() else {
         ui.label("Plays part of the image as an animation. Select the frames on the canvas and set the size of one frame; they are read left to right, then top to bottom.");
         ui.add_space(4.0);
         let mut size = g.anim_size.unwrap_or((e.view.grid_w, e.view.grid_h));
@@ -851,11 +861,67 @@ pub fn animation(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
                 g.anim_size = Some(size);
             }
         });
-        if ui.button(format!("Animate the {source}")).clicked() {
-            animate_selection(e, g);
-        }
+        ui.horizontal(|ui| {
+            if ui.button(format!("Animate the {source}")).clicked() {
+                animate_selection(e, g);
+            }
+            if ui.button("Import...").on_hover_text("Read animations from a JSON file").clicked() {
+                anim_import(e, g);
+            }
+        });
         return;
     };
+
+    // Which animation, and the ones beside it.
+    let index = e.view.anim_index;
+    ui.horizontal_wrapped(|ui| {
+        let mut pick = None;
+        egui::ComboBox::from_id_salt("anim_pick").width(120.0).selected_text(a.name.clone()).show_ui(ui, |ui| {
+            for (i, x) in e.doc.anims.iter().enumerate() {
+                if ui.selectable_label(i == index, format!("{}  ({})", x.name, x.count())).clicked() {
+                    pick = Some(x.name.clone());
+                }
+            }
+        });
+        if let Some(name) = pick {
+            g.anim_name = None;
+            g.run(e, "anim_control", json!({ "name": name }));
+        }
+        if ui.button("New").on_hover_text(format!("A new animation from the {source}")).clicked() {
+            g.anim_name = None;
+            animate_selection(e, g);
+        }
+        if ui.button("Remove").on_hover_text("Remove this animation's setup; no pixels change").clicked() {
+            g.anim_name = None;
+            g.run(e, "anim_clear", json!({ "name": a.name }));
+        }
+        if ui.button("Import...").on_hover_text("Read animations from a JSON file; one with the name of an existing animation replaces it").clicked() {
+            anim_import(e, g);
+        }
+        if ui.button("Export...").on_hover_text("Write every animation to a JSON file").clicked() {
+            if let Some(p) = rfd::FileDialog::new().add_filter("Animations (JSON)", &["json"]).set_file_name("animations.json").save_file() {
+                if g.run(e, "anim_export_json", json!({ "path": p.display().to_string() })).is_some() {
+                    g.info(format!("Exported {}", p.display()));
+                }
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        // The text belongs to the animation it was typed for, whichever is on show when it is applied.
+        let (of, mut name) = g.anim_name.clone().unwrap_or_else(|| (a.name.clone(), a.name.clone()));
+        let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0).char_limit(Anim::NAME_MAX));
+        if r.changed() {
+            g.anim_name = Some((of, name.clone()));
+        }
+        if r.lost_focus() {
+            // Renamed when the field is left; a name that cannot be used is reported and dropped.
+            if let Some((of, to)) = g.anim_name.take().map(|(of, n)| (of, n.trim().to_string())).filter(|(of, n)| n != of) {
+                g.run(e, "anim_rename", json!({ "name": of, "to": to }));
+            }
+        }
+    });
+    let Some(a) = e.anim().cloned() else { return };
 
     // Playback: move on by however many frames are due.
     let now = ui.input(|i| i.time);
@@ -887,62 +953,83 @@ pub fn animation(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     });
     // Setup changes go through anim_set, so they are saved, undoable and visible to scripts.
     let mut set = serde_json::Map::new();
-    let (mut fw, mut fh, mut limit, mut speed) = (a.fw, a.fh, a.limit, a.fps);
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Frame size");
-        if ui.add(egui::DragValue::new(&mut fw).range(1..=a.w)).changed() {
-            set.insert("frame_w".into(), json!(fw));
+    let mut speed = a.fps;
+    match a.grid() {
+        Some(grid) => {
+            let (mut fw, mut fh, mut limit) = (grid.fw, grid.fh, grid.limit);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Frame size");
+                if ui.add(egui::DragValue::new(&mut fw).range(1..=grid.w)).changed() {
+                    set.insert("frame_w".into(), json!(fw));
+                }
+                ui.label("x");
+                if ui.add(egui::DragValue::new(&mut fh).range(1..=grid.h)).changed() {
+                    set.insert("frame_h".into(), json!(fh));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Frames");
+                let frames = egui::DragValue::new(&mut limit).range(0..=grid.total()).custom_formatter(|v, _| if v < 1.0 { "all".into() } else { format!("{v:.0}") });
+                if ui.add(frames).on_hover_text("How many frames play; 0 plays all of them. Use it to stop before empty cells in the last row.").changed() {
+                    set.insert("frames".into(), json!(limit));
+                }
+                ui.label("Speed");
+                if ui.add(egui::DragValue::new(&mut speed).range(Anim::FPS).speed(0.1).max_decimals(1).suffix(" fps")).changed() {
+                    set.insert("fps".into(), json!(speed));
+                }
+            });
         }
-        ui.label("x");
-        if ui.add(egui::DragValue::new(&mut fh).range(1..=a.h)).changed() {
-            set.insert("frame_h".into(), json!(fh));
+        None => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Speed");
+                if ui.add(egui::DragValue::new(&mut speed).range(Anim::FPS).speed(0.1).max_decimals(1).suffix(" fps")).changed() {
+                    set.insert("fps".into(), json!(speed));
+                }
+                ui.weak(format!("{n} frames, each its own rectangle (set by a script, an AI client or a JSON file)"));
+            });
         }
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Frames");
-        let frames = egui::DragValue::new(&mut limit).range(0..=a.total()).custom_formatter(|v, _| if v < 1.0 { "all".into() } else { format!("{v:.0}") });
-        if ui.add(frames).on_hover_text("How many frames play; 0 plays all of them. Use it to stop before empty cells in the last row.").changed() {
-            set.insert("frames".into(), json!(limit));
-        }
-        ui.label("Speed");
-        if ui.add(egui::DragValue::new(&mut speed).range(Anim::FPS).speed(0.1).max_decimals(1).suffix(" fps")).changed() {
-            set.insert("fps".into(), json!(speed));
-        }
-    });
+    }
     if !set.is_empty() {
-        if let Err(err) = e.exec_coalesced("anim_set", &serde_json::Value::Object(set), "anim") {
+        set.insert("name".into(), json!(a.name));
+        if let Err(err) = e.exec_coalesced("anim_set", &serde_json::Value::Object(set), &format!("anim:{}", a.name)) {
             g.error(err);
         }
     }
-    ui.horizontal_wrapped(|ui| {
-        if ui.button(format!("Use the {source}")).on_hover_text("Cut the frames from the selection instead (or from the whole image when nothing is selected)").clicked() {
-            animate_selection(e, g);
-        }
-        if ui.button("Remove").on_hover_text("Remove the animation setup; no pixels change").clicked() {
-            g.run(e, "anim_clear", json!({}));
-        }
-        ui.weak(format!("{}x{} at {},{}", a.w, a.h, a.x, a.y));
-    });
+    if let Some(grid) = a.grid() {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(format!("Use the {source}")).on_hover_text("Cut this animation's frames from the selection instead (or from the whole image when nothing is selected)").clicked() {
+                let (x, y, w, h) = match e.doc.sel_bounds() {
+                    Some((x0, y0, x1, y1)) => (x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32),
+                    None => (0, 0, e.doc.w, e.doc.h),
+                };
+                g.run(e, "anim_set", json!({ "name": a.name, "x": x, "y": y, "w": w, "h": h, "frame_w": grid.fw.clamp(1, w), "frame_h": grid.fh.clamp(1, h) }));
+            }
+            ui.weak(format!("{}x{} at {},{}", grid.w, grid.h, grid.x, grid.y));
+        });
+    }
     ui.checkbox(&mut e.view.anim_guides, "Show frames on the canvas").on_hover_text("Lines where the cuts fall, with the cells that do not play dimmed (also View > Animation Frames)");
     ui.weak("Left / Right step and Space plays while the pointer is over this tab.");
 
-    let Some(a) = e.doc.anim else { return };
+    let Some(a) = e.anim().cloned() else { return };
+    let Some(f) = a.frame(e.view.anim_frame.min(a.count().saturating_sub(1))) else { return };
     canvas::update_texture(ui.ctx(), e, g);
     let avail = ui.available_size();
     if avail.x < 16.0 || avail.y < 16.0 {
         return;
     }
     let (resp, p) = ui.allocate_painter(avail, Sense::hover());
-    let (fx, fy) = a.origin(e.view.anim_frame.min(a.count().saturating_sub(1)));
-    let (fw, fh, dw, dh) = (a.fw as f32, a.fh as f32, e.doc.w as f32, e.doc.h as f32);
-    let fit = ((avail.x - 8.0) / fw).min((avail.y - 8.0) / fh);
+    // The box holds every frame at its offset, so frames of different sizes stay lined up.
+    let (bx, by, bw, bh) = a.bounds();
+    let (bw, bh, dw, dh) = (bw as f32, bh as f32, e.doc.w as f32, e.doc.h as f32);
+    let fit = ((avail.x - 8.0) / bw).min((avail.y - 8.0) / bh);
     let scale = if fit >= 1.0 { fit.floor() } else { fit.max(0.01) };
-    let r = Rect::from_center_size(resp.rect.center(), vec2(fw, fh) * scale);
+    let r = Rect::from_center_size(resp.rect.center(), vec2(bw, bh) * scale);
     if let Some(t) = &g.tex {
         // The frame is cut from the canvas texture, so it shows exactly what the canvas shows
         // (visible layers, colour cycling) and follows edits as they are drawn.
-        let uv = Rect::from_min_max(pos2(fx as f32 / dw, fy as f32 / dh), pos2((fx as f32 + fw) / dw, (fy as f32 + fh) / dh));
-        p.image(t.id(), r, uv, Color32::WHITE);
+        let at = r.min + vec2((f.ox - bx) as f32, (f.oy - by) as f32) * scale;
+        let uv = Rect::from_min_max(pos2(f.x as f32 / dw, f.y as f32 / dh), pos2((f.x + f.w) as f32 / dw, (f.y + f.h) as f32 / dh));
+        p.image(t.id(), Rect::from_min_size(at, vec2(f.w as f32, f.h as f32) * scale), uv, Color32::WHITE);
     }
     p.rect_stroke(r, 0.0, Stroke::new(1.0_f32, Color32::from_white_alpha(40)), StrokeKind::Outside);
 }

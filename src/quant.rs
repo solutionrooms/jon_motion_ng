@@ -183,7 +183,12 @@ pub fn palette_for<'a>(px: impl Iterator<Item = &'a [u8; 4]>, n: usize) -> Palet
     let mut exact = true;
     // Per bin: pixel count and channel sums, so each bin is represented by its mean colour.
     let mut bins = vec![(0u32, [0u64; 3]); 1 << 15];
-    for p in px.filter(|p| p[3] >= 128) {
+    let mut transparent = false;
+    for p in px {
+        if p[3] < 128 {
+            transparent = true;
+            continue;
+        }
         let b = &mut bins[(p[0] as usize >> 3) << 10 | (p[1] as usize >> 3) << 5 | p[2] as usize >> 3];
         b.0 = b.0.saturating_add(1);
         for k in 0..3 {
@@ -201,7 +206,9 @@ pub fn palette_for<'a>(px: impl Iterator<Item = &'a [u8; 4]>, n: usize) -> Palet
             *hist.entry([(sum[0] / c) as u8, (sum[1] / c) as u8, (sum[2] / c) as u8]).or_insert(0) += *count;
         }
     }
-    let mut colors = median_cut(&hist, n.clamp(1, 256));
+    // An indexed PNG spends one palette entry on transparency, so an image with transparent
+    // pixels gets at most 255 colours and can always be exported.
+    let mut colors = median_cut(&hist, n.clamp(1, if transparent { 255 } else { 256 }));
     if colors.is_empty() {
         colors.push([0, 0, 0]);
     }

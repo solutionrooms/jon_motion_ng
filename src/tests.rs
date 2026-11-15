@@ -681,6 +681,37 @@ fn right_clicking_a_tool_selects_it_and_opens_its_options() {
 }
 
 #[test]
+fn a_converted_image_with_transparency_can_always_be_exported() {
+    // Far more than 256 colours, and a transparent corner.
+    let (w, h) = (96u32, 96u32);
+    let mut rgba = vec![];
+    for y in 0..h {
+        for x in 0..w {
+            rgba.extend_from_slice(&if x < 8 && y < 8 { [0, 0, 0, 0] } else { [(x * 5 / 2) as u8, (y * 5 / 2) as u8, ((x * 7 + y * 13) % 256) as u8, 255] });
+        }
+    }
+    let (src, out, opaque) = (tmp("many_transparent.png"), tmp("many_transparent_out.png"), tmp("many_opaque.png"));
+    std::fs::write(&src, crate::io::encode_png_rgba(w, h, &rgba).unwrap()).unwrap();
+    let mut e = Engine::new("headless");
+    e.exec("open_document", &json!({"path": src})).unwrap();
+    assert_eq!(e.doc.palette.colors.len(), 255, "one entry is left for transparency");
+    e.exec("export_png", &json!({"path": out})).unwrap();
+    e.exec("open_document", &json!({"path": out, "force": true})).unwrap();
+    assert_eq!((pixel(&mut e, 0, 0), e.doc.palette.colors.len()), (-1, 255), "the transparent corner survives the round trip");
+    assert!(pixel(&mut e, 50, 50) >= 0);
+    // Asking for 256 generated colours on such an image stops at 255 too.
+    e.exec("reduce_colors", &json!({"colors": 256})).unwrap();
+    assert!(e.doc.palette.colors.len() <= 255);
+    e.exec("export_png", &json!({"path": out})).unwrap();
+    // An image with no transparent pixel still gets all 256.
+    rgba.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+    std::fs::write(&opaque, crate::io::encode_png_rgba(w, h, &rgba).unwrap()).unwrap();
+    e.exec("open_document", &json!({"path": opaque, "force": true})).unwrap();
+    assert_eq!(e.doc.palette.colors.len(), 256);
+    e.exec("export_png", &json!({"path": out})).unwrap();
+}
+
+#[test]
 fn many_colour_images_convert_quickly_and_closely() {
     // Noise has far more colours than the exact paths handle; it takes the pooled route.
     let n = 512usize;

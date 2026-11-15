@@ -346,7 +346,7 @@ fn install_doc(e: &mut Engine, doc: Doc, path: Option<PathBuf>, blank: bool) {
     e.o.active_ramp = None;
     e.o.active_tile = 0;
     e.path = path;
-    e.legacy_tc = false;
+    e.old_file = false;
     e.modified = false;
     e.reset_history = true;
     e.view.fit = true;
@@ -761,7 +761,8 @@ fn document_cmds(b: &mut B) {
                 e.path_free(&p)?;
                 let (d, legacy) = io::load_doc_noting(&p)?;
                 install_doc(e, d, Some(p), false);
-                e.legacy_tc = legacy;
+                // The file is in the form older versions open unless it is a current true-colour project.
+                e.old_file = legacy || !e.doc.rgba();
                 let mut v = info(e);
                 if legacy {
                     // Saving it writes the true-colour form, which the version that made it cannot open.
@@ -776,8 +777,8 @@ fn document_cmds(b: &mut B) {
         "save_document",
         Read,
         "path:str? Destination .jmn file (default: the current file)",
-        "Save the project in the native .jmn format (layers, palette, ramps, tiles). Overwrites an existing file. Saving a true-colour project from 0.1.0-0.1.2 over itself \
-         rewrites it in the form 0.1.4 and older cannot open (rewrote_legacy_truecolor is then true); pass another path to keep the original.",
+        "Save the project in the native .jmn format (layers, palette, ramps, tiles). Overwrites an existing file. A true-colour document saved over a file that 0.1.4 and older \
+         could open (it was indexed when last opened or saved, or a true-colour project from 0.1.0-0.1.2) rewrites it in the form they cannot open, and rewrote_as_truecolor is then true. Pass another path to keep the original.",
         |e, a| {
             let p = match a.os("path")? {
                 Some(_) => path_arg(a, "jmn")?,
@@ -785,13 +786,13 @@ fn document_cmds(b: &mut B) {
             };
             e.path_free(&p)?;
             // Said in the answer, since a caller cannot be asked first the way the window asks.
-            let rewrote = e.legacy_rewrite() && e.path.as_ref() == Some(&p);
+            let rewrote = e.rewrites_old_file(&p);
             io::save_doc(&e.doc, &p)?;
             e.path = Some(p.clone());
             e.mark_saved();
             let mut v = json!({"path": p.display().to_string()});
             if rewrote {
-                v["rewrote_legacy_truecolor"] = json!(true);
+                v["rewrote_as_truecolor"] = json!(true);
             }
             Ok(v)
         },

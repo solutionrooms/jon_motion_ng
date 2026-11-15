@@ -41,8 +41,9 @@ pub enum Dialog {
     Dropped(PathBuf),
     /// Convert this indexed document to true colour? Asked first, because of what Save then writes.
     ToTrue,
-    /// Save a true-colour project from 0.1.0-0.1.2 over itself? `then` is what was waiting on the save.
-    LegacySave { then: Option<Pending> },
+    /// Save this true-colour document over a file older versions can still open? `then` is
+    /// what was waiting on the save.
+    OldFileSave { then: Option<Pending> },
 }
 
 pub enum Pending {
@@ -406,22 +407,23 @@ fn file_stem(e: &Engine) -> String {
 }
 
 pub fn save(e: &mut Engine, g: &mut Gui, save_as: bool) -> bool {
-    if !save_as && e.legacy_rewrite() {
-        // Rewriting an older version's true-colour project: asked first, and saved from the answer.
-        if !matches!(g.dialog, Dialog::LegacySave { .. }) {
-            g.dialog = Dialog::LegacySave { then: None };
-        }
-        return false;
-    }
-    save_now(e, g, save_as)
+    save_asking(e, g, save_as, false)
 }
 
-fn save_now(e: &mut Engine, g: &mut Gui, save_as: bool) -> bool {
+/// Save, unless that would rewrite a file older versions can open as a true-colour project
+/// they cannot: then the question is put first (`asked` is true once it has been answered).
+fn save_asking(e: &mut Engine, g: &mut Gui, save_as: bool, asked: bool) -> bool {
     let path = match (&e.path, save_as) {
         (Some(p), false) => Some(p.clone()),
         _ => rfd::FileDialog::new().add_filter("Jon Motion project", &["jmn"]).set_file_name(format!("{}.jmn", file_stem(e))).save_file(),
     };
     let Some(path) = path else { return false };
+    if !asked && e.rewrites_old_file(&path) {
+        if !matches!(g.dialog, Dialog::OldFileSave { .. }) {
+            g.dialog = Dialog::OldFileSave { then: None };
+        }
+        return false;
+    }
     let ok = g.run(e, "save_document", json!({ "path": path.display().to_string() })).is_some();
     if ok {
         g.info(format!("Saved {}", path.display()));
@@ -1427,17 +1429,19 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             let (ok, cancel) = buttons(ui, "Convert");
             if ok {
                 if g.run(e, "convert_mode", json!({ "mode": "truecolor" })).is_some() {
+                    // This was the question about what Save writes, so Save does not ask it again.
+                    e.old_file = false;
                     g.info("This document is now true colour (Edit > Undo goes back)");
                 }
                 close = true;
             }
             close |= cancel;
         }),
-        Dialog::LegacySave { then } => window(ctx, "Save Over the Original?", |ui| {
+        Dialog::OldFileSave { then } => window(ctx, "Save Over the Original?", |ui| {
             let name: String = e.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let name = if name.chars().count() > 48 { format!("{}...", name.chars().take(45).collect::<String>()) } else { name };
-            ui.label(format!("\"{name}\" is a true-colour project from an older version of Jon Motion."));
-            ui.label("Saving rewrites it in a form that versions 0.1.4 and older cannot open.");
+            ui.label(format!("\"{name}\" can be opened by Jon Motion 0.1.4 and older as it is now."));
+            ui.label("Saving this true-colour document over it writes a form those versions cannot open.");
             ui.weak("Save As... writes a new file and leaves the original as it is.");
             ui.add_space(8.0);
             let mut choice = None;
@@ -1453,7 +1457,7 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             if let Some(save_as) = choice {
                 close = true;
                 let then = then.take();
-                if save_now(e, g, save_as) {
+                if save_asking(e, g, save_as, true) {
                     if let Some(what) = then {
                         proceed(e, g, what);
                     }
@@ -1640,7 +1644,7 @@ pub fn answer(e: &mut Engine, g: &mut Gui, choice: u8) {
         return;
     }
     match choice {
-        0 if e.legacy_rewrite() => g.dialog = Dialog::LegacySave { then: Some(what) },
+        0 if e.path.as_ref().is_some_and(|p| e.rewrites_old_file(p)) => g.dialog = Dialog::OldFileSave { then: Some(what) },
         0 => {
             if save(e, g, false) {
                 proceed(e, g, what);
@@ -1762,8 +1766,8 @@ impl eframe::App for App {
                 g.quit_skip.clear();
                 g.status = "The document on show changed, so the question was cancelled".into();
             }
-            if matches!(g.dialog, Dialog::Resize { .. } | Dialog::Scale { .. } | Dialog::Reduce { .. } | Dialog::Dropped(_) | Dialog::ToTrue | Dialog::LegacySave { .. }) {
-                if matches!(g.dialog, Dialog::LegacySave { then: Some(Pending::Quit) }) {
+            if matches!(g.dialog, Dialog::Resize { .. } | Dialog::Scale { .. } | Dialog::Reduce { .. } | Dialog::Dropped(_) | Dialog::ToTrue | Dialog::OldFileSave { .. }) {
+                if matches!(g.dialog, Dialog::OldFileSave { then: Some(Pending::Quit) }) {
                     g.quit_skip.clear();
                 }
                 g.dialog = Dialog::None;

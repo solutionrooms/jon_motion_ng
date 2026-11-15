@@ -237,7 +237,7 @@ pub struct Snapshot {
     tiles_dirty: Option<bool>,
     reset_history: bool,
     blank: bool,
-    legacy_tc: bool,
+    old_file: bool,
 }
 
 pub struct Engine {
@@ -288,9 +288,16 @@ pub struct Engine {
     roster: Option<Vec<Value>>,
     /// True for a document made blank (not read from a file).
     pub blank: bool,
-    /// True for a true-colour project opened from a file 0.1.0-0.1.2 wrote, until it is saved:
-    /// that save rewrites the file in the form those versions cannot open, so the window asks first.
-    pub legacy_tc: bool,
+    /// True while the file at `path` is in the form 0.1.4 and older open: an indexed project,
+    /// or a true-colour one 0.1.0-0.1.2 wrote. Saving a true-colour document over such a file
+    /// writes the form those versions refuse, so the window asks first (see `rewrites_old_file`).
+    pub old_file: bool,
+}
+
+/// True when two paths name one file, however each is spelt (`..`, letter case on a volume
+/// that ignores it, a link to its folder).
+pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b || std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(x, y)| x == y)
 }
 
 /// Most documents open at once.
@@ -390,7 +397,7 @@ impl Engine {
             next_id: 2,
             roster: None,
             blank: true,
-            legacy_tc: false,
+            old_file: false,
         }
     }
 
@@ -516,7 +523,7 @@ impl Engine {
 
     /// The open document showing this file, if any.
     pub fn tab_with_path(&self, p: &std::path::Path) -> Option<u32> {
-        let same = |a: &std::path::Path| a == p || std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(p).ok()).is_some_and(|(x, y)| x == y);
+        let same = |a: &std::path::Path| same_file(a, p);
         if let Some(r) = &self.roster {
             // A script's working copy knows the other documents only by this list.
             return r.iter().find(|t| t["path"].as_str().is_some_and(|a| same(std::path::Path::new(a)))).and_then(|t| t["id"].as_u64()).map(|id| id as u32);
@@ -574,7 +581,7 @@ impl Engine {
         e.id = self.id;
         e.roster = Some(self.tab_list());
         e.blank = self.blank;
-        e.legacy_tc = self.legacy_tc;
+        e.old_file = self.old_file;
         e
     }
 
@@ -582,7 +589,7 @@ impl Engine {
     pub fn adopt(&mut self, s: Engine) {
         let (modified, reset) = (s.modified, s.was_reset);
         self.blank = s.blank;
-        self.legacy_tc = s.legacy_tc;
+        self.old_file = s.old_file;
         let _ = self.group(|e| {
             e.doc = s.doc;
             e.o = s.o;
@@ -816,7 +823,7 @@ impl Engine {
             tiles_dirty: self.tiles_dirty,
             reset_history: self.reset_history,
             blank: self.blank,
-            legacy_tc: self.legacy_tc,
+            old_file: self.old_file,
         }
     }
 
@@ -829,7 +836,7 @@ impl Engine {
         self.tiles_dirty = s.tiles_dirty;
         self.reset_history = s.reset_history;
         self.blank = s.blank;
-        self.legacy_tc = s.legacy_tc;
+        self.old_file = s.old_file;
     }
 
     fn begin_top(&mut self) -> Option<Snapshot> {
@@ -968,13 +975,13 @@ impl Engine {
         self.modified = false;
         self.saved_at = Some(self.edits);
         self.saved_to = self.path.clone();
-        self.legacy_tc = false;
+        self.old_file = !self.doc.rgba();
     }
 
-    /// True when saving to the document's own file would turn a project 0.1.0-0.1.2 wrote
-    /// into one those versions (and 0.1.3, 0.1.4) cannot open.
-    pub fn legacy_rewrite(&self) -> bool {
-        self.legacy_tc && self.doc.rgba() && self.path.is_some()
+    /// True when saving to `to` would turn the document's own file from one 0.1.4 and older
+    /// can open into a true-colour project they cannot. `to` may spell the file another way.
+    pub fn rewrites_old_file(&self, to: &std::path::Path) -> bool {
+        self.old_file && self.doc.rgba() && self.path.as_deref().is_some_and(|p| same_file(p, to))
     }
 
     /// Direct pixel read for scripts.

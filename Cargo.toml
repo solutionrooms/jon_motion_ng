@@ -16,6 +16,7 @@ rfd = "0.15"
 arboard = "3"
 mlua = { version = "0.10", features = ["lua54", "vendored", "serialize"] }
 tiny_http = "0.12"
+image-webp = "0.2.4"
 
 [profile.dev]
 opt-level = 1

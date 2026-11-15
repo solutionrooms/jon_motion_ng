@@ -110,6 +110,8 @@ pub struct Gui {
     pub anim_size: Option<(u32, u32)>,
     /// The animation's name while it is being typed in the Animation tab.
     pub anim_name: Option<(String, String)>,
+    /// The sprite atlas viewer, when one is open. View only, and no part of any document.
+    pub atlas: Option<crate::atlas::View>,
     /// While quitting: documents the user chose not to save.
     pub quit_skip: Vec<u32>,
     /// The document the quit question on screen is about.
@@ -171,6 +173,7 @@ impl Gui {
             anim_clock: 0.0,
             anim_size: None,
             anim_name: None,
+            atlas: None,
             quit_skip: vec![],
             quit_asked: 0,
             tab_seen: 0,
@@ -318,9 +321,14 @@ impl App {
         }
         gui.saved_keymap = Some(engine.view.keymap);
         if let Some(f) = file {
-            match engine.exec("open_document", &json!({ "path": f.display().to_string() })) {
-                Ok(_) => gui.remember(&f),
-                Err(e) => gui.error(e),
+            if f.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")) {
+                // A sprite atlas description: shown in the viewer, beside the blank document.
+                open_atlas(&mut gui, &f);
+            } else {
+                match engine.exec("open_document", &json!({ "path": f.display().to_string() })) {
+                    Ok(_) => gui.remember(&f),
+                    Err(e) => gui.error(e),
+                }
             }
         }
         let engine = Arc::new(Mutex::new(engine));
@@ -440,9 +448,12 @@ pub fn dropped(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
         g.dialog = Dialog::Dropped(p.clone());
     } else if is("jmn") {
         request(e, g, Pending::OpenFile(p.clone()));
+    } else if is("json") {
+        // A sprite atlas description opens in the view-only viewer.
+        open_atlas(g, p);
     } else {
         let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        g.error(format!("Only .jmn and .png files can be opened; {name} is neither"));
+        g.error(format!("Only .jmn and .png files can be opened, or a sprite atlas .json; {name} is none of them"));
     }
 }
 
@@ -520,6 +531,17 @@ fn proceed(e: &mut Engine, g: &mut Gui, what: Pending) {
                 }
             }
         }
+    }
+}
+
+/// Show an atlas (its .json description, beside its page images) in the viewer.
+pub fn open_atlas(g: &mut Gui, p: &Path) {
+    match crate::atlas::load(p) {
+        Ok(a) => {
+            g.info(format!("Atlas: {} objects on {} pages - view only", a.objects.len(), a.pages.len()));
+            g.atlas = Some(crate::atlas::View::new(a));
+        }
+        Err(err) => g.error(err),
     }
 }
 
@@ -772,6 +794,19 @@ pub fn shortcuts(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
         }
     }
     let plain = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+    // Over the sprite atlas viewer the same three keys drive it, and go no further.
+    if let Some(v) = g.atlas.as_mut().filter(|v| ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| v.rect.contains(p))) {
+        if plain(Key::Space) {
+            v.playing = !v.playing;
+        }
+        for (k, step) in [(Key::ArrowLeft, -1), (Key::ArrowRight, 1)] {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k) || i.consume_key(Modifiers::SHIFT, k)) {
+                v.playing = false;
+                v.step(step);
+            }
+        }
+        return;
+    }
     // With the pointer over the Animation tab, Left / Right and Space drive the animation. Anywhere
     // else they keep their usual jobs: the arrows nudge the selection, and Space held pans the canvas.
     if e.anim().is_some() && ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| anim_rect.contains(p)) {
@@ -935,6 +970,11 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
                 request(e, g, Pending::Open);
             }
             ui.menu_button("Open Recent", |ui| recent_menu(ui, e, g));
+            if item(ui, "Open Sprite Atlas...", "") {
+                if let Some(p) = rfd::FileDialog::new().add_filter("Sprite atlas (JSON)", &["json"]).pick_file() {
+                    open_atlas(g, &p);
+                }
+            }
             if item(ui, "Close Tab", "Cmd+W") {
                 request(e, g, Pending::CloseTab(e.id));
             }
@@ -1589,7 +1629,7 @@ impl eframe::App for App {
 
         dropped(ctx, e, g);
         let modal = !matches!(g.dialog, Dialog::None) || g.pending.is_some();
-        drop_hint(ctx, if modal { "Finish the open dialog before dropping a file" } else { "Drop a .jmn to open it, or a .png to open it or add it as a layer" });
+        drop_hint(ctx, if modal { "Finish the open dialog before dropping a file" } else { "Drop a .jmn to open it, a .png to open it or add it as a layer, or a sprite atlas .json to view it" });
         if !modal {
             shortcuts(ctx, e, g);
             if g.saved_keymap.is_some() {
@@ -1615,6 +1655,10 @@ impl eframe::App for App {
             .show_leaf_close_all_buttons(false)
             .show_leaf_collapse_buttons(false)
             .show(ctx, &mut Viewer { e, g });
+        // The atlas viewer floats over everything; closing its window lets the pages go.
+        if g.atlas.as_mut().is_some_and(|v| !crate::atlas::window(ctx, v)) {
+            g.atlas = None;
+        }
         dialogs(ctx, e, g);
 
         e.fix_state();

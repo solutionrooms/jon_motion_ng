@@ -1049,3 +1049,154 @@ fn animation_keys_apply_over_its_tab_only() {
     frame(&mut e, &mut g, key(egui::Key::ArrowRight));
     assert_eq!((e.view.anim_frame, sel_x(&e)), ((f + 1) % 8, 10));
 }
+
+// ---------------------------------------------------------------- open recent
+
+#[test]
+fn recent_files_and_settings() {
+    use crate::app::{read_settings, request, write_settings, Pending, RECENT_MAX};
+    use std::path::{Path, PathBuf};
+    let abs = |name: &str| PathBuf::from(tmp(name));
+
+    // Newest first, no duplicates, capped; relative paths are stored absolute.
+    let mut g = Gui::new();
+    for i in 0..RECENT_MAX + 3 {
+        g.remember(&abs(&format!("r{i}.jmn")));
+    }
+    assert_eq!(g.recent.len(), RECENT_MAX);
+    assert_eq!(g.recent[0], abs(&format!("r{}.jmn", RECENT_MAX + 2)));
+    g.remember(&abs("r5.jmn"));
+    assert_eq!((g.recent[0].clone(), g.recent.len()), (abs("r5.jmn"), RECENT_MAX));
+    assert_eq!(g.recent.iter().filter(|p| **p == abs("r5.jmn")).count(), 1);
+    g.remember(Path::new("relative.jmn"));
+    assert!(g.recent[0].is_absolute() && g.recent_dirty);
+
+    // Writing keeps keys this build does not know, and one setting does not wipe the other.
+    let file = abs("settings.json");
+    std::fs::write(&file, r#"{"keymap":"standard","future":{"x":1}}"#).unwrap();
+    write_settings(&file, Keymap::DPaint, Some(&g.recent)).unwrap();
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!((&v["keymap"], &v["future"]["x"], v["recent"].as_array().unwrap().len()), (&json!("dpaint"), &json!(1), RECENT_MAX));
+    assert_eq!(read_settings(&file), (Some(Keymap::DPaint), g.recent.clone()));
+    write_settings(&file, Keymap::Standard, None).unwrap();
+    assert_eq!(read_settings(&file), (Some(Keymap::Standard), g.recent.clone()), "changing the preset keeps the list");
+    assert!(!file.with_extension(format!("json.{}.tmp", std::process::id())).exists(), "written beside the file, then renamed over it");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600, "the list of file names is private");
+    }
+
+    // The file is the user's to edit: whatever is wrong in it is ignored.
+    let (a, b) = (abs("a.jmn"), abs("b.png"));
+    let (sa, sb) = (a.to_str().unwrap(), b.to_str().unwrap());
+    let long = format!("/{}", "x".repeat(5000));
+    let many: Vec<String> = (0..500).map(|i| abs(&format!("m{i}.jmn")).display().to_string()).collect();
+    for (text, keymap, recent) in [
+        (json!({"keymap": 7, "recent": [sa, 3, null, {"p": 1}, "relative.jmn", "", sa, long, "/tmp/new\nline.jmn", "/tmp/\u{202e}gnp.exe", "/tmp/nul\u{0}.jmn", sb]}).to_string(), None, vec![a.clone(), b.clone()]),
+        (json!({"recent": "not a list"}).to_string(), None, vec![]),
+        (json!({"keymap": "dpaint", "recent": {"0": sa}}).to_string(), Some(Keymap::DPaint), vec![]),
+        (json!({"recent": many}).to_string(), None, many[..RECENT_MAX].iter().map(PathBuf::from).collect()),
+        (json!([sa, sb]).to_string(), None, vec![]),
+        ("{ not json".to_string(), None, vec![]),
+        (String::new(), None, vec![]),
+    ] {
+        std::fs::write(&file, &text).unwrap();
+        assert_eq!(read_settings(&file), (keymap, recent), "{}", &text[..text.len().min(60)]);
+    }
+    std::fs::write(&file, vec![b' '; (1 << 20) + 1]).unwrap();
+    assert_eq!(read_settings(&file), (None, vec![]), "an oversized file is not read");
+    // A file that is not a JSON object is replaced rather than left broken.
+    std::fs::write(&file, "[1, 2]").unwrap();
+    write_settings(&file, Keymap::Standard, Some(&[a.clone()])).unwrap();
+    assert_eq!(read_settings(&file), (Some(Keymap::Standard), vec![a.clone()]));
+    // Whatever is at the path is never written through or re-moded: a link is replaced by a
+    // real file, a directory is left alone, and a file the user made read-only stays as it is.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let (target, link, dir, locked) = (abs("link_target.txt"), abs("link.json"), abs("dir.json"), abs("locked.json"));
+        std::fs::write(&target, "precious").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_settings(&link, Keymap::DPaint, Some(&[a.clone()])).unwrap();
+        assert_eq!((std::fs::read_to_string(&target).unwrap().as_str(), mode(&target)), ("precious", 0o644));
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink() && read_settings(&link).0 == Some(Keymap::DPaint));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(write_settings(&dir, Keymap::DPaint, None).is_err());
+        assert!(mode(&dir) == 0o755 && !dir.with_extension(format!("json.{}.tmp", std::process::id())).exists());
+        let _ = std::fs::remove_file(&locked);
+        std::fs::write(&locked, r#"{"keymap":"standard"}"#).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o400)).unwrap();
+        write_settings(&locked, Keymap::DPaint, Some(&[a.clone()])).unwrap();
+        assert_eq!((read_settings(&locked), mode(&locked)), ((Some(Keymap::Standard), vec![]), 0o400));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // One entry per file however it is spelled, and names that would display deceptively are not listed.
+    let mut g2 = Gui::new();
+    std::fs::write(&a, b"x").unwrap();
+    g2.remember(&a);
+    g2.remember(&a.parent().unwrap().join("..").join(a.parent().unwrap().file_name().unwrap()).join("a.jmn"));
+    g2.remember(Path::new("/tmp/\u{202e}gnp.exe"));
+    g2.remember(Path::new("/tmp/two\nlines.jmn"));
+    #[cfg(unix)]
+    assert_eq!(g2.recent, vec![std::fs::canonicalize(&a).unwrap()]);
+    assert_eq!(read_settings(&abs("no_such_settings.json")), (None, vec![]));
+
+    // Opening from the list asks about unsaved changes first, exactly like File > Open.
+    let mut e = eng(16, 16);
+    e.exec("draw_rect", &json!({"x": 1, "y": 1, "w": 1, "h": 1, "color": 9, "filled": true})).unwrap();
+    e.exec("save_document", &json!({"path": sa})).unwrap();
+    e.exec("new_document", &json!({"width": 8, "height": 8, "force": true})).unwrap();
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": 3, "filled": true})).unwrap();
+    let mut g = Gui::new();
+    assert!(e.modified);
+    request(&mut e, &mut g, Pending::OpenFile(a.clone()));
+    assert!(matches!(g.pending, Some(Pending::OpenFile(_))) && e.doc.w == 8, "nothing is replaced until the prompt is answered");
+    assert!(g.recent.is_empty());
+    g.pending = None;
+    e.modified = false;
+    request(&mut e, &mut g, Pending::OpenFile(a.clone()));
+    let real = if cfg!(unix) { std::fs::canonicalize(&a).unwrap() } else { a.clone() };
+    assert_eq!((e.doc.w, pixel(&mut e, 1, 1), g.recent.clone()), (16, 9, vec![real.clone()]), "opened, and remembered");
+    // A file that has gone is an error in the status bar; the document stays as it was.
+    request(&mut e, &mut g, Pending::OpenFile(abs("gone.jmn")));
+    assert!(g.status_err && e.doc.w == 16 && g.recent == vec![real]);
+
+    // The menu lists file names, tells same-named files apart by folder, and offers Clear.
+    let other = std::env::temp_dir().join("jmn_recent_other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("a.jmn"), b"x").unwrap();
+    g.recent = vec![a.clone(), other.join("a.jmn"), b.clone()];
+    let ctx = egui::Context::default();
+    let mut texts = vec![];
+    for _ in 0..2 {
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0))), ..Default::default() };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| crate::app::recent_menu(ui, &mut e, &mut g));
+        });
+        fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        texts.clear();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut texts));
+    }
+    // (Long folders are shortened in the middle; the hover text has the whole path.)
+    let twin = |end: &str| texts.iter().any(|t| t.starts_with("a.jmn  -  ") && t.ends_with(end) && t.chars().count() <= 10 + 64);
+    assert!(twin(a.parent().unwrap().file_name().unwrap().to_str().unwrap()) && twin("jmn_recent_other"), "{texts:?}");
+    assert!(texts.contains(&"b.png".to_string()) && texts.contains(&"Clear Recent".to_string()), "{texts:?}");
+    std::fs::remove_dir_all(other).ok();
+    g.recent = vec![a.clone()];
+
+    // The list is window state: no command reports it.
+    let all = format!("{} {} {}", e.exec("get_info", &json!({})).unwrap(), e.exec("get_view", &json!({})).unwrap(), e.exec("get_options", &json!({})).unwrap());
+    assert!(!all.contains("recent"));
+    assert!(crate::commands::registry().iter().all(|c| !c.name.contains("recent")));
+}

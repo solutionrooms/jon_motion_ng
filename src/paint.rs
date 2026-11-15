@@ -122,6 +122,8 @@ pub struct PaintOpts {
 pub struct Painter<'a> {
     pub w: i32,
     pub h: i32,
+    /// True when the pixels are colours (a true-colour document), not palette indices.
+    pub rgba: bool,
     pub pal: &'a Palette,
     pub data: &'a mut [Cell],
     /// Layer pixels as they were when the stroke began.
@@ -204,7 +206,7 @@ pub fn ellipse_points(xa: i32, ya: i32, xb: i32, yb: i32) -> Vec<(i32, i32)> {
 }
 
 fn similar(a: Cell, b: Cell) -> bool {
-    a == b || (a >= 256 && b >= 256)
+    a == b || (cell_empty(a) && cell_empty(b))
 }
 
 /// Pixels matching the one at (x, y): the connected region, or every match when not contiguous.
@@ -316,6 +318,15 @@ impl Painter<'_> {
     }
 
     fn shade(&self, c: Cell, up: bool) -> Option<Cell> {
+        if self.rgba {
+            // No ramp to step along: the colour itself is made lighter or darker.
+            if cell_empty(c) {
+                return None;
+            }
+            let [r, g, b, a] = unpack(c);
+            let f = |v: u8| if up { (v as i32 + (255 - v as i32) / 8 + 2).min(255) as u8 } else { (v as i32 - v as i32 / 8 - 2).max(0) as u8 };
+            return Some(pack([f(r), f(g), f(b), a]));
+        }
         let cur = *self.pal.colors.get(c as usize)?;
         if let Some((r, p)) = self.pal.ramp_pos(c as u8, self.o.ramp) {
             let ramp = &self.pal.ramps[r].indices;
@@ -339,6 +350,9 @@ impl Painter<'_> {
 
     /// The palette colour nearest the average of a pixel and its neighbours.
     fn smooth(&self, x: i32, y: i32) -> Option<Cell> {
+        if self.rgba {
+            return self.smooth_rgba(x, y);
+        }
         let at = |x: i32, y: i32| -> Option<[u8; 3]> {
             if x < 0 || y < 0 || x >= self.w || y >= self.h {
                 return None;
@@ -359,6 +373,41 @@ impl Painter<'_> {
             }
         }
         Some(self.pal.nearest([(sum[0] / wsum).round() as u8, (sum[1] / wsum).round() as u8, (sum[2] / wsum).round() as u8]) as Cell)
+    }
+
+    /// True colour: the alpha-weighted average of a pixel and its neighbours.
+    fn smooth_rgba(&self, x: i32, y: i32) -> Option<Cell> {
+        let at = |x: i32, y: i32| -> Option<[u8; 4]> {
+            if x < 0 || y < 0 || x >= self.w || y >= self.h {
+                return None;
+            }
+            let c = self.base[(y * self.w + x) as usize];
+            (!cell_empty(c)).then(|| unpack(c))
+        };
+        at(x, y)?;
+        let (mut sum, mut wsum, mut asum, mut n) = ([0f32; 3], 0f32, 0f32, 0f32);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let wgt = if dx == 0 && dy == 0 { 2.0 } else { 1.0 };
+                // Neighbours off the canvas do not count, so an edge is not faded towards nothing.
+                if x + dx < 0 || y + dy < 0 || x + dx >= self.w || y + dy >= self.h {
+                    continue;
+                }
+                n += wgt;
+                if let Some(c) = at(x + dx, y + dy) {
+                    let a = c[3] as f32 / 255.0 * wgt;
+                    for i in 0..3 {
+                        sum[i] += c[i] as f32 * a;
+                    }
+                    wsum += a;
+                    asum += c[3] as f32 * wgt;
+                }
+            }
+        }
+        if wsum <= 0.0 {
+            return None;
+        }
+        Some(pack([(sum[0] / wsum).round() as u8, (sum[1] / wsum).round() as u8, (sum[2] / wsum).round() as u8, (asum / n).round().max(1.0) as u8]))
     }
 
     pub fn stamp(&mut self, x: i32, y: i32) {
@@ -491,8 +540,21 @@ impl Painter<'_> {
                 let (px, py) = (x as f32 - x0, y as f32 - y0);
                 let t = if radial { ((px * px + py * py) / len2).sqrt() } else { (px * dx + py * dy) / len2 }.clamp(0.0, 1.0);
                 let f = t * (n - 1) as f32;
-                let thr = if dither { (BAYER4[(y & 3) as usize][(x & 3) as usize] as f32 + 0.5) / 16.0 } else { 0.5 };
-                let cell = stops[((f + thr).floor() as usize).min(n - 1)];
+                let cell = if self.rgba && !dither {
+                    // True colour blends from stop to stop; a transparent stop fades out.
+                    let i = (f.floor() as usize).min(n - 1);
+                    let (j, k) = ((i + 1).min(n - 1), f - i as f32);
+                    let (a, b) = (unpack(stops[i]), unpack(stops[j]));
+                    let (a, b) = (if a[3] == 0 { [b[0], b[1], b[2], 0] } else { a }, if b[3] == 0 { [a[0], a[1], a[2], 0] } else { b });
+                    let mut c = [0u8; 4];
+                    for q in 0..4 {
+                        c[q] = (a[q] as f32 + (b[q] as f32 - a[q] as f32) * k).round() as u8;
+                    }
+                    pack(c)
+                } else {
+                    let thr = if dither { (BAYER4[(y & 3) as usize][(x & 3) as usize] as f32 + 0.5) / 16.0 } else { 0.5 };
+                    stops[((f + thr).floor() as usize).min(n - 1)]
+                };
                 self.plot(x, y, Some(cell));
             }
         }

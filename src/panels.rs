@@ -26,8 +26,12 @@ fn swatch(p: &Painter, r: Rect, c: [u8; 4]) {
 }
 
 fn cell_label(e: &Engine, c: Cell) -> String {
-    if c >= 256 {
+    if cell_empty(c) {
         return "transparent".into();
+    }
+    if e.doc.rgba() {
+        let c = unpack(c);
+        return if c[3] == 255 { hex6([c[0], c[1], c[2]]) } else { hex8(c) };
     }
     format!("{} {}", c, hex6(e.doc.palette.colors.get(c as usize).copied().unwrap_or([0, 0, 0])))
 }
@@ -349,7 +353,12 @@ pub fn options(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
 pub fn status(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 14.0;
-        ui.weak(format!("{} x {}  {} colours", e.doc.w, e.doc.h, e.doc.palette.colors.len()));
+        if e.doc.rgba() {
+            ui.weak(format!("{} x {}", e.doc.w, e.doc.h));
+            ui.label(RichText::new("True colour").color(Color32::from_rgb(240, 190, 90))).on_hover_text("Every pixel is its own colour. Image > Convert to Indexed makes it a palette image.");
+        } else {
+            ui.weak(format!("{} x {}  {} colours", e.doc.w, e.doc.h, e.doc.palette.colors.len()));
+        }
         match g.hover {
             Some((x, y)) => {
                 ui.monospace(format!("{x:>4},{y:<4}"));
@@ -409,6 +418,22 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             ui.label(RichText::new(format!("{label} {}", cell_label(e, cell))).small());
         }
     });
+    let rgba = e.doc.rgba();
+    if rgba {
+        // True colour: any colour can be painted, so the colours are edited here directly
+        // and the grid below is a set of swatches to pick from.
+        ui.horizontal(|ui| {
+            for (label, is_fg) in [("FG", true), ("BG", false)] {
+                let cell = if is_fg { e.o.fg } else { e.o.bg };
+                let mut c = if cell_empty(cell) { [0, 0, 0, 0] } else { unpack(cell) };
+                ui.label(RichText::new(label).small());
+                if ui.color_edit_button_srgba_unmultiplied(&mut c).on_hover_text("Pick any colour, with its opacity (0 is transparent)").changed() {
+                    *(if is_fg { &mut e.o.fg } else { &mut e.o.bg }) = pack(c);
+                }
+            }
+        });
+        ui.label(RichText::new("True colour: the palette is a set of swatches. Editing a swatch does not change the image.").small().weak());
+    }
     ui.add_space(2.0);
 
     // ---- colour grid
@@ -451,16 +476,17 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if shift {
                 g.pal_sel = Some((g.pal_sel.map(|s| s.0).unwrap_or(i), i));
             } else {
-                e.o.fg = i as Cell;
+                e.o.fg = if rgba { pack(e.doc.palette.rgba(i)) } else { i as Cell };
                 g.pal_sel = Some((i, i));
             }
         }
         if resp.secondary_clicked() {
-            e.o.bg = i as Cell;
+            e.o.bg = if rgba { pack(e.doc.palette.rgba(i)) } else { i as Cell };
         }
         let c = e.doc.palette.colors[i];
-        let used = format!("\n{} px", g.usage.get(i).copied().unwrap_or(0));
-        resp.on_hover_text(format!("{i}  {}{used}\nClick: foreground   Right-click: background\nShift-click: select a range   Alt: flash on canvas", hex6(c)));
+        let used = if rgba { String::new() } else { format!("\n{} px", g.usage.get(i).copied().unwrap_or(0)) };
+        let flash = if rgba { "" } else { "   Alt: flash on canvas" };
+        resp.on_hover_text(format!("{i}  {}{used}\nClick: foreground   Right-click: background\nShift-click: select a range{flash}", hex6(c)));
     }
 
     // ---- selected colour / range
@@ -509,7 +535,8 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     ui.horizontal(|ui| {
         ui.strong("Ramps");
         let mut cyc = e.view.cycling;
-        if ui.checkbox(&mut cyc, "Cycle").on_hover_text("Preview colour cycling for ramps with cycling enabled").changed() {
+        let why = if rgba { "Colour cycling needs an indexed document: it works by rotating palette entries" } else { "Preview colour cycling for ramps with cycling enabled" };
+        if ui.add_enabled(!rgba, egui::Checkbox::new(&mut cyc, "Cycle")).on_hover_text(why).on_disabled_hover_text(why).changed() {
             e.view.cycling = cyc;
             e.rev += 1;
         }

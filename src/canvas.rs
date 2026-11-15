@@ -20,7 +20,7 @@ pub fn step_zoom(z: f32, dir: i32) -> f32 {
 /// Refresh the composited canvas texture when the document or display palette changed.
 pub fn update_texture(ctx: &egui::Context, e: &Engine, g: &mut Gui) {
     let time = ctx.input(|i| i.time);
-    let cycling = e.view.cycling && e.doc.palette.ramps.iter().any(|r| r.cycle);
+    let cycling = e.view.cycling && !e.doc.rgba() && e.doc.palette.ramps.iter().any(|r| r.cycle);
     let blink = (time * 6.0) as u64 % 2;
     let key = (e.rev, if cycling { (time * 30.0) as u64 } else { 0 }, g.flash_now.map(|f| (f as i64) * 2 + blink as i64).unwrap_or(-1));
     if g.tex.is_some() && g.tex_key == key {

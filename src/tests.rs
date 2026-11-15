@@ -236,19 +236,45 @@ fn everything_is_indexed() {
     e.exec("export_png", &json!({"path": tmp("full.png")})).unwrap();
     assert!(is_indexed(&tmp("full.png")));
 
-    // A true-colour project written by 0.1.x is converted when it is opened, and
-    // layer opacity (also gone) is reset.
+    // A true-colour project written by 0.1.0-0.1.2 opens as true colour with its pixels as
+    // they were. Layer opacity (gone) goes into the pixels, so the picture looks the same.
     let mut d = Doc::new(4, 4, Palette::preset("pico8").unwrap());
     d.mode = ColorMode::Rgba;
     d.layers[0].opacity = 100;
     d.layers[0].data = std::sync::Arc::new((0..16u32).map(|i| if i == 0 { 0 } else { u32::from_le_bytes([200, (i * 10) as u8, 30, 255]) }).collect());
+    let solid = d.new_layer("solid");
+    d.layers.push(solid);
+    d.layers[1].data = std::sync::Arc::new((0..16u32).map(|i| if i < 8 { 5 } else { u32::from_le_bytes([1, 2, 3, 77]) }).collect());
     let old = tmp("old_rgba.jmn");
     io::save_doc(&d, std::path::Path::new(&old)).unwrap();
-    e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
-    assert_eq!((e.doc.mode, e.doc.layers[0].opacity), (ColorMode::Indexed, 255));
+    // 0.1.0-0.1.2 wrote true colour under the same file marker as indexed documents.
+    let mut bytes = std::fs::read(&old).unwrap();
+    assert_eq!(bytes[4], 2);
+    bytes[4] = 1;
+    std::fs::write(&old, bytes).unwrap();
+    let v = e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    assert_eq!((v["mode"].as_str(), v["legacy_truecolor"].as_bool()), (Some("truecolor"), Some(true)));
+    assert_eq!((e.doc.mode, e.doc.layers[0].opacity), (ColorMode::Rgba, 255));
+    assert_eq!(e.doc.palette, Palette::preset("pico8").unwrap(), "the swatches are kept");
     assert_eq!(e.doc.layers[0].data[0], TRANSP);
-    assert_eq!(e.doc.to_rgba(e.doc.layers[0].data[5]), [200, 50, 30, 255]);
-    assert_eq!(e.exec("get_info", &json!({})).unwrap()["mode"], "indexed");
+    assert_eq!(unpack(e.doc.layers[0].data[5]), [200, 50, 30, 100], "alpha 255 at layer opacity 100");
+    // A layer that was fully opaque is untouched, apart from alpha 0 becoming the one transparent value.
+    assert_eq!((e.doc.layers[1].data[0], unpack(e.doc.layers[1].data[8])), (TRANSP, [1, 2, 3, 77]));
+    // Saved from here it is an ordinary true-colour project, which opens the same and is no longer "legacy".
+    let before = e.doc.clone();
+    e.exec("save_document", &json!({})).unwrap();
+    assert_eq!(std::fs::read(&old).unwrap()[4], 2);
+    let v = e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    assert!(v.get("legacy_truecolor").is_none() && e.doc.layers == before.layers);
+    // An old indexed project is not affected: no flag, and its layer opacity is simply dropped.
+    let mut d = Doc::new(4, 4, Palette::preset("pico8").unwrap());
+    d.layers[0].opacity = 100;
+    d.layers[0].data = std::sync::Arc::new(vec![3; 16]);
+    let old = tmp("old_indexed.jmn");
+    io::save_doc(&d, std::path::Path::new(&old)).unwrap();
+    let v = e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    assert!(v.get("legacy_truecolor").is_none());
+    assert_eq!((e.doc.mode, e.doc.layers[0].opacity, e.doc.layers[0].data[0]), (ColorMode::Indexed, 255, 3));
 }
 
 #[test]
@@ -1768,6 +1794,172 @@ fn animation_keys_apply_over_its_tab_only() {
 }
 
 // ---------------------------------------------------------------- open recent
+
+#[test]
+fn true_colour_is_a_separate_kind_of_document() {
+    use crate::doc::*;
+    use crate::io::{self, PngPixels};
+    let path = |n: &str| std::path::PathBuf::from(tmp(n));
+    let px = |e: &mut Engine, x: i64, y: i64| e.exec("get_pixel", &json!({"x": x, "y": y})).unwrap()["color"].as_str().unwrap_or("?").to_string();
+
+    // A picture with opaque, part-transparent and fully transparent pixels, and far more than 256 colours.
+    let (w, h) = (40u32, 30u32);
+    let src: Vec<[u8; 4]> = (0..w * h).map(|i| [(i % w * 6) as u8, (i / w * 8) as u8, (i * 7 % 251) as u8, if i % 11 == 0 { 0 } else if i % 5 == 0 { 97 } else { 255 }]).collect();
+    let png = tmp("tc_src.png");
+    std::fs::write(&png, io::encode_png_rgba(w, h, &src.concat()).unwrap()).unwrap();
+
+    // Opened the usual way it is still an indexed document, and the answer says colours were given up.
+    let mut e = Engine::new("headless");
+    let v = e.exec("open_document", &json!({"path": png})).unwrap();
+    assert_eq!((e.doc.mode, v["mode"].as_str(), v["converted_to_indexed"].as_bool()), (ColorMode::Indexed, Some("indexed"), Some(true)));
+
+    // Asked for by name, every pixel is kept exactly.
+    let v = e.exec("open_document", &json!({"path": png, "mode": "truecolor", "force": true})).unwrap();
+    assert_eq!((e.doc.mode, v["mode"].as_str(), v["converted_to_indexed"].as_bool()), (ColorMode::Rgba, Some("truecolor"), Some(false)));
+    let want: Vec<Cell> = src.iter().map(|&c| pack(c)).collect();
+    assert_eq!(*e.doc.layers[0].data, want);
+    assert_eq!((want[0], want[5], px(&mut e, 0, 0), px(&mut e, 5, 0)), (TRANSP, pack(src[5]), "transparent".to_string(), hex8(src[5])));
+    assert!(want.iter().all(|&c| c == TRANSP || c >= 1 << 24), "a colour is never mistaken for an index");
+
+    // It exports as an RGBA PNG holding the same pixels (transparent ones as 0,0,0,0), scaled or not.
+    let out = tmp("tc_out.png");
+    e.exec("export_png", &json!({"path": out})).unwrap();
+    let PngPixels::Rgba(back) = io::load_png(&path("tc_out.png")).unwrap().pixels else { panic!("not an RGBA PNG") };
+    let clean: Vec<[u8; 4]> = src.iter().map(|&c| if c[3] == 0 { [0; 4] } else { c }).collect();
+    assert_eq!(back, clean);
+    e.exec("export_png", &json!({"path": tmp("tc_out2.png"), "scale": 2})).unwrap();
+    let big = io::load_png(&path("tc_out2.png")).unwrap();
+    let PngPixels::Rgba(bp) = big.pixels else { panic!("not an RGBA PNG") };
+    assert_eq!((big.w, big.h, bp[(2 * 3 * 80 + 2 * 7) as usize]), (80, 60, clean[3 * 40 + 7]));
+
+    // The project file: a different first six bytes, so builds that only know indexed documents
+    // refuse it instead of converting it; indexed projects keep the marker they always had.
+    let jmn = tmp("tc.jmn");
+    e.exec("anim_set", &json!({"name": "a", "x": 0, "y": 0, "w": 40, "h": 10, "frame_w": 10, "frame_h": 10})).unwrap();
+    e.exec("save_document", &json!({"path": jmn})).unwrap();
+    assert_eq!(&std::fs::read(&jmn).unwrap()[..6], b"JMNG\x02\n");
+    let saved = e.doc.clone();
+    e.exec("open_document", &json!({"path": jmn})).unwrap();
+    assert_eq!((e.doc.mode, &e.doc.layers, &e.doc.palette, e.doc.anims.len()), (ColorMode::Rgba, &saved.layers, &saved.palette, 1));
+    assert!(e.exec("open_document", &json!({"path": jmn, "mode": "indexed"})).unwrap_err().contains("'mode' is for PNG files"));
+    let mut plain = Engine::new("headless");
+    plain.exec("save_document", &json!({"path": tmp("tc_indexed.jmn")})).unwrap();
+    assert_eq!(&std::fs::read(tmp("tc_indexed.jmn")).unwrap()[..6], b"JMNG\x01\n");
+    // A true-colour file that holds an indexed document is damaged, not something to guess at.
+    let mut bytes = std::fs::read(tmp("tc_indexed.jmn")).unwrap();
+    bytes[4] = 2;
+    std::fs::write(tmp("tc_bad.jmn"), bytes).unwrap();
+    assert!(io::load_doc(&path("tc_bad.jmn")).unwrap_err().contains("corrupt"));
+    // Values that are neither a colour nor transparent are read as transparent.
+    let mut odd = Doc::new_rgba(2, 1, Palette::preset("pico8").unwrap());
+    odd.layers[0].data = std::sync::Arc::new(vec![7, pack([1, 2, 3, 4])]);
+    io::save_doc(&odd, &path("tc_odd.jmn")).unwrap();
+    assert_eq!(*io::load_doc(&path("tc_odd.jmn")).unwrap().layers[0].data, vec![TRANSP, pack([1, 2, 3, 4])]);
+
+    // Painting sets exactly the colour asked for; a number names a swatch.
+    let mut e = Engine::new("headless");
+    e.exec("new_document", &json!({"width": 16, "height": 16, "mode": "truecolor", "palette": "pico8"})).unwrap();
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 8, "h": 8, "color": "#10203040", "filled": true})).unwrap();
+    e.exec("draw_rect", &json!({"x": 8, "y": 0, "w": 8, "h": 8, "color": 8, "filled": true})).unwrap();
+    assert_eq!((px(&mut e, 3, 3), px(&mut e, 9, 3), px(&mut e, 3, 12)), ("#10203040".to_string(), "#ff004dff".to_string(), "transparent".to_string()));
+    e.exec("fill", &json!({"x": 3, "y": 3, "color": [1, 2, 3]})).unwrap();
+    e.exec("set_pixels", &json!({"pixels": [[0, 15, "#ffffff01"], [1, 15, -1]]})).unwrap();
+    assert_eq!((px(&mut e, 7, 7), px(&mut e, 0, 15), px(&mut e, 1, 15)), ("#010203ff".to_string(), "#ffffff01".to_string(), "transparent".to_string()));
+    e.exec("draw_rect", &json!({"x": 8, "y": 0, "w": 2, "h": 2, "mode": "darken", "filled": true})).unwrap();
+    assert!(px(&mut e, 8, 0) != "#ff004dff" && px(&mut e, 8, 0).ends_with("ff") && px(&mut e, 11, 0) == "#ff004dff", "darken changes the colour itself");
+    e.exec("gradient", &json!({"x0": 0, "y0": 12, "x1": 15, "y1": 12, "colors": ["#000000", "#ffffff"]})).unwrap();
+    let row: std::collections::HashSet<Cell> = (0..16).map(|x| e.doc.layers[0].data[12 * 16 + x]).collect();
+    assert!(row.len() > 8, "a true-colour gradient blends: {} colours", row.len());
+    e.exec("set_colors", &json!({"fg": 12, "bg": "#11223344"})).unwrap();
+    let v = e.exec("get_info", &json!({})).unwrap();
+    assert_eq!((v["fg"].as_str(), v["bg"].as_str()), (Some("#29adffff"), Some("#11223344")));
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": "transparent", "filled": true})).unwrap();
+    assert_eq!(e.doc.layers[0].data[0], TRANSP);
+
+    // The palette is a set of swatches: editing it never changes a pixel, and commands that
+    // renumber or count pixels are refused rather than doing nothing quietly.
+    let before = e.doc.layers[0].data.clone();
+    for (cmd, p) in [("palette_set", json!({"index": 8, "color": "#00ff00"})), ("palette_sort", json!({})), ("palette_swap", json!({"a": 1, "b": 2})),
+                     ("palette_load_preset", json!({"name": "gameboy"})), ("palette_resize", json!({"count": 2})), ("palette_cleanup", json!({}))] {
+        e.exec(cmd, &p).unwrap_or_else(|err| panic!("{cmd}: {err}"));
+        assert!(e.doc.layers[0].data == before, "{cmd} changed the picture");
+    }
+    for (cmd, p) in [("palette_cleanup", json!({"unused": true})), ("palette_usage", json!({})), ("reduce_colors", json!({"colors": 4}))] {
+        assert!(e.exec(cmd, &p).unwrap_err().contains("indexed document"), "{cmd}");
+    }
+    assert_eq!(e.exec("get_info", &json!({})).unwrap()["fg"], "#29adffff", "the colours in hand are colours, not swatch numbers");
+
+    // Layers blend where a pixel is part transparent, on screen, when flattened and when merged.
+    let mut e = Engine::new("headless");
+    e.exec("new_document", &json!({"width": 2, "height": 1, "mode": "truecolor"})).unwrap();
+    e.exec("set_pixels", &json!({"pixels": [[0, 0, "#0000ffff"], [1, 0, "#0000ffff"]]})).unwrap();
+    e.exec("layer_add", &json!({})).unwrap();
+    e.exec("set_pixels", &json!({"pixels": [[0, 0, "#ff000080"]]})).unwrap();
+    let shown = e.doc.composite(&[], None, false);
+    assert_eq!((&shown[..4], &shown[4..]), (&[128u8, 0, 127, 255][..], &[0u8, 0, 255, 255][..]));
+    assert_eq!(e.exec("get_pixel", &json!({"x": 0, "y": 0, "merged": true})).unwrap()["color"], "#80007fff");
+    e.exec("layer_merge_down", &json!({})).unwrap();
+    assert_eq!((e.doc.layers.len(), px(&mut e, 0, 0), px(&mut e, 1, 0)), (1, "#80007fff".to_string(), "#0000ffff".to_string()));
+
+    // convert_mode is the only thing that changes a document's kind, and it is one undo step.
+    let mut e = eng(16, 16);
+    e.exec("draw_rect", &json!({"x": 2, "y": 2, "w": 6, "h": 6, "color": 40, "filled": true})).unwrap();
+    e.exec("set_colors", &json!({"fg": 40, "bg": 3})).unwrap();
+    let (look, cells, pal) = (e.doc.composite(&e.doc.palette.colors, None, false), e.doc.layers[0].data.clone(), e.doc.palette.clone());
+    assert_eq!(e.exec("convert_mode", &json!({"mode": "truecolor"})).unwrap()["mode"], "truecolor");
+    assert_eq!((e.doc.mode, e.doc.composite(&[], None, false) == look, e.o.fg, &e.doc.palette), (ColorMode::Rgba, true, pack(pal.rgba(40)), &pal));
+    assert!(e.exec("convert_mode", &json!({"mode": "truecolor"})).unwrap_err().contains("already"));
+    e.exec("undo", &json!({})).unwrap();
+    assert_eq!((e.doc.mode, &e.doc.layers[0].data, e.o.fg, e.o.bg), (ColorMode::Indexed, &cells, 40, 3), "undo brings back the indexed document, indices and all");
+    e.exec("redo", &json!({})).unwrap();
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": "#abcdef", "filled": true})).unwrap();
+    let v = e.exec("convert_mode", &json!({"mode": "indexed", "colors": 16})).unwrap();
+    assert_eq!((v["mode"].as_str(), e.doc.mode, v["palette_count"].as_i64()), (Some("indexed"), ColorMode::Indexed, Some(2)));
+    assert_eq!((e.doc.to_rgba(e.doc.layers[0].data[0]), e.doc.to_rgba(e.doc.layers[0].data[3 * 16 + 3]), e.doc.layers[0].data[255]), ([0xab, 0xcd, 0xef, 255], pal.rgba(40), TRANSP));
+    assert!(e.doc.layers[0].data.iter().all(|&c| c <= TRANSP) && e.o.fg < 256 && e.o.bg < 256);
+
+    // A picture with thousands of colours and transparent pixels, made indexed, leaves room
+    // for transparency in its palette, so it can always be exported.
+    let mut e = Engine::new("headless");
+    e.exec("open_document", &json!({"path": png, "mode": "truecolor"})).unwrap();
+    assert_eq!(e.exec("get_pixel", &json!({"x": 7, "y": 3, "merged": true})).unwrap()["color"], hex8(src[3 * 40 + 7]));
+    let v = e.exec("convert_mode", &json!({"mode": "indexed"})).unwrap();
+    assert!(v["palette_count"].as_i64().is_some_and(|n| n > 200 && n <= 255), "{v}");
+    e.exec("export_png", &json!({"path": tmp("tc_conv.png")})).unwrap();
+    assert!(matches!(io::load_png(&path("tc_conv.png")).unwrap().pixels, PngPixels::Indexed { .. }));
+
+    // Tabs: each document is its own kind, the tab list says which, and copy / paste between
+    // the two keeps the look (exactly into true colour, nearest palette colour into indexed).
+    let mut e = eng(8, 8);
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4, "color": 40, "filled": true})).unwrap();
+    let c40 = e.doc.palette.rgba(40);
+    e.exec("copy", &json!({})).unwrap();
+    e.exec("tab_new", &json!({"width": 8, "height": 8, "mode": "truecolor"})).unwrap();
+    assert_eq!(e.tab_list().iter().map(|t| t["mode"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>(), ["indexed", "truecolor"]);
+    e.exec("paste", &json!({"x": 0, "y": 0})).unwrap();
+    assert_eq!((e.doc.layers[0].data[0], e.doc.layers[0].data[63]), (pack(c40), TRANSP));
+    e.exec("set_pixels", &json!({"pixels": [[7, 7, "#fefefe"], [6, 7, "#00000010"]]})).unwrap();
+    e.exec("select_all", &json!({})).unwrap();
+    e.exec("copy", &json!({})).unwrap();
+    e.exec("tab_select", &json!({"id": 1})).unwrap();
+    e.exec("layer_add", &json!({})).unwrap();
+    e.exec("paste", &json!({"x": 0, "y": 0})).unwrap();
+    let d = &e.doc.layers[1].data;
+    assert_eq!((d[0], d[63], d[62], e.doc.mode), (40, e.doc.palette.nearest([0xfe, 0xfe, 0xfe]) as Cell, TRANSP, ColorMode::Indexed));
+    assert!(d.iter().all(|&c| c <= TRANSP), "no colour leaks into an indexed document");
+    let v = e.exec("tab_open", &json!({"path": png, "mode": "truecolor"})).unwrap();
+    assert_eq!((v["converted_to_indexed"].as_bool(), e.doc.mode, e.doc.w), (Some(false), ColorMode::Rgba, 40));
+    // A PNG added as a layer keeps its exact pixels in a true-colour document.
+    e.exec("import_png_layer", &json!({"path": png})).unwrap();
+    assert_eq!(*e.doc.layers[1].data, want);
+    // An indexed PNG opened in true colour brings its palette as swatches.
+    plain.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4, "color": 20, "filled": true})).unwrap();
+    plain.exec("export_png", &json!({"path": tmp("tc_idx.png")})).unwrap();
+    assert!(matches!(io::load_png(&path("tc_idx.png")).unwrap().pixels, PngPixels::Indexed { .. }), "indexed documents still export indexed PNGs");
+    let c20 = plain.doc.palette.rgba(20);
+    plain.exec("open_document", &json!({"path": tmp("tc_idx.png"), "mode": "truecolor", "force": true})).unwrap();
+    assert_eq!((plain.doc.mode, plain.doc.layers[0].data[0], plain.doc.layers[0].data[5], plain.doc.palette.colors[20]), (ColorMode::Rgba, pack(c20), TRANSP, [c20[0], c20[1], c20[2]]));
+}
 
 #[test]
 fn recent_files_and_settings() {

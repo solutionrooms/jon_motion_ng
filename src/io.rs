@@ -1,13 +1,16 @@
 //! Native project files (.jmn) and PNG import/export.
 
 use crate::doc::*;
-use crate::quant;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::io::{Read, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 6] = b"JMNG\x01\n";
+/// True-colour projects start differently, so builds that only know indexed documents
+/// (0.1.3 and 0.1.4, which would turn the pixels into a 256-colour palette) refuse the
+/// file instead of converting it. Everything after the first six bytes has the same layout.
+const MAGIC_RGBA: &[u8; 6] = b"JMNG\x02\n";
 const MAX_EXPORT_PIXELS: u64 = 8192 * 8192;
 /// Largest uncompressed project accepted, so a small crafted file cannot inflate without bound.
 const MAX_RAW: u64 = 4 << 30;
@@ -18,7 +21,8 @@ pub fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
     let mut raw = bincode::serialize(&d).map_err(|e| e.to_string())?;
     if !d.anims.is_empty() {
         // 0.1.4 knows one grid animation, in this chunk; it is given the first one there is.
-        if let Some((a, g)) = d.anims.iter().find_map(|a| a.grid().map(|g| (a, g))) {
+        // (It cannot open a true-colour project at all, so those do not carry the chunk.)
+        if let Some((a, g)) = d.anims.iter().find_map(|a| a.grid().map(|g| (a, g))).filter(|_| !d.rgba()) {
             let old = AnimV1 { x: g.x, y: g.y, w: g.w, h: g.h, fw: g.fw, fh: g.fh, limit: g.limit, fps: a.fps };
             chunk(&mut raw, b"ANIM", &bincode::serialize(&old).map_err(|e| e.to_string())?);
         }
@@ -27,7 +31,7 @@ pub fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
     if raw.len() as u64 > MAX_RAW {
         return Err("the project is too large to save (over 4 GB of pixel data); merge or remove layers".into());
     }
-    let mut out = MAGIC.to_vec();
+    let mut out = if d.rgba() { MAGIC_RGBA.to_vec() } else { MAGIC.to_vec() };
     let mut enc = flate2::write::DeflateEncoder::new(&mut out, flate2::Compression::default());
     enc.write_all(&raw).map_err(|e| e.to_string())?;
     enc.finish().map_err(|e| e.to_string())?;
@@ -37,9 +41,18 @@ pub fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+#[cfg(test)]
 pub fn load_doc(path: &Path) -> Result<Doc, String> {
+    load_doc_noting(path).map(|(d, _)| d)
+}
+
+/// The project, and whether it is a true-colour one written by 0.1.0-0.1.2. Those used the
+/// indexed file marker; saving one from here writes it under the true-colour marker.
+pub fn load_doc_noting(path: &Path) -> Result<(Doc, bool), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
+    let head = bytes.get(..MAGIC.len());
+    let rgba = head == Some(MAGIC_RGBA);
+    if !rgba && head != Some(MAGIC) {
         return Err(format!("{}: not a Jon Motion project file", path.display()));
     }
     let mut raw = Vec::new();
@@ -51,11 +64,17 @@ pub fn load_doc(path: &Path) -> Result<Doc, String> {
     // The document re-serialises to exactly the bytes it was read from, which locates the chunks after it.
     let used = bincode::serialized_size(&d).map_err(|e| e.to_string())? as usize;
     read_chunks(&mut d, raw.get(used..).unwrap_or(&[]));
+    let opacity: Vec<u8> = d.layers.iter().map(|l| l.opacity).collect();
     validate(&mut d)?;
-    if d.mode == ColorMode::Rgba {
-        to_indexed(&mut d);
+    if rgba != d.rgba() && rgba {
+        return Err("corrupt project file: a true-colour file holding an indexed document".into());
     }
-    Ok(d)
+    let legacy = !rgba && d.rgba();
+    if legacy {
+        legacy_opacity(&mut d, &opacity);
+    }
+    tidy_cells(&mut d);
+    Ok((d, legacy))
 }
 
 /// Data added after 0.1.3 follows the document as tagged chunks: a four-byte tag, a
@@ -274,24 +293,39 @@ pub fn anims_from_json(v: &Value, w: u32, h: u32) -> Result<Vec<Result<Anim, Str
         .collect())
 }
 
-/// Convert a true-colour project written by 0.1.x: its cells are packed RGBA
-/// (little-endian r, g, b, a). It gets a generated palette of up to 256 colours.
-fn to_indexed(d: &mut Doc) {
-    let px = |cells: &[Cell]| -> Vec<[u8; 4]> { cells.iter().map(|c| c.to_le_bytes()).collect() };
-    let layers: Vec<Vec<[u8; 4]>> = d.layers.iter().map(|l| px(&l.data)).collect();
-    let tiles: Vec<Vec<[u8; 4]>> = d.tileset.iter().flat_map(|t| t.tiles.iter()).map(|t| px(t)).collect();
-    d.palette = quant::palette_for(layers.iter().chain(&tiles).flatten(), 256);
-    let (w, h) = (d.w as usize, d.h as usize);
-    for (l, p) in d.layers.iter_mut().zip(&layers) {
-        l.data = Arc::new(quant::to_indexed(p, w, h, &d.palette, quant::Dither::None));
-    }
-    if let Some(ts) = &mut d.tileset {
-        let (tw, th) = (ts.tw as usize, ts.th as usize);
-        for (t, p) in ts.tiles.iter_mut().zip(&tiles) {
-            *t = Arc::new(quant::to_indexed(p, tw, th, &d.palette, quant::Dither::None));
+/// A true-colour project written by 0.1.0-0.1.2 holds the same packed colours (with alpha 0
+/// for a transparent pixel, which `tidy_cells` turns into `TRANSP`), but its layers could be
+/// part transparent as a whole. Layers are always opaque now, so that opacity goes into each
+/// pixel's alpha, the way those versions applied it when they drew the layer: the picture
+/// looks the same. A tile-mapped layer shows its tiles, which other layers may share, so it
+/// is left alone and becomes fully opaque.
+fn legacy_opacity(d: &mut Doc, opacity: &[u8]) {
+    for (l, &o) in d.layers.iter_mut().zip(opacity) {
+        if o == 255 || l.map.is_some() {
+            continue;
+        }
+        for c in Arc::make_mut(&mut l.data).iter_mut() {
+            let [r, g, b, a] = c.to_le_bytes();
+            *c = u32::from_le_bytes([r, g, b, (a as u32 * o as u32 / 255) as u8]);
         }
     }
-    d.mode = ColorMode::Indexed;
+}
+
+/// Make every pixel a value its kind of document can hold: an index or `TRANSP` in an
+/// indexed one (anything else was always read as transparent), a colour or `TRANSP` in a
+/// true-colour one. A sound file is left exactly as it is.
+fn tidy_cells(d: &mut Doc) {
+    let rgba = d.rgba();
+    let bad = move |c: Cell| if rgba { c < 1 << 24 && c != TRANSP } else { c > TRANSP };
+    let fix = |data: &mut Arc<Vec<Cell>>| {
+        if data.iter().any(|&c| bad(c)) {
+            Arc::make_mut(data).iter_mut().filter(|c| bad(**c)).for_each(|c| *c = TRANSP);
+        }
+    };
+    d.layers.iter_mut().for_each(|l| fix(&mut l.data));
+    if let Some(ts) = &mut d.tileset {
+        ts.tiles.iter_mut().for_each(fix);
+    }
 }
 
 fn validate(d: &mut Doc) -> Result<(), String> {
@@ -447,8 +481,13 @@ fn upscale_cells(src: &[Cell], w: usize, h: usize, s: usize) -> Vec<Cell> {
     out
 }
 
-/// Encode cells as an indexed PNG carrying the document's palette.
+/// Encode cells as a PNG: indexed, carrying the document's palette, or for a true-colour
+/// document RGBA with every pixel exactly as it is.
 pub fn encode_cells(doc: &Doc, w: u32, h: u32, cells: &[Cell]) -> Result<Vec<u8>, String> {
+    if doc.rgba() {
+        let rgba: Vec<u8> = cells.iter().flat_map(|&c| unpack(c)).collect();
+        return encode_png_rgba(w, h, &rgba);
+    }
     let has_transp = cells.iter().any(|&c| c >= 256);
     let mut pal = doc.palette.colors.clone();
     // Transparency needs a palette slot: a spare entry, or failing that one the image never uses.
@@ -473,7 +512,7 @@ pub fn encode_cells(doc: &Doc, w: u32, h: u32, cells: &[Cell]) -> Result<Vec<u8>
     encode_png_indexed(w, h, &idx, &pal, t)
 }
 
-/// Encode the document (or one layer) as an indexed PNG.
+/// Encode the document (or one layer) as a PNG: indexed, or RGBA for a true-colour document.
 pub fn export_png(doc: &Doc, layer: Option<usize>, scale: u32) -> Result<Vec<u8>, String> {
     let scale = scale.clamp(1, 64);
     let (ow, oh) = (doc.w as u64 * scale as u64, doc.h as u64 * scale as u64);

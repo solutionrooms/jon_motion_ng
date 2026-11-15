@@ -21,8 +21,11 @@ pub const BASE_PORT: u16 = 47800;
 const INSTRUCTIONS: &str = "\
 Jon Motion is a pixel art editor: layers, a 256-colour indexed palette, colour ramps, paint modes and tile maps.
 Coordinates are pixels with (0,0) at the top-left. Layer 0 is the bottom layer.
-Every pixel is a palette index; there is no true-colour mode and layers are fully opaque. \
-Colours: a palette index (0-255, -1 = transparent) or '#rrggbb' (snapped to the nearest palette colour). 'fg', 'bg' and 'transparent' also work.
+get_info's 'mode' says what kind of document is open. indexed (the usual kind): every pixel is a palette index. \
+Colours: a palette index (0-255, -1 = transparent) or '#rrggbb' (snapped to the nearest palette colour). \
+truecolor: every pixel is its own colour, given as '#rrggbb' or '#rrggbbaa' (a number picks that palette swatch's colour) and read back as '#rrggbbaa'; \
+the palette is only a set of swatches, and palette commands that renumber or count pixels are refused. \
+'fg', 'bg' and 'transparent' work in both. Layers are fully opaque. Nothing converts a document between the two except convert_mode; do not call it unless asked.
 Workflow: get_info first; list_commands to discover commands; execute_command or batch to act; screenshot to look at the result. \
 For anything loop-heavy or procedural use run_lua. put_pixels places a whole sprite in one call.
 Every call is atomic and is one undo step. When the app window is open you are editing the user's live document alongside them: \

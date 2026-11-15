@@ -78,6 +78,13 @@ pub struct Gui {
     pub hover: Option<(i32, i32)>,
     /// The keymap last written to the settings file; `None` (tests) never touches the file.
     pub saved_keymap: Option<Keymap>,
+    /// The default grid size last read from or written to the settings file.
+    pub saved_grid: (u32, u32),
+    /// The document on show and its grid setting when last looked at, so the user is told
+    /// once when they switch on (or resize) a grid that is too fine to draw at this zoom.
+    pub grid_seen: (u32, bool, u32, u32),
+    /// The too-fine-grid note, while it is what was last put in the status line.
+    pub grid_hint: Option<String>,
     pub last_pos: Option<egui::Pos2>,
     pub zoom_accum: f32,
     pub canvas_rect: egui::Rect,
@@ -142,6 +149,9 @@ impl Gui {
     pub fn new() -> Gui {
         Gui {
             saved_keymap: None,
+            saved_grid: crate::engine::GRID_DEFAULT,
+            grid_seen: (0, false, 0, 0),
+            grid_hint: None,
             tex: None,
             tex_key: (0, 0, -1),
             tile_tex: None,
@@ -323,8 +333,12 @@ impl App {
             let (keymap, recent) = read_settings(&p);
             engine.view.keymap = keymap.unwrap_or(engine.view.keymap);
             gui.recent = recent;
+            if let Some(grid) = read_grid_default(&p) {
+                engine.use_grid_default(grid);
+            }
         }
         gui.saved_keymap = Some(engine.view.keymap);
+        gui.saved_grid = engine.view.grid_default;
         if let Some(f) = file {
             if f.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")) {
                 // A sprite atlas description: shown in the viewer, beside the blank document.
@@ -709,9 +723,18 @@ pub fn read_settings(p: &Path) -> (Option<Keymap>, Vec<PathBuf>) {
     (v["keymap"].as_str().and_then(Keymap::parse), recent)
 }
 
+/// The grid size new documents start with, if the settings file has a usable one:
+/// `"grid_default": [width, height]`, each 1 to 1024.
+pub fn read_grid_default(p: &Path) -> Option<(u32, u32)> {
+    let v = settings_json(p)?;
+    let side = |i: usize| v["grid_default"][i].as_u64().filter(|n| (1..=crate::engine::GRID_MAX as u64).contains(n)).map(|n| n as u32);
+    (v["grid_default"].as_array()?.len() == 2).then_some(())?;
+    Some((side(0)?, side(1)?))
+}
+
 /// Write the preferences, keeping any keys in the file that this build does not know.
-/// `recent: None` leaves the list in the file as it is.
-pub fn write_settings(p: &Path, keymap: Keymap, recent: Option<&[PathBuf]>) -> std::io::Result<()> {
+/// `grid: None` and `recent: None` leave those entries in the file as they are.
+pub fn write_settings(p: &Path, keymap: Keymap, grid: Option<(u32, u32)>, recent: Option<&[PathBuf]>) -> std::io::Result<()> {
     use std::io::Write;
     // A settings file the user has made read-only is theirs to keep that way.
     if std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file() && m.permissions().readonly()) {
@@ -719,6 +742,9 @@ pub fn write_settings(p: &Path, keymap: Keymap, recent: Option<&[PathBuf]>) -> s
     }
     let mut v = settings_json(p).filter(Value::is_object).unwrap_or_else(|| json!({}));
     v["keymap"] = json!(keymap.name());
+    if let Some((w, h)) = grid {
+        v["grid_default"] = json!([w, h]);
+    }
     if let Some(recent) = recent {
         v["recent"] = json!(recent.iter().filter_map(|f| f.to_str()).collect::<Vec<_>>());
     }
@@ -742,12 +768,38 @@ pub fn write_settings(p: &Path, keymap: Keymap, recent: Option<&[PathBuf]>) -> s
     done
 }
 
+/// Say so when the grid was just switched on, or resized, and is too fine to be drawn at
+/// this zoom: otherwise nothing on screen changes and it looks as if the grid did not work.
+/// While that note is still what the status line shows it follows the zoom, and it goes
+/// once it stops being true: the grid is drawn, was switched off, or another document is on show.
+pub fn grid_note(e: &Engine, g: &mut Gui) {
+    let now = (e.id, e.view.grid, e.view.grid_w, e.view.grid_h);
+    let before = std::mem::replace(&mut g.grid_seen, now);
+    // Only a status line that still holds the note is touched: a later message stays.
+    let showing = !g.status_err && g.grid_hint.as_ref().is_some_and(|h| *h == g.status);
+    let hidden = e.view.grid_hidden().filter(|_| before.0 == now.0 && (before != now || showing));
+    match hidden {
+        Some(why) => {
+            g.info(why.clone());
+            g.grid_hint = Some(why);
+        }
+        None => {
+            if showing {
+                g.status.clear();
+            }
+            g.grid_hint = None;
+        }
+    }
+}
+
 /// Write the preferences when one changed (from the menu, the dialog, a script or an AI client).
 fn save_settings(e: &Engine, g: &mut Gui) {
-    if g.saved_keymap == Some(e.view.keymap) && !g.recent_dirty {
+    let grid = (g.saved_grid != e.view.grid_default).then_some(e.view.grid_default);
+    if g.saved_keymap == Some(e.view.keymap) && grid.is_none() && !g.recent_dirty {
         return;
     }
     g.saved_keymap = Some(e.view.keymap);
+    g.saved_grid = e.view.grid_default;
     let Some(p) = remote::settings_file() else { return };
     // The list is only written when this window changed it, so a key preset change here
     // cannot drop files another window added.
@@ -760,7 +812,8 @@ fn save_settings(e: &Engine, g: &mut Gui) {
             }
         }
     }
-    if let Err(err) = write_settings(&p, e.view.keymap, dirty.then_some(g.recent.as_slice())) {
+    // Likewise the grid default is only written when it changed here.
+    if let Err(err) = write_settings(&p, e.view.keymap, grid, dirty.then_some(g.recent.as_slice())) {
         g.error(format!("could not save settings to {}: {err}", p.display()));
     }
 }
@@ -1268,6 +1321,15 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
                 ui.label("x");
                 ui.add(egui::DragValue::new(&mut e.view.grid_h).range(1..=1024));
             });
+            let (cur, def) = ((e.view.grid_w, e.view.grid_h), e.view.grid_default);
+            let set = ui
+                .add_enabled(cur != def, egui::Button::new("Use as Default Grid Size"))
+                .on_hover_text(format!("New documents start with a {}x{} grid now. Make it {}x{}, and remember that", def.0, def.1, cur.0, cur.1))
+                .on_disabled_hover_text(format!("New documents already start with a {}x{} grid", def.0, def.1));
+            if set.clicked() {
+                e.view.grid_default = cur;
+                g.info(format!("New documents now start with a {}x{} grid", cur.0, cur.1));
+            }
             ui.checkbox(&mut e.view.tile_grid, "Tile Grid");
             ui.checkbox(&mut e.view.tile_ids, "Tile Numbers");
             ui.checkbox(&mut e.view.anim_guides, "Animation Frames");
@@ -1789,6 +1851,7 @@ impl eframe::App for App {
         } else {
             g.anim_rect = egui::Rect::NOTHING;
         }
+        grid_note(e, g);
         egui::TopBottomPanel::top("menu").show(ctx, |ui| menu_bar(ui, e, g));
         egui::TopBottomPanel::top("options").exact_height(34.0).show(ctx, |ui| panels::options(ui, e, g));
         egui::TopBottomPanel::top("tabs").exact_height(28.0).show(ctx, |ui| tab_bar(ui, e, g, modal));

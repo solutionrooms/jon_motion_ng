@@ -1285,10 +1285,17 @@ fn animation_setup_is_part_of_the_document_and_playback_is_not() {
     assert_eq!(e.exec("anim_info", &json!({})).unwrap()["active"], false);
     assert!(e.exec("anim_control", &json!({"step": 1})).is_err(), "nothing to step yet");
 
-    // With nothing selected the whole image is cut up, at the grid size.
+    // With nothing selected the whole image is cut up: into 16x16 frames while the grid is
+    // its one-pixel default, else into grid cells.
+    assert_eq!((e.view.grid_w, e.view.grid_h, e.default_frame()), (1, 1, (16, 16)));
     let v = e.exec("anim_set", &json!({})).unwrap();
     assert_eq!((v["w"].as_i64(), v["frame_w"].as_i64(), v["cols"].as_i64(), v["rows"].as_i64(), v["frames"].as_i64()), (Some(128), Some(16), Some(8), Some(4), Some(32)));
     e.exec("anim_clear", &json!({})).unwrap();
+    e.exec("set_view", &json!({"grid_w": 32, "grid_h": 8})).unwrap();
+    let v = e.exec("anim_set", &json!({})).unwrap();
+    assert_eq!((v["frame_w"].as_i64(), v["frame_h"].as_i64(), v["frames"].as_i64()), (Some(32), Some(8), Some(32)));
+    e.exec("anim_clear", &json!({})).unwrap();
+    e.exec("set_view", &json!({"grid_w": 1, "grid_h": 1})).unwrap();
 
     // A selection gives the start and extent; part frames at the right and bottom edges are left out.
     e.exec("select_rect", &json!({"x": 8, "y": 16, "w": 70, "h": 40})).unwrap();
@@ -2036,12 +2043,156 @@ fn recent_files_and_settings() {
     // Writing keeps keys this build does not know, and one setting does not wipe the other.
     let file = abs("settings.json");
     std::fs::write(&file, r#"{"keymap":"standard","future":{"x":1}}"#).unwrap();
-    write_settings(&file, Keymap::DPaint, Some(&g.recent)).unwrap();
+    write_settings(&file, Keymap::DPaint, None, Some(&g.recent)).unwrap();
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!((&v["keymap"], &v["future"]["x"], v["recent"].as_array().unwrap().len()), (&json!("dpaint"), &json!(1), RECENT_MAX));
     assert_eq!(read_settings(&file), (Some(Keymap::DPaint), g.recent.clone()));
-    write_settings(&file, Keymap::Standard, None).unwrap();
+    write_settings(&file, Keymap::Standard, None, None).unwrap();
     assert_eq!(read_settings(&file), (Some(Keymap::Standard), g.recent.clone()), "changing the preset keeps the list");
+
+    // The grid size new documents start with is kept there too, and only changed when asked.
+    use crate::app::read_grid_default;
+    assert_eq!(read_grid_default(&file), None);
+    write_settings(&file, Keymap::Standard, Some((8, 12)), None).unwrap();
+    assert_eq!((read_grid_default(&file), read_settings(&file)), (Some((8, 12)), (Some(Keymap::Standard), g.recent.clone())));
+    write_settings(&file, Keymap::DPaint, None, None).unwrap();
+    assert_eq!(read_grid_default(&file), Some((8, 12)), "another change keeps it");
+    let grid_file = abs("grid_settings.json");
+    for (text, want) in [
+        (r#"{"grid_default":[1,1024]}"#, Some((1, 1024))),
+        (r#"{"grid_default":[0,8]}"#, None),
+        (r#"{"grid_default":[8,1025]}"#, None),
+        (r#"{"grid_default":[8]}"#, None),
+        (r#"{"grid_default":[8,8,8]}"#, None),
+        (r#"{"grid_default":[8.5,8]}"#, None),
+        (r#"{"grid_default":[-8,8]}"#, None),
+        (r#"{"grid_default":"8x8"}"#, None),
+        (r#"{"grid_default":{"w":8,"h":8}}"#, None),
+        (r#"{"grid_default":[1e300,8]}"#, None),
+    ] {
+        std::fs::write(&grid_file, text).unwrap();
+        assert_eq!(read_grid_default(&grid_file), want, "{text}");
+    }
+    // A new document's grid is one pixel. Making another size the default gives it to every
+    // document opened after that - a new tab, a file, the blank left by closing the last tab -
+    // and leaves the open ones as they are.
+    let mut t = eng(32, 32);
+    let view = |t: &mut Engine| {
+        let v = t.exec("get_view", &json!({})).unwrap();
+        (v["grid_w"].as_i64().unwrap(), v["grid_h"].as_i64().unwrap(), v["grid_default_w"].as_i64().unwrap(), v["grid_default_h"].as_i64().unwrap())
+    };
+    assert_eq!(view(&mut t), (1, 1, 1, 1));
+    t.exec("set_view", &json!({"grid_w": 8, "grid_h": 12})).unwrap();
+    assert_eq!(view(&mut t), (8, 12, 1, 1), "changing the grid is not changing the default");
+    let second = t.exec("tab_new", &json!({})).unwrap()["id"].as_u64().unwrap();
+    assert_eq!(view(&mut t), (1, 1, 1, 1));
+    t.exec("set_view", &json!({"grid_w": 4000, "grid_h": 0, "grid_default": true})).unwrap();
+    assert_eq!(view(&mut t), (1024, 1, 1024, 1), "the sizes are clamped first");
+    t.exec("set_view", &json!({"grid_w": 8, "grid_h": 8, "grid_default": true})).unwrap();
+    t.exec("set_view", &json!({"grid_w": 3})).unwrap();
+    t.exec("tab_new", &json!({})).unwrap();
+    assert_eq!(view(&mut t), (8, 8, 8, 8));
+    t.exec("tab_select", &json!({"id": 1})).unwrap();
+    assert_eq!(view(&mut t), (8, 12, 8, 8), "an open document keeps its grid; the default is the window's");
+    t.exec("tab_select", &json!({"id": second})).unwrap();
+    assert_eq!(view(&mut t), (3, 8, 8, 8));
+    // Set from a tab that is not on show, it is still the window's.
+    t.on_tab(1, |t| t.exec("set_view", &json!({"grid_w": 5, "grid_h": 5, "grid_default": true}))).unwrap().unwrap();
+    assert_eq!(view(&mut t), (3, 8, 5, 5));
+    while t.tab_list().len() > 1 {
+        let id = t.id;
+        t.exec("tab_close", &json!({"id": id, "force": true})).unwrap();
+    }
+    let id = t.id;
+    t.exec("tab_close", &json!({"id": id, "force": true})).unwrap();
+    assert_eq!(view(&mut t), (5, 5, 5, 5), "the blank document left behind");
+    // A call that fails changes neither the grid nor what the window remembers.
+    t.exec("set_view", &json!({"grid_w": 6, "grid_h": 6, "grid_default": true, "keymap": "bogus"})).unwrap_err();
+    assert_eq!(view(&mut t), (5, 5, 5, 5));
+    t.exec("set_view", &json!({"keymap": "dpaint", "zoom": 3, "grid_default": "yes"})).unwrap_err();
+    assert_eq!((t.view.keymap, view(&mut t)), (Keymap::Standard, (5, 5, 5, 5)));
+    let failed = t.group(|t| {
+        t.exec("set_view", &json!({"grid_w": 10, "grid_h": 10, "grid_default": true, "keymap": "dpaint"}))?;
+        t.exec("no_such_command", &json!({})).map(|_| ())
+    });
+    assert!(failed.is_err());
+    assert_eq!((t.view.keymap, view(&mut t)), (Keymap::Standard, (5, 5, 5, 5)));
+    assert!(script::run_lua(&mut t, "jm.set_view{grid_w=9, grid_h=9, grid_default=true} error('stop')").error.is_some());
+    assert_eq!(view(&mut t), (5, 5, 5, 5));
+
+    // The grid is drawn once its smaller side is four screen pixels. Switched on, or resized,
+    // while it is finer than that, the window says so. The note follows the zoom while it is
+    // what the status line shows, and goes when it stops being true.
+    use crate::app::grid_note;
+    let mut n = eng(64, 64);
+    let mut ng = Gui::new();
+    let note = |n: &Engine, ng: &mut Gui| {
+        grid_note(n, ng);
+        ng.status.clone()
+    };
+    n.view.zoom = 3.0;
+    assert_eq!((n.view.grid_zoom(), n.view.grid_hidden(), note(&n, &mut ng)), (4.0, None, String::new()));
+    n.view.grid = true;
+    assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 300% now)");
+    assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 300% now)", "it stays while it is true");
+    n.view.zoom = 2.0;
+    assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 200% now)", "and follows the zoom");
+    n.view.zoom = 8.0;
+    assert_eq!((n.view.grid_hidden(), note(&n, &mut ng)), (None, String::new()), "zoomed in, the grid shows and the note goes");
+    n.view.zoom = 2.0;
+    assert_eq!(note(&n, &mut ng), "", "zooming out again is not switching the grid on");
+    // Switching the grid off removes it too, and so does making the grid coarse enough.
+    n.view.grid = false;
+    assert_eq!(note(&n, &mut ng), "");
+    n.view.grid = true;
+    assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 200% now)");
+    n.view.grid = false;
+    assert_eq!(note(&n, &mut ng), "");
+    n.view.grid = true;
+    assert!(!note(&n, &mut ng).is_empty());
+    (n.view.grid_w, n.view.grid_h) = (2, 2);
+    assert_eq!(note(&n, &mut ng), "", "2x2 shows at 200%");
+    // Another message is never removed or overwritten by it, an error included.
+    (n.view.grid_w, n.view.grid_h) = (1, 1);
+    assert!(!note(&n, &mut ng).is_empty());
+    ng.info("Saved somewhere");
+    n.view.zoom = 8.0;
+    assert_eq!(note(&n, &mut ng), "Saved somewhere");
+    n.view.zoom = 2.0;
+    assert_eq!(note(&n, &mut ng), "Saved somewhere");
+    n.view.grid = false;
+    grid_note(&n, &mut ng);
+    n.view.grid = true;
+    assert!(note(&n, &mut ng).starts_with("The 1x1 grid"));
+    ng.error("The 1x1 grid shows from 400% zoom (it is 200% now)");
+    n.view.zoom = 8.0;
+    assert!(ng.status_err && !note(&n, &mut ng).is_empty(), "an error with the same words is not the note");
+    ng.status.clear();
+    // The finer side decides, and the zoom named is one that shows it.
+    n.view.grid = false;
+    grid_note(&n, &mut ng);
+    (n.view.grid, n.view.grid_w, n.view.grid_h, n.view.zoom) = (true, 16, 1, 0.25);
+    assert_eq!(note(&n, &mut ng), "The 16x1 grid shows from 400% zoom (it is 25% now)");
+    (n.view.grid_w, n.view.grid_h) = (16, 16);
+    assert_eq!((n.view.grid_zoom(), note(&n, &mut ng)), (0.25, String::new()));
+    (n.view.grid_w, n.view.grid_h, n.view.zoom) = (3, 3, 1.0);
+    assert_eq!(note(&n, &mut ng), "The 3x3 grid shows from 134% zoom (it is 100% now)");
+    // Another document coming on show takes the note away, and is not itself a change to a grid.
+    n.exec("tab_new", &json!({})).unwrap();
+    n.view.grid = true;
+    n.view.zoom = 1.0;
+    assert_eq!(note(&n, &mut ng), "");
+    assert_eq!(note(&n, &mut ng), "");
+    n.view.grid_w = 2;
+    assert_eq!(note(&n, &mut ng), "The 2x1 grid shows from 400% zoom (it is 100% now)");
+    n.exec("tab_select", &json!({"id": 1})).unwrap();
+    assert_eq!(note(&n, &mut ng), "");
+
+    // A script's change counts as well, and tiles still set the grid to their size.
+    assert_eq!(script::run_lua(&mut t, "jm.set_view{grid_w=2, grid_h=2, grid_default=true}").error, None);
+    assert_eq!(view(&mut t), (2, 2, 2, 2));
+    t.exec("tileset_create", &json!({"tile_w": 8, "tile_h": 8})).unwrap();
+    assert_eq!((view(&mut t), t.default_frame()), ((8, 8, 2, 2), (8, 8)));
     assert!(!file.with_extension(format!("json.{}.tmp", std::process::id())).exists(), "written beside the file, then renamed over it");
     #[cfg(unix)]
     {
@@ -2070,7 +2221,7 @@ fn recent_files_and_settings() {
     assert_eq!(read_settings(&file), (None, vec![]), "an oversized file is not read");
     // A file that is not a JSON object is replaced rather than left broken.
     std::fs::write(&file, "[1, 2]").unwrap();
-    write_settings(&file, Keymap::Standard, Some(&[a.clone()])).unwrap();
+    write_settings(&file, Keymap::Standard, None, Some(&[a.clone()])).unwrap();
     assert_eq!(read_settings(&file), (Some(Keymap::Standard), vec![a.clone()]));
     // Whatever is at the path is never written through or re-moded: a link is replaced by a
     // real file, a directory is left alone, and a file the user made read-only stays as it is.
@@ -2083,17 +2234,17 @@ fn recent_files_and_settings() {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        write_settings(&link, Keymap::DPaint, Some(&[a.clone()])).unwrap();
+        write_settings(&link, Keymap::DPaint, None, Some(&[a.clone()])).unwrap();
         assert_eq!((std::fs::read_to_string(&target).unwrap().as_str(), mode(&target)), ("precious", 0o644));
         assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink() && read_settings(&link).0 == Some(Keymap::DPaint));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(write_settings(&dir, Keymap::DPaint, None).is_err());
+        assert!(write_settings(&dir, Keymap::DPaint, None, None).is_err());
         assert!(mode(&dir) == 0o755 && !dir.with_extension(format!("json.{}.tmp", std::process::id())).exists());
         let _ = std::fs::remove_file(&locked);
         std::fs::write(&locked, r#"{"keymap":"standard"}"#).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o400)).unwrap();
-        write_settings(&locked, Keymap::DPaint, Some(&[a.clone()])).unwrap();
+        write_settings(&locked, Keymap::DPaint, None, Some(&[a.clone()])).unwrap();
         assert_eq!((read_settings(&locked), mode(&locked)), ((Some(Keymap::Standard), vec![]), 0o400));
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
     }

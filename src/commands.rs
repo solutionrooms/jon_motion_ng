@@ -2017,7 +2017,8 @@ fn editor_cmds(b: &mut B) {
         "set_view",
         Read,
         "zoom:num? Screen pixels per image pixel; center_x:num? Image X at the centre of the view; center_y:num? Image Y at the centre; fit:bool? Zoom to fit the window; \
-         pixel_grid:bool? Pixel grid at high zoom; grid:bool? Custom grid; grid_w:int? Grid cell width; grid_h:int? Grid cell height; \
+         pixel_grid:bool? Pixel grid at high zoom; grid:bool? Custom grid; grid_w:int? Grid cell width (1-1024, starts at 1); grid_h:int? Grid cell height; \
+         grid_default:bool? Make the grid size (as set by this call) the size new documents start with, which the window remembers; \
          tile_grid:bool? Tile grid; tile_ids:bool? Show tile ids on the canvas; cycling:bool? Preview colour cycling; \
          anim_guides:bool? Show the animation's frame cuts on the canvas; \
          keymap:str? Single-key shortcuts in the window: standard or dpaint (Deluxe Paint keys)",
@@ -2051,6 +2052,9 @@ fn editor_cmds(b: &mut B) {
             if let Some(n) = a.oi("grid_h")? {
                 v.grid_h = n.clamp(1, 1024) as u32;
             }
+            if a.b("grid_default")? {
+                v.grid_default = (v.grid_w, v.grid_h);
+            }
             if let Some(b) = a.ob("tile_grid")? {
                 v.tile_grid = b;
             }
@@ -2072,7 +2076,7 @@ fn editor_cmds(b: &mut B) {
     b.add("editor", "get_view", Read, "", "Current zoom, view centre and overlay settings.", |e, _| {
         let v = &e.view;
         Ok(json!({"zoom": v.zoom, "center_x": v.cx, "center_y": v.cy, "pixel_grid": v.pixel_grid, "grid": v.grid, "grid_w": v.grid_w,
-                  "grid_h": v.grid_h, "tile_grid": v.tile_grid, "tile_ids": v.tile_ids, "cycling": v.cycling, "anim_guides": v.anim_guides, "keymap": v.keymap.name()}))
+                  "grid_h": v.grid_h, "grid_default_w": v.grid_default.0, "grid_default_h": v.grid_default.1, "tile_grid": v.tile_grid, "tile_ids": v.tile_ids, "cycling": v.cycling, "anim_guides": v.anim_guides, "keymap": v.keymap.name()}))
     });
 }
 
@@ -2182,7 +2186,7 @@ fn animation_cmds(b: &mut B) {
         Edit,
         "name:str? Which animation (default: the one on show) - a name that is not in use makes a new animation; \
          x:int? Left of the region; y:int? Top of the region; w:int? Region width; h:int? Region height; \
-         frame_w:int? Width of one frame (default: the grid width); frame_h:int? Height of one frame (default: the grid height); \
+         frame_w:int? Width of one frame (default: the tile width, else the grid width, else 16 when the grid is 1x1); frame_h:int? Height of one frame (default: likewise); \
          frames:int? How many frames play, 0 for every frame in the region (default 0); fps:num? Frames per second, 1-60 (default 8)",
         "Set up a grid animation: a region of the image is cut into frames of frame_w x frame_h, read left to right, then top to bottom \
          (part frames at the right and bottom edges are left out). For a new animation the region defaults to the selection, or the whole image \
@@ -2219,8 +2223,8 @@ fn animation_cmds(b: &mut B) {
                 return Err("the region is empty or outside the image".into());
             }
             let (w, h) = (x1 - x0, y1 - y0);
-            let fw = a.oi("frame_w")?.or(grid.map(|c| c.fw as i64)).unwrap_or(e.view.grid_w as i64);
-            let fh = a.oi("frame_h")?.or(grid.map(|c| c.fh as i64)).unwrap_or(e.view.grid_h as i64);
+            let fw = a.oi("frame_w")?.or(grid.map(|c| c.fw as i64)).unwrap_or(e.default_frame().0 as i64);
+            let fh = a.oi("frame_h")?.or(grid.map(|c| c.fh as i64)).unwrap_or(e.default_frame().1 as i64);
             if fw < 1 || fh < 1 {
                 return Err("frame_w and frame_h must be at least 1".into());
             }
@@ -2427,7 +2431,7 @@ fn tab_cmds(b: &mut B) {
                 e.exec("new_document", &p)?;
                 return Ok(json!({"id": e.id, "reused": true}));
             }
-            let mut t = Engine::new(e.host);
+            let mut t = e.new_tab();
             t.exec("new_document", &p)?;
             Ok(json!({"id": e.tab_add(t)?}))
         },
@@ -2455,7 +2459,7 @@ fn tab_cmds(b: &mut B) {
             if e.order.len() >= MAX_TABS {
                 return Err(format!("{MAX_TABS} documents are open, which is the limit; close one first"));
             }
-            let mut t = Engine::new(e.host);
+            let mut t = e.new_tab();
             let v = t.exec("open_document", &open)?;
             Ok(json!({"id": e.tab_add(t)?, "converted_to_indexed": v["converted_to_indexed"] == true, "legacy_truecolor": v["legacy_truecolor"] == true}))
         },

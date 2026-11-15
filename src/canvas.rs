@@ -397,7 +397,7 @@ pub fn show(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     if e.view.pixel_grid && zoom >= 8.0 {
         grid(1, 1, Stroke::new(1.0_f32, Color32::from_black_alpha(48)));
     }
-    if e.view.grid && e.view.grid_w as f32 * zoom >= 4.0 {
+    if e.view.grid && zoom >= e.view.grid_zoom() {
         grid(e.view.grid_w as i32, e.view.grid_h as i32, Stroke::new(1.0_f32, Color32::from_white_alpha(52)));
     }
     if let Some(ts) = &e.doc.tileset {

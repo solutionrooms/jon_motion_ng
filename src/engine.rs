@@ -180,6 +180,9 @@ impl Keymap {
     }
 }
 
+/// A grid whose cells would be under this many screen pixels, either way, is not drawn.
+pub const GRID_MIN_PX: f32 = 4.0;
+
 #[derive(Clone)]
 pub struct View {
     pub keymap: Keymap,
@@ -191,6 +194,9 @@ pub struct View {
     pub grid: bool,
     pub grid_w: u32,
     pub grid_h: u32,
+    /// The grid size a new document starts with. Like the key preset it belongs to the
+    /// window, not to one document, and the window remembers it in the settings file.
+    pub grid_default: (u32, u32),
     pub tile_grid: bool,
     pub tile_ids: bool,
     pub cycling: bool,
@@ -238,6 +244,9 @@ pub struct Snapshot {
     reset_history: bool,
     blank: bool,
     old_file: bool,
+    /// What the window shows, and the preferences it remembers (key preset, default grid
+    /// size): a call that fails leaves those as they were too.
+    view: View,
 }
 
 pub struct Engine {
@@ -298,6 +307,26 @@ pub struct Engine {
 /// that ignores it, a link to its folder).
 pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     a == b || std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(x, y)| x == y)
+}
+
+/// The grid size a new document starts with unless the user chose another: one pixel.
+pub const GRID_DEFAULT: (u32, u32) = (1, 1);
+/// Largest grid cell, each way.
+pub const GRID_MAX: u32 = 1024;
+/// The frame size a new animation starts with when nothing else suggests one.
+const FRAME_DEFAULT: (u32, u32) = (16, 16);
+
+impl View {
+    /// The zoom from which the grid is drawn: its smaller side is then `GRID_MIN_PX` on screen.
+    pub fn grid_zoom(&self) -> f32 {
+        GRID_MIN_PX / self.grid_w.min(self.grid_h).max(1) as f32
+    }
+
+    /// When the grid is switched on but too fine to draw at this zoom: what to tell the user.
+    pub fn grid_hidden(&self) -> Option<String> {
+        (self.grid && self.zoom < self.grid_zoom())
+            .then(|| format!("The {}x{} grid shows from {}% zoom (it is {}% now)", self.grid_w, self.grid_h, (self.grid_zoom() * 100.0).ceil(), (self.zoom * 100.0).round()))
+    }
 }
 
 /// Most documents open at once.
@@ -362,8 +391,9 @@ impl Engine {
                 fit: true,
                 pixel_grid: true,
                 grid: false,
-                grid_w: 16,
-                grid_h: 16,
+                grid_w: GRID_DEFAULT.0,
+                grid_h: GRID_DEFAULT.1,
+                grid_default: GRID_DEFAULT,
                 tile_grid: true,
                 tile_ids: false,
                 cycling: false,
@@ -464,6 +494,7 @@ impl Engine {
         self.o.active_ramp = mine.active_ramp;
         self.o.custom_brush = mine.custom_brush;
         self.view.keymap = t.view.keymap;
+        self.view.grid_default = t.view.grid_default;
         self.rev = self.rev.max(t.rev) + 1;
         self.parked.push(t);
         self.fix_state();
@@ -509,7 +540,7 @@ impl Engine {
         match self.order.get(at + 1).or(at.checked_sub(1).and_then(|i| self.order.get(i))).copied() {
             Some(next) => self.tab_select(next)?,
             None => {
-                let mut blank = Engine::new(self.host);
+                let mut blank = self.new_tab();
                 blank.id = self.next_id;
                 self.next_id += 1;
                 self.order.push(blank.id);
@@ -519,6 +550,31 @@ impl Engine {
         self.parked.retain(|p| p.id != id);
         self.order.retain(|&o| o != id);
         Ok(())
+    }
+
+    /// A blank document for a new tab of this window: it starts with the window's grid size.
+    pub fn new_tab(&self) -> Engine {
+        let mut t = Engine::new(self.host);
+        t.use_grid_default(self.view.grid_default);
+        t.view.keymap = self.view.keymap;
+        t
+    }
+
+    /// Set the grid size new documents start with, and give it to this one.
+    pub fn use_grid_default(&mut self, (w, h): (u32, u32)) {
+        let d = (w.clamp(1, GRID_MAX), h.clamp(1, GRID_MAX));
+        self.view.grid_default = d;
+        (self.view.grid_w, self.view.grid_h) = d;
+    }
+
+    /// The frame size offered for a new animation: a tile if there are tiles, else the grid
+    /// cell when the grid is coarser than single pixels, else 16x16.
+    pub fn default_frame(&self) -> (u32, u32) {
+        match &self.doc.tileset {
+            Some(ts) => (ts.tw, ts.th),
+            None if (self.view.grid_w, self.view.grid_h) != (1, 1) => (self.view.grid_w, self.view.grid_h),
+            None => FRAME_DEFAULT,
+        }
     }
 
     /// The open document showing this file, if any.
@@ -824,6 +880,7 @@ impl Engine {
             reset_history: self.reset_history,
             blank: self.blank,
             old_file: self.old_file,
+            view: self.view.clone(),
         }
     }
 
@@ -837,6 +894,7 @@ impl Engine {
         self.reset_history = s.reset_history;
         self.blank = s.blank;
         self.old_file = s.old_file;
+        self.view = s.view;
     }
 
     fn begin_top(&mut self) -> Option<Snapshot> {
@@ -915,7 +973,13 @@ impl Engine {
             }
         }
         if cmd.kind == Kind::Read {
+            // These do not change the document, but set_view changes what the window shows
+            // and remembers: a call that fails part-way leaves that as it was.
+            let view = self.view.clone();
             let r = guarded(|| (cmd.run)(self, &args));
+            if r.is_err() {
+                self.view = view;
+            }
             self.rev += 1;
             return r.map_err(|e| format!("{name}: {e}"));
         }

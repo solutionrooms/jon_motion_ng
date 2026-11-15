@@ -346,6 +346,7 @@ fn install_doc(e: &mut Engine, doc: Doc, path: Option<PathBuf>, blank: bool) {
     e.o.active_ramp = None;
     e.o.active_tile = 0;
     e.path = path;
+    e.legacy_tc = false;
     e.modified = false;
     e.reset_history = true;
     e.view.fit = true;
@@ -760,6 +761,7 @@ fn document_cmds(b: &mut B) {
                 e.path_free(&p)?;
                 let (d, legacy) = io::load_doc_noting(&p)?;
                 install_doc(e, d, Some(p), false);
+                e.legacy_tc = legacy;
                 let mut v = info(e);
                 if legacy {
                     // Saving it writes the true-colour form, which the version that made it cannot open.
@@ -774,17 +776,24 @@ fn document_cmds(b: &mut B) {
         "save_document",
         Read,
         "path:str? Destination .jmn file (default: the current file)",
-        "Save the project in the native .jmn format (layers, palette, ramps, tiles). Overwrites an existing file.",
+        "Save the project in the native .jmn format (layers, palette, ramps, tiles). Overwrites an existing file. Saving a true-colour project from 0.1.0-0.1.2 over itself \
+         rewrites it in the form 0.1.4 and older cannot open (rewrote_legacy_truecolor is then true); pass another path to keep the original.",
         |e, a| {
             let p = match a.os("path")? {
                 Some(_) => path_arg(a, "jmn")?,
                 None => e.path.clone().ok_or("the document has no file yet; pass 'path'")?,
             };
             e.path_free(&p)?;
+            // Said in the answer, since a caller cannot be asked first the way the window asks.
+            let rewrote = e.legacy_rewrite() && e.path.as_ref() == Some(&p);
             io::save_doc(&e.doc, &p)?;
             e.path = Some(p.clone());
             e.mark_saved();
-            Ok(json!({"path": p.display().to_string()}))
+            let mut v = json!({"path": p.display().to_string()});
+            if rewrote {
+                v["rewrote_legacy_truecolor"] = json!(true);
+            }
+            Ok(v)
         },
     );
     b.add(

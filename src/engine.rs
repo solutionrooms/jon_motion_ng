@@ -237,6 +237,7 @@ pub struct Snapshot {
     tiles_dirty: Option<bool>,
     reset_history: bool,
     blank: bool,
+    legacy_tc: bool,
 }
 
 pub struct Engine {
@@ -287,6 +288,9 @@ pub struct Engine {
     roster: Option<Vec<Value>>,
     /// True for a document made blank (not read from a file).
     pub blank: bool,
+    /// True for a true-colour project opened from a file 0.1.0-0.1.2 wrote, until it is saved:
+    /// that save rewrites the file in the form those versions cannot open, so the window asks first.
+    pub legacy_tc: bool,
 }
 
 /// Most documents open at once.
@@ -386,6 +390,7 @@ impl Engine {
             next_id: 2,
             roster: None,
             blank: true,
+            legacy_tc: false,
         }
     }
 
@@ -569,6 +574,7 @@ impl Engine {
         e.id = self.id;
         e.roster = Some(self.tab_list());
         e.blank = self.blank;
+        e.legacy_tc = self.legacy_tc;
         e
     }
 
@@ -576,6 +582,7 @@ impl Engine {
     pub fn adopt(&mut self, s: Engine) {
         let (modified, reset) = (s.modified, s.was_reset);
         self.blank = s.blank;
+        self.legacy_tc = s.legacy_tc;
         let _ = self.group(|e| {
             e.doc = s.doc;
             e.o = s.o;
@@ -809,6 +816,7 @@ impl Engine {
             tiles_dirty: self.tiles_dirty,
             reset_history: self.reset_history,
             blank: self.blank,
+            legacy_tc: self.legacy_tc,
         }
     }
 
@@ -821,6 +829,7 @@ impl Engine {
         self.tiles_dirty = s.tiles_dirty;
         self.reset_history = s.reset_history;
         self.blank = s.blank;
+        self.legacy_tc = s.legacy_tc;
     }
 
     fn begin_top(&mut self) -> Option<Snapshot> {
@@ -959,6 +968,13 @@ impl Engine {
         self.modified = false;
         self.saved_at = Some(self.edits);
         self.saved_to = self.path.clone();
+        self.legacy_tc = false;
+    }
+
+    /// True when saving to the document's own file would turn a project 0.1.0-0.1.2 wrote
+    /// into one those versions (and 0.1.3, 0.1.4) cannot open.
+    pub fn legacy_rewrite(&self) -> bool {
+        self.legacy_tc && self.doc.rgba() && self.path.is_some()
     }
 
     /// Direct pixel read for scripts.

@@ -262,8 +262,31 @@ fn everything_is_indexed() {
     assert_eq!((e.doc.layers[1].data[0], unpack(e.doc.layers[1].data[8])), (TRANSP, [1, 2, 3, 77]));
     // Saved from here it is an ordinary true-colour project, which opens the same and is no longer "legacy".
     let before = e.doc.clone();
-    e.exec("save_document", &json!({})).unwrap();
+    // Until it is saved, the window asks before Save rewrites the file (legacy_rewrite). Not
+    // while it is indexed, since that is saved in the form the old version opens.
+    assert!(e.legacy_rewrite());
+    e.exec("convert_mode", &json!({"mode": "indexed"})).unwrap();
+    assert!(!e.legacy_rewrite());
+    e.undo().unwrap();
+    assert!(e.legacy_rewrite() && e.doc.layers == before.layers);
+    // A script's working copy knows too, and a failed command does not lose it.
+    assert_eq!(script::run_lua(&mut e, "jm.set(0, 0, '#010203')").error, None);
+    e.exec("save_document", &json!({"path": tmp("nope.txt")})).unwrap_err();
+    assert!(e.legacy_rewrite());
+    e.undo().unwrap();
+    // Saved somewhere else the original is untouched, and the document is no longer the old file.
+    let copy = tmp("old_rgba_copy.jmn");
+    let v = e.exec("save_document", &json!({"path": copy})).unwrap();
+    assert!(v.get("rewrote_legacy_truecolor").is_none() && !e.legacy_rewrite());
+    assert_eq!((std::fs::read(&old).unwrap()[4], std::fs::read(&copy).unwrap()[4]), (1, 2));
+    // Saved over itself, a caller is told what happened (it cannot be asked first).
+    e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    assert!(e.legacy_rewrite());
+    let v = e.exec("save_document", &json!({})).unwrap();
+    assert_eq!(v["rewrote_legacy_truecolor"], true);
+    assert!(!e.legacy_rewrite());
     assert_eq!(std::fs::read(&old).unwrap()[4], 2);
+    assert!(e.exec("save_document", &json!({})).unwrap().get("rewrote_legacy_truecolor").is_none());
     let v = e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
     assert!(v.get("legacy_truecolor").is_none() && e.doc.layers == before.layers);
     // An old indexed project is not affected: no flag, and its layer opacity is simply dropped.

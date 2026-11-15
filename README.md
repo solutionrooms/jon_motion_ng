@@ -85,7 +85,9 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
   wrongly; indexed projects are written exactly as before. That is why Image > Convert to True Colour... asks first:
   the next Save rewrites the project file in that form. A true-colour project made by 0.1.0-0.1.2 opens as true
   colour with its pixels as they were (the status line says so, and `open_document` answers `legacy_truecolor`);
-  saving it also writes the new form, so use Save As to keep the original for the old version. Layers have no
+  saving it also writes the new form, so Save asks first (Save, Save As... or Cancel) the first time, including when
+  you choose Save from the unsaved-changes question. A script or AI client cannot be asked: `save_document` over
+  the same file goes ahead and answers `rewrote_legacy_truecolor`, and saving to another path keeps the original. Layers have no
   opacity setting in either kind: where such an old project had a part-transparent layer, that opacity goes into the
   layer's pixels so the picture looks the same (a tile-mapped layer becomes fully opaque instead).
 

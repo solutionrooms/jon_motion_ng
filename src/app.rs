@@ -41,6 +41,9 @@ pub enum Dialog {
     Dropped(PathBuf),
     /// Convert this indexed document to true colour? Asked first, because of what Save then writes.
     ToTrue,
+    /// Save this true-colour document over a file older versions can still open? `then` is
+    /// what was waiting on the save.
+    OldFileSave { then: Option<Pending> },
 }
 
 pub enum Pending {
@@ -418,11 +421,23 @@ fn file_stem(e: &Engine) -> String {
 }
 
 pub fn save(e: &mut Engine, g: &mut Gui, save_as: bool) -> bool {
+    save_asking(e, g, save_as, false)
+}
+
+/// Save, unless that would rewrite a file older versions can open as a true-colour project
+/// they cannot: then the question is put first (`asked` is true once it has been answered).
+fn save_asking(e: &mut Engine, g: &mut Gui, save_as: bool, asked: bool) -> bool {
     let path = match (&e.path, save_as) {
         (Some(p), false) => Some(p.clone()),
         _ => rfd::FileDialog::new().add_filter("Jon Motion project", &["jmn"]).set_file_name(format!("{}.jmn", file_stem(e))).save_file(),
     };
     let Some(path) = path else { return false };
+    if !asked && e.rewrites_old_file(&path) {
+        if !matches!(g.dialog, Dialog::OldFileSave { .. }) {
+            g.dialog = Dialog::OldFileSave { then: None };
+        }
+        return false;
+    }
     let ok = g.run(e, "save_document", json!({ "path": path.display().to_string() })).is_some();
     if ok {
         g.info(format!("Saved {}", path.display()));
@@ -437,11 +452,11 @@ fn open(e: &mut Engine, g: &mut Gui) {
     }
 }
 
-/// What is said when a true-colour project from 0.1.0-0.1.2 is opened: Save changes its form.
+/// What is said when a true-colour project from 0.1.0-0.1.2 is opened: Save changes its form (and asks first).
 fn legacy_note(p: &Path) -> String {
     // Short, with the file's name only, so it fits the status bar.
     let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    format!("Opened {name}, an older true-colour project: Save rewrites it so 0.1.4 and older cannot open it (Save As keeps the original)")
+    format!("Opened {name}, an older true-colour project: Save asks before rewriting it in the form 0.1.4 and older cannot open")
 }
 
 /// Open a file the user chose, in a new tab (or in place of an untouched blank document). A
@@ -1476,11 +1491,45 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
             let (ok, cancel) = buttons(ui, "Convert");
             if ok {
                 if g.run(e, "convert_mode", json!({ "mode": "truecolor" })).is_some() {
+                    // This was the question about what Save writes, so Save does not ask it again.
+                    e.old_file = false;
                     g.info("This document is now true colour (Edit > Undo goes back)");
                 }
                 close = true;
             }
             close |= cancel;
+        }),
+        Dialog::OldFileSave { then } => window(ctx, "Save Over the Original?", |ui| {
+            let name: String = e.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = if name.chars().count() > 48 { format!("{}...", name.chars().take(45).collect::<String>()) } else { name };
+            ui.label(format!("\"{name}\" can be opened by Jon Motion 0.1.4 and older as it is now."));
+            ui.label("Saving this true-colour document over it writes a form those versions cannot open.");
+            ui.weak("Save As... writes a new file and leaves the original as it is.");
+            ui.add_space(8.0);
+            let mut choice = None;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("Save").color(Color32::WHITE)).fill(Color32::from_rgb(58, 104, 196))).clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Save As...").clicked() {
+                    choice = Some(true);
+                }
+                close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+            });
+            if let Some(save_as) = choice {
+                close = true;
+                let then = then.take();
+                if save_asking(e, g, save_as, true) {
+                    if let Some(what) = then {
+                        proceed(e, g, what);
+                    }
+                } else if matches!(then, Some(Pending::Quit)) {
+                    g.quit_skip.clear();
+                }
+            } else if close && matches!(then, Some(Pending::Quit)) {
+                // Like cancelling the unsaved-changes question: quitting starts over next time.
+                g.quit_skip.clear();
+            }
         }),
         Dialog::Scale { w, h } => window(ctx, "Scale Image", |ui| {
             size_fields(ui, w, h);
@@ -1657,6 +1706,7 @@ pub fn answer(e: &mut Engine, g: &mut Gui, choice: u8) {
         return;
     }
     match choice {
+        0 if e.path.as_ref().is_some_and(|p| e.rewrites_old_file(p)) => g.dialog = Dialog::OldFileSave { then: Some(what) },
         0 => {
             if save(e, g, false) {
                 proceed(e, g, what);
@@ -1778,7 +1828,10 @@ impl eframe::App for App {
                 g.quit_skip.clear();
                 g.status = "The document on show changed, so the question was cancelled".into();
             }
-            if matches!(g.dialog, Dialog::Resize { .. } | Dialog::Scale { .. } | Dialog::Reduce { .. } | Dialog::Dropped(_) | Dialog::ToTrue) {
+            if matches!(g.dialog, Dialog::Resize { .. } | Dialog::Scale { .. } | Dialog::Reduce { .. } | Dialog::Dropped(_) | Dialog::ToTrue | Dialog::OldFileSave { .. }) {
+                if matches!(g.dialog, Dialog::OldFileSave { then: Some(Pending::Quit) }) {
+                    g.quit_skip.clear();
+                }
                 g.dialog = Dialog::None;
                 g.status = "The document on show changed, so the dialog was closed".into();
             }

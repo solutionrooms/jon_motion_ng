@@ -262,8 +262,61 @@ fn everything_is_indexed() {
     assert_eq!((e.doc.layers[1].data[0], unpack(e.doc.layers[1].data[8])), (TRANSP, [1, 2, 3, 77]));
     // Saved from here it is an ordinary true-colour project, which opens the same and is no longer "legacy".
     let before = e.doc.clone();
-    e.exec("save_document", &json!({})).unwrap();
+    // The window asks before Save turns a file 0.1.4 and older can open into one they cannot
+    // (rewrites_old_file). Not while the document is indexed, which is saved in the old form.
+    let me = std::path::PathBuf::from(&old);
+    let asks = |e: &Engine| e.path.as_ref().is_some_and(|p| e.rewrites_old_file(p));
+    assert!(asks(&e));
+    e.exec("convert_mode", &json!({"mode": "indexed"})).unwrap();
+    assert!(!asks(&e));
+    e.undo().unwrap();
+    assert!(asks(&e) && e.doc.layers == before.layers);
+    // A script's working copy knows too, and a failed command does not lose it.
+    assert_eq!(script::run_lua(&mut e, "jm.set(0, 0, '#010203')").error, None);
+    e.exec("save_document", &json!({"path": tmp("nope.txt")})).unwrap_err();
+    assert!(asks(&e));
+    e.undo().unwrap();
+    // Saved somewhere else the original is untouched, and the document is no longer that file.
+    let copy = tmp("old_rgba_copy.jmn");
+    let v = e.exec("save_document", &json!({"path": copy})).unwrap();
+    assert!(v.get("rewrote_as_truecolor").is_none() && !asks(&e));
+    assert_eq!((std::fs::read(&old).unwrap()[4], std::fs::read(&copy).unwrap()[4]), (1, 2));
+    // Saved while indexed the file stays in the old form, so undoing the conversion asks again.
+    e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    e.exec("convert_mode", &json!({"mode": "indexed"})).unwrap();
+    assert!(e.exec("save_document", &json!({})).unwrap().get("rewrote_as_truecolor").is_none());
+    assert_eq!(std::fs::read(&old).unwrap()[4], 1);
+    e.undo().unwrap();
+    assert!(e.doc.rgba() && asks(&e));
+    // Saved over itself, a caller is told what happened (it cannot be asked first), however
+    // it spells the file.
+    let dir = me.parent().unwrap();
+    let other = dir.join("..").join(dir.file_name().unwrap()).join(me.file_name().unwrap());
+    assert!(other != me && e.rewrites_old_file(&other));
+    let v = e.exec("save_document", &json!({"path": other.display().to_string()})).unwrap();
+    assert_eq!(v["rewrote_as_truecolor"], true);
+    assert!(!asks(&e));
     assert_eq!(std::fs::read(&old).unwrap()[4], 2);
+    assert!(e.exec("save_document", &json!({})).unwrap().get("rewrote_as_truecolor").is_none());
+    // The same holds with no old true-colour project involved: an indexed project converted by
+    // a command (the window's own Convert asks at that point instead) and saved over itself.
+    let plain = tmp("plain_indexed.jmn");
+    e.exec("new_document", &json!({"width": 4, "height": 4, "force": true})).unwrap();
+    assert!(e.exec("save_document", &json!({"path": plain})).unwrap().get("rewrote_as_truecolor").is_none());
+    assert!(!asks(&e));
+    e.exec("convert_mode", &json!({"mode": "truecolor"})).unwrap();
+    assert!(asks(&e));
+    assert_eq!(e.exec("save_document", &json!({})).unwrap()["rewrote_as_truecolor"], true);
+    // Back to indexed and saved, the file is old-form again; redoing nothing, converting again asks again.
+    e.exec("convert_mode", &json!({"mode": "indexed"})).unwrap();
+    e.exec("save_document", &json!({})).unwrap();
+    e.undo().unwrap();
+    assert!(e.doc.rgba() && asks(&e));
+    // Reopened from disk it is known to be an old-form file from the start.
+    e.exec("open_document", &json!({"path": plain, "force": true})).unwrap();
+    assert!(!e.doc.rgba() && !asks(&e));
+    e.exec("convert_mode", &json!({"mode": "truecolor"})).unwrap();
+    assert!(asks(&e));
     let v = e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
     assert!(v.get("legacy_truecolor").is_none() && e.doc.layers == before.layers);
     // An old indexed project is not affected: no flag, and its layer opacity is simply dropped.

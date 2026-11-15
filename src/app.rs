@@ -77,6 +77,9 @@ pub struct Gui {
     pub saved_keymap: Option<Keymap>,
     /// The default grid size last read from or written to the settings file.
     pub saved_grid: (u32, u32),
+    /// The document on show and its grid setting when last looked at, so the user is told
+    /// once when they switch on (or resize) a grid that is too fine to draw at this zoom.
+    pub grid_seen: (u32, bool, u32, u32),
     pub last_pos: Option<egui::Pos2>,
     pub zoom_accum: f32,
     pub canvas_rect: egui::Rect,
@@ -142,6 +145,7 @@ impl Gui {
         Gui {
             saved_keymap: None,
             saved_grid: crate::engine::GRID_DEFAULT,
+            grid_seen: (0, false, 0, 0),
             tex: None,
             tex_key: (0, 0, -1),
             tile_tex: None,
@@ -744,6 +748,19 @@ pub fn write_settings(p: &Path, keymap: Keymap, grid: Option<(u32, u32)>, recent
         let _ = std::fs::remove_file(&tmp);
     }
     done
+}
+
+/// Say so when the grid was just switched on, or resized, and is too fine to be drawn at
+/// this zoom: otherwise nothing on screen changes and it looks as if the grid did not work.
+pub fn grid_note(e: &Engine, g: &mut Gui) {
+    let now = (e.id, e.view.grid, e.view.grid_w, e.view.grid_h);
+    let before = std::mem::replace(&mut g.grid_seen, now);
+    // Not on changing tabs: that document's grid was not just touched.
+    if before != now && before.0 == now.0 {
+        if let Some(why) = e.view.grid_hidden() {
+            g.info(why);
+        }
+    }
 }
 
 /// Write the preferences when one changed (from the menu, the dialog, a script or an AI client).
@@ -1767,6 +1784,7 @@ impl eframe::App for App {
         } else {
             g.anim_rect = egui::Rect::NOTHING;
         }
+        grid_note(e, g);
         egui::TopBottomPanel::top("menu").show(ctx, |ui| menu_bar(ui, e, g));
         egui::TopBottomPanel::top("options").exact_height(34.0).show(ctx, |ui| panels::options(ui, e, g));
         egui::TopBottomPanel::top("tabs").exact_height(28.0).show(ctx, |ui| tab_bar(ui, e, g, modal));

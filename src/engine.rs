@@ -180,6 +180,9 @@ impl Keymap {
     }
 }
 
+/// A grid whose cells would be under this many screen pixels, either way, is not drawn.
+pub const GRID_MIN_PX: f32 = 4.0;
+
 #[derive(Clone)]
 pub struct View {
     pub keymap: Keymap,
@@ -240,6 +243,9 @@ pub struct Snapshot {
     tiles_dirty: Option<bool>,
     reset_history: bool,
     blank: bool,
+    /// What the window shows, and the preferences it remembers (key preset, default grid
+    /// size): a call that fails leaves those as they were too.
+    view: View,
 }
 
 pub struct Engine {
@@ -298,6 +304,19 @@ pub const GRID_DEFAULT: (u32, u32) = (1, 1);
 pub const GRID_MAX: u32 = 1024;
 /// The frame size a new animation starts with when nothing else suggests one.
 const FRAME_DEFAULT: (u32, u32) = (16, 16);
+
+impl View {
+    /// The zoom from which the grid is drawn: its smaller side is then `GRID_MIN_PX` on screen.
+    pub fn grid_zoom(&self) -> f32 {
+        GRID_MIN_PX / self.grid_w.min(self.grid_h).max(1) as f32
+    }
+
+    /// When the grid is switched on but too fine to draw at this zoom: what to tell the user.
+    pub fn grid_hidden(&self) -> Option<String> {
+        (self.grid && self.zoom < self.grid_zoom())
+            .then(|| format!("The {}x{} grid shows from {}% zoom (it is {}% now)", self.grid_w, self.grid_h, (self.grid_zoom() * 100.0).ceil(), (self.zoom * 100.0).round()))
+    }
+}
 
 /// Most documents open at once.
 pub const MAX_TABS: usize = 32;
@@ -846,6 +865,7 @@ impl Engine {
             tiles_dirty: self.tiles_dirty,
             reset_history: self.reset_history,
             blank: self.blank,
+            view: self.view.clone(),
         }
     }
 
@@ -858,6 +878,7 @@ impl Engine {
         self.tiles_dirty = s.tiles_dirty;
         self.reset_history = s.reset_history;
         self.blank = s.blank;
+        self.view = s.view;
     }
 
     fn begin_top(&mut self) -> Option<Snapshot> {
@@ -936,7 +957,13 @@ impl Engine {
             }
         }
         if cmd.kind == Kind::Read {
+            // These do not change the document, but set_view changes what the window shows
+            // and remembers: a call that fails part-way leaves that as it was.
+            let view = self.view.clone();
             let r = guarded(|| (cmd.run)(self, &args));
+            if r.is_err() {
+                self.view = view;
+            }
             self.rev += 1;
             return r.map_err(|e| format!("{name}: {e}"));
         }

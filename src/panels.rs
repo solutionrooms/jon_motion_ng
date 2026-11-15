@@ -342,7 +342,10 @@ pub fn options(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
             if ui.small_button("-").clicked() {
                 crate::app::zoom(e, -1);
             }
-            ui.toggle_value(&mut e.view.grid, "Grid");
+            let grid = ui.toggle_value(&mut e.view.grid, "Grid");
+            if let Some(why) = e.view.grid_hidden() {
+                grid.on_hover_text(why);
+            }
             let _ = g;
         });
     });

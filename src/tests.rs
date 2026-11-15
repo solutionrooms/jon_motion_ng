@@ -2053,6 +2053,54 @@ fn recent_files_and_settings() {
     let id = t.id;
     t.exec("tab_close", &json!({"id": id, "force": true})).unwrap();
     assert_eq!(view(&mut t), (5, 5, 5, 5), "the blank document left behind");
+    // A call that fails changes neither the grid nor what the window remembers.
+    t.exec("set_view", &json!({"grid_w": 6, "grid_h": 6, "grid_default": true, "keymap": "bogus"})).unwrap_err();
+    assert_eq!(view(&mut t), (5, 5, 5, 5));
+    t.exec("set_view", &json!({"keymap": "dpaint", "zoom": 3, "grid_default": "yes"})).unwrap_err();
+    assert_eq!((t.view.keymap, view(&mut t)), (Keymap::Standard, (5, 5, 5, 5)));
+    let failed = t.group(|t| {
+        t.exec("set_view", &json!({"grid_w": 10, "grid_h": 10, "grid_default": true, "keymap": "dpaint"}))?;
+        t.exec("no_such_command", &json!({})).map(|_| ())
+    });
+    assert!(failed.is_err());
+    assert_eq!((t.view.keymap, view(&mut t)), (Keymap::Standard, (5, 5, 5, 5)));
+    assert!(script::run_lua(&mut t, "jm.set_view{grid_w=9, grid_h=9, grid_default=true} error('stop')").error.is_some());
+    assert_eq!(view(&mut t), (5, 5, 5, 5));
+
+    // The grid is drawn once its smaller side is four screen pixels. Switched on, or resized,
+    // while it is finer than that, the window says so once - and not just for changing tabs.
+    use crate::app::grid_note;
+    let mut n = eng(64, 64);
+    let mut ng = Gui::new();
+    let note = |n: &Engine, ng: &mut Gui| {
+        ng.status.clear();
+        grid_note(n, ng);
+        ng.status.clone()
+    };
+    n.view.zoom = 3.0;
+    assert_eq!((n.view.grid_zoom(), n.view.grid_hidden(), note(&n, &mut ng)), (4.0, None, String::new()));
+    assert_eq!(note(&n, &mut ng), "");
+    n.view.grid = true;
+    assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 300% now)");
+    assert_eq!(note(&n, &mut ng), "", "said once");
+    n.view.zoom = 4.0;
+    n.view.grid = false;
+    assert_eq!(note(&n, &mut ng), "");
+    n.view.grid = true;
+    assert_eq!((n.view.grid_hidden(), note(&n, &mut ng)), (None, String::new()), "drawn at 4x");
+    (n.view.grid_w, n.view.grid_h, n.view.zoom) = (16, 1, 0.25);
+    assert_eq!(note(&n, &mut ng), "The 16x1 grid shows from 400% zoom (it is 25% now)", "the finer side decides");
+    (n.view.grid_w, n.view.grid_h) = (16, 16);
+    assert_eq!((n.view.grid_zoom(), note(&n, &mut ng)), (0.25, String::new()));
+    (n.view.grid_w, n.view.grid_h, n.view.zoom) = (3, 3, 1.0);
+    assert_eq!(note(&n, &mut ng), "The 3x3 grid shows from 134% zoom (it is 100% now)");
+    n.exec("tab_new", &json!({})).unwrap();
+    n.view.grid = true;
+    n.view.zoom = 1.0;
+    assert_eq!(note(&n, &mut ng), "", "another document coming on show is not a change to its grid");
+    n.view.grid_w = 2;
+    assert_eq!(note(&n, &mut ng), "The 2x1 grid shows from 400% zoom (it is 100% now)");
+
     // A script's change counts as well, and tiles still set the grid to their size.
     assert_eq!(script::run_lua(&mut t, "jm.set_view{grid_w=2, grid_h=2, grid_default=true}").error, None);
     assert_eq!(view(&mut t), (2, 2, 2, 2));

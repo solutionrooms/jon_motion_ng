@@ -1897,6 +1897,16 @@ fn true_colour_is_a_separate_kind_of_document() {
     assert_eq!((e.doc.to_rgba(e.doc.layers[0].data[0]), e.doc.to_rgba(e.doc.layers[0].data[3 * 16 + 3]), e.doc.layers[0].data[255]), ([0xab, 0xcd, 0xef, 255], pal.rgba(40), TRANSP));
     assert!(e.doc.layers[0].data.iter().all(|&c| c <= TRANSP) && e.o.fg < 256 && e.o.bg < 256);
 
+    // A picture with thousands of colours and transparent pixels, made indexed, leaves room
+    // for transparency in its palette, so it can always be exported.
+    let mut e = Engine::new("headless");
+    e.exec("open_document", &json!({"path": png, "mode": "truecolor"})).unwrap();
+    assert_eq!(e.exec("get_pixel", &json!({"x": 7, "y": 3, "merged": true})).unwrap()["color"], hex8(src[3 * 40 + 7]));
+    let v = e.exec("convert_mode", &json!({"mode": "indexed"})).unwrap();
+    assert!(v["palette_count"].as_i64().is_some_and(|n| n > 200 && n <= 255), "{v}");
+    e.exec("export_png", &json!({"path": tmp("tc_conv.png")})).unwrap();
+    assert!(matches!(io::load_png(&path("tc_conv.png")).unwrap().pixels, PngPixels::Indexed { .. }));
+
     // Tabs: each document is its own kind, the tab list says which, and copy / paste between
     // the two keeps the look (exactly into true colour, nearest palette colour into indexed).
     let mut e = eng(8, 8);

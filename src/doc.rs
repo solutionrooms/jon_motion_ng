@@ -647,6 +647,22 @@ impl Doc {
         out
     }
 
+    /// One pixel of `flat_cells`, without flattening the whole image.
+    pub fn flat_cell(&self, i: usize) -> Cell {
+        let mut px = [0u8; 4];
+        let mut out = TRANSP;
+        for l in self.layers.iter().filter(|l| l.visible) {
+            let c = l.data[i];
+            if self.rgba() {
+                blend(&mut px, unpack(c));
+                out = pack(px);
+            } else if c < 256 {
+                out = c;
+            }
+        }
+        out
+    }
+
     pub fn sel_at(&self, x: i32, y: i32) -> bool {
         match &self.selection {
             None => true,

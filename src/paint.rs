@@ -389,6 +389,10 @@ impl Painter<'_> {
         for dy in -1..=1 {
             for dx in -1..=1 {
                 let wgt = if dx == 0 && dy == 0 { 2.0 } else { 1.0 };
+                // Neighbours off the canvas do not count, so an edge is not faded towards nothing.
+                if x + dx < 0 || y + dy < 0 || x + dx >= self.w || y + dy >= self.h {
+                    continue;
+                }
                 n += wgt;
                 if let Some(c) = at(x + dx, y + dy) {
                     let a = c[3] as f32 / 255.0 * wgt;

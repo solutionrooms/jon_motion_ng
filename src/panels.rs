@@ -485,7 +485,8 @@ pub fn palette(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
         }
         let c = e.doc.palette.colors[i];
         let used = if rgba { String::new() } else { format!("\n{} px", g.usage.get(i).copied().unwrap_or(0)) };
-        resp.on_hover_text(format!("{i}  {}{used}\nClick: foreground   Right-click: background\nShift-click: select a range   Alt: flash on canvas", hex6(c)));
+        let flash = if rgba { "" } else { "   Alt: flash on canvas" };
+        resp.on_hover_text(format!("{i}  {}{used}\nClick: foreground   Right-click: background\nShift-click: select a range{flash}", hex6(c)));
     }
 
     // ---- selected colour / range

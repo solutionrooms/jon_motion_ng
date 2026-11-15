@@ -1102,7 +1102,7 @@ fn draw_cmds(b: &mut B) {
                 return Err(format!("({x}, {y}) is outside the {}x{} canvas", e.doc.w, e.doc.h));
             }
             let i = (y * e.doc.w as i64 + x) as usize;
-            let c = if a.b("merged")? { e.doc.flat_cells()[i] } else { e.doc.layers[layer_arg(e, a)?].data[i] };
+            let c = if a.b("merged")? { e.doc.flat_cell(i) } else { e.doc.layers[layer_arg(e, a)?].data[i] };
             Ok(json!({"color": e.cell_json(c), "rgba": hex8(e.doc.to_rgba(c))}))
         },
     );
@@ -1294,7 +1294,7 @@ fn draw_cmds(b: &mut B) {
                 return Err("outside the canvas".into());
             }
             let i = (y * e.doc.w as i64 + x) as usize;
-            let c = if a.ob("merged")?.unwrap_or(true) { e.doc.flat_cells()[i] } else { e.doc.layers[e.doc.active].data[i] };
+            let c = if a.ob("merged")?.unwrap_or(true) { e.doc.flat_cell(i) } else { e.doc.layers[e.doc.active].data[i] };
             if !cell_empty(c) {
                 match a.os("target")?.unwrap_or("fg") {
                     "bg" => e.o.bg = c,

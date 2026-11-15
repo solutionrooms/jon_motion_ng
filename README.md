@@ -73,7 +73,8 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
 - **True colour** - a separate kind of document, for pictures that are not palette images. You only get one by asking:
   **True colour** in File > New, File > Open as True Colour... (or that choice when a PNG is dropped), or Image >
   Convert to True Colour. Its tab and the status bar say "true colour". Every pixel is its own colour with its own
-  opacity, a PNG opens and exports with every pixel exactly as it is (RGBA), and the palette is a set of swatches:
+  opacity, a PNG opens and exports with every visible pixel exactly as it is (RGBA; a fully transparent pixel is just
+  transparent, so any colour a file stored under one is not kept), and the palette is a set of swatches:
   editing it never changes the picture. Painting sets exactly the colour in hand - it replaces the pixel rather than
   blending over it - while layers do blend where pixels are part transparent. Gradients blend smoothly, lighten /
   darken and smooth work on the colours themselves, and tile maps, selections, animations and scripts work as usual.

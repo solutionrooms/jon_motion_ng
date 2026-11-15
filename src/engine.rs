@@ -237,6 +237,7 @@ pub struct Snapshot {
     tiles_dirty: Option<bool>,
     reset_history: bool,
     blank: bool,
+    old_file: bool,
 }
 
 pub struct Engine {
@@ -287,6 +288,16 @@ pub struct Engine {
     roster: Option<Vec<Value>>,
     /// True for a document made blank (not read from a file).
     pub blank: bool,
+    /// True while the file at `path` is in the form 0.1.4 and older open: an indexed project,
+    /// or a true-colour one 0.1.0-0.1.2 wrote. Saving a true-colour document over such a file
+    /// writes the form those versions refuse, so the window asks first (see `rewrites_old_file`).
+    pub old_file: bool,
+}
+
+/// True when two paths name one file, however each is spelt (`..`, letter case on a volume
+/// that ignores it, a link to its folder).
+pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b || std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(x, y)| x == y)
 }
 
 /// Most documents open at once.
@@ -386,6 +397,7 @@ impl Engine {
             next_id: 2,
             roster: None,
             blank: true,
+            old_file: false,
         }
     }
 
@@ -511,7 +523,7 @@ impl Engine {
 
     /// The open document showing this file, if any.
     pub fn tab_with_path(&self, p: &std::path::Path) -> Option<u32> {
-        let same = |a: &std::path::Path| a == p || std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(p).ok()).is_some_and(|(x, y)| x == y);
+        let same = |a: &std::path::Path| same_file(a, p);
         if let Some(r) = &self.roster {
             // A script's working copy knows the other documents only by this list.
             return r.iter().find(|t| t["path"].as_str().is_some_and(|a| same(std::path::Path::new(a)))).and_then(|t| t["id"].as_u64()).map(|id| id as u32);
@@ -569,6 +581,7 @@ impl Engine {
         e.id = self.id;
         e.roster = Some(self.tab_list());
         e.blank = self.blank;
+        e.old_file = self.old_file;
         e
     }
 
@@ -576,6 +589,7 @@ impl Engine {
     pub fn adopt(&mut self, s: Engine) {
         let (modified, reset) = (s.modified, s.was_reset);
         self.blank = s.blank;
+        self.old_file = s.old_file;
         let _ = self.group(|e| {
             e.doc = s.doc;
             e.o = s.o;
@@ -809,6 +823,7 @@ impl Engine {
             tiles_dirty: self.tiles_dirty,
             reset_history: self.reset_history,
             blank: self.blank,
+            old_file: self.old_file,
         }
     }
 
@@ -821,6 +836,7 @@ impl Engine {
         self.tiles_dirty = s.tiles_dirty;
         self.reset_history = s.reset_history;
         self.blank = s.blank;
+        self.old_file = s.old_file;
     }
 
     fn begin_top(&mut self) -> Option<Snapshot> {
@@ -959,6 +975,13 @@ impl Engine {
         self.modified = false;
         self.saved_at = Some(self.edits);
         self.saved_to = self.path.clone();
+        self.old_file = !self.doc.rgba();
+    }
+
+    /// True when saving to `to` would turn the document's own file from one 0.1.4 and older
+    /// can open into a true-colour project they cannot. `to` may spell the file another way.
+    pub fn rewrites_old_file(&self, to: &std::path::Path) -> bool {
+        self.old_file && self.doc.rgba() && self.path.as_deref().is_some_and(|p| same_file(p, to))
     }
 
     /// Direct pixel read for scripts.

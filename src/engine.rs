@@ -5,7 +5,7 @@
 use crate::commands::{self, Args, Kind};
 use crate::doc::*;
 use crate::paint::*;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -234,6 +234,7 @@ pub struct Snapshot {
     bg: Cell,
     tiles_dirty: Option<bool>,
     reset_history: bool,
+    blank: bool,
 }
 
 pub struct Engine {
@@ -272,7 +273,22 @@ pub struct Engine {
     halt: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// "gui" or "headless"; reported by get_info.
     pub host: &'static str,
+    /// This document's number among the open ones; it keeps it for as long as it is open.
+    pub id: u32,
+    /// The other open documents (tabs). Each is a whole engine - its own undo history, file
+    /// path, view and selection - parked while another document is the active one.
+    pub parked: Vec<Engine>,
+    /// Every open document's id, in tab order. Kept on the active engine only.
+    pub order: Vec<u32>,
+    next_id: u32,
+    /// On a script's working copy: the open documents as they were when the script started.
+    roster: Option<Vec<Value>>,
+    /// True for a document made blank (not read from a file).
+    pub blank: bool,
 }
+
+/// Most documents open at once.
+pub const MAX_TABS: usize = 32;
 
 fn tile_dims(doc: &Doc) -> Option<(usize, usize, usize, usize)> {
     let ts = doc.tileset.as_ref()?;
@@ -362,7 +378,174 @@ impl Engine {
             was_reset: false,
             halt: None,
             host,
+            id: 1,
+            parked: vec![],
+            order: vec![1],
+            next_id: 2,
+            roster: None,
+            blank: true,
         }
+    }
+
+    // ------------------------------------------------------------ tabs
+
+    /// Name shown for the document: its file name, or "Untitled".
+    pub fn title(&self) -> String {
+        self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".into())
+    }
+
+    /// True for a blank document nobody has touched: opening a file replaces it instead of adding a tab.
+    pub fn pristine(&self) -> bool {
+        self.blank && !self.modified && self.path.is_none() && self.undo.is_empty() && self.redo.is_empty() && self.pending.is_none() && self.stroke.is_none()
+    }
+
+    fn tab_json(&self, active: bool) -> Value {
+        json!({"id": self.id, "name": self.title(), "path": self.path.as_ref().map(|p| p.display().to_string()),
+               "modified": self.modified, "width": self.doc.w, "height": self.doc.h, "active": active})
+    }
+
+    /// The open documents in tab order.
+    pub fn tab_list(&self) -> Vec<Value> {
+        if let Some(r) = &self.roster {
+            return r.clone();
+        }
+        self.order.iter().filter_map(|&id| if id == self.id { Some(self.tab_json(true)) } else { self.parked.iter().find(|p| p.id == id).map(|p| p.tab_json(false)) }).collect()
+    }
+
+    /// The open document `id`, whether it is the active one or parked.
+    pub fn tab(&self, id: u32) -> Option<&Engine> {
+        if id == self.id {
+            Some(self)
+        } else {
+            self.parked.iter().find(|p| p.id == id)
+        }
+    }
+
+    /// Tabs are only changed between commands: never inside a script or batch (which works on
+    /// one document from start to finish) and never under an open brush stroke.
+    pub fn tabs_free(&self) -> Result<(), String> {
+        if self.halt.is_some() || self.group > 0 {
+            return Err("a script or batch works on one document from start to finish; change tabs before or after it".into());
+        }
+        if self.busy() {
+            return Err("busy: a stroke is in progress".into());
+        }
+        Ok(())
+    }
+
+    /// Make `t` the active document and park the current one. The tool settings, clipboard and
+    /// key preset travel with the user; colours, the custom brush and everything else belong to
+    /// each document.
+    fn activate(&mut self, mut t: Engine) {
+        self.tiles_flush();
+        std::mem::swap(self, &mut t);
+        self.parked = std::mem::take(&mut t.parked);
+        self.order = std::mem::take(&mut t.order);
+        self.next_id = t.next_id;
+        self.clipboard = t.clipboard.take();
+        let mine = std::mem::replace(&mut self.o, t.o.clone());
+        self.o.fg = mine.fg;
+        self.o.bg = mine.bg;
+        self.o.active_tile = mine.active_tile;
+        self.o.active_ramp = mine.active_ramp;
+        self.o.custom_brush = mine.custom_brush;
+        self.view.keymap = t.view.keymap;
+        self.rev = self.rev.max(t.rev) + 1;
+        self.parked.push(t);
+        self.fix_state();
+    }
+
+    /// Add a document as a new tab, after the active one, and make it active.
+    pub fn tab_add(&mut self, mut t: Engine) -> Result<u32, String> {
+        self.tabs_free()?;
+        if self.order.len() >= MAX_TABS {
+            return Err(format!("{MAX_TABS} documents are open, which is the limit; close one first"));
+        }
+        t.id = self.next_id;
+        self.next_id += 1;
+        let id = t.id;
+        let at = self.order.iter().position(|&i| i == self.id).map_or(self.order.len(), |i| i + 1);
+        self.order.insert(at, id);
+        self.activate(t);
+        Ok(id)
+    }
+
+    pub fn tab_select(&mut self, id: u32) -> Result<(), String> {
+        if id == self.id {
+            return Ok(());
+        }
+        self.tabs_free()?;
+        let i = self.parked.iter().position(|p| p.id == id).ok_or_else(|| format!("no open document has id {id} (see tab_list)"))?;
+        let t = self.parked.remove(i);
+        self.activate(t);
+        Ok(())
+    }
+
+    /// Close a document, whatever state it is in (the caller has dealt with unsaved changes).
+    /// The window always has one: closing the last leaves a blank document in its place.
+    pub fn tab_close(&mut self, id: u32) -> Result<(), String> {
+        self.tabs_free()?;
+        if id != self.id {
+            let i = self.parked.iter().position(|p| p.id == id).ok_or_else(|| format!("no open document has id {id} (see tab_list)"))?;
+            self.parked.remove(i);
+            self.order.retain(|&o| o != id);
+            return Ok(());
+        }
+        let at = self.order.iter().position(|&o| o == id).unwrap_or(0);
+        match self.order.get(at + 1).or(at.checked_sub(1).and_then(|i| self.order.get(i))).copied() {
+            Some(next) => self.tab_select(next)?,
+            None => {
+                let mut blank = Engine::new(self.host);
+                blank.id = self.next_id;
+                self.next_id += 1;
+                self.order.push(blank.id);
+                self.activate(blank);
+            }
+        }
+        self.parked.retain(|p| p.id != id);
+        self.order.retain(|&o| o != id);
+        Ok(())
+    }
+
+    /// The open document showing this file, if any.
+    pub fn tab_with_path(&self, p: &std::path::Path) -> Option<u32> {
+        let same = |a: &std::path::Path| a == p || std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(p).ok()).is_some_and(|(x, y)| x == y);
+        if let Some(r) = &self.roster {
+            // A script's working copy knows the other documents only by this list.
+            return r.iter().find(|t| t["path"].as_str().is_some_and(|a| same(std::path::Path::new(a)))).and_then(|t| t["id"].as_u64()).map(|id| id as u32);
+        }
+        self.order.iter().copied().find(|&id| self.tab(id).and_then(|t| t.path.as_deref()).is_some_and(same))
+    }
+
+    /// Refuse a file that another open document holds: two tabs on one file would each
+    /// overwrite the other's work when saved.
+    pub fn path_free(&self, p: &std::path::Path) -> Result<(), String> {
+        match self.tab_with_path(p) {
+            Some(id) if id != self.id => Err(format!("{} is open in another tab (document {id}); use that tab, or close it first", p.display())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Run `f` on document `id` and come back to the active one, so a remote call can work on
+    /// a tab the user is not looking at without changing what they see.
+    pub fn on_tab<R>(&mut self, id: u32, f: impl FnOnce(&mut Engine) -> R) -> Result<R, String> {
+        let back = self.id;
+        if id == back {
+            return Ok(f(self));
+        }
+        // The tools and clipboard travel from tab to tab, so they are put back afterwards:
+        // what the call set or copied on the other document lasts for that call only.
+        let mine = (self.o.clone(), self.clipboard.clone());
+        self.tab_select(id)?;
+        let r = f(self);
+        if self.id != back && self.parked.iter().any(|p| p.id == back) {
+            let _ = self.tab_select(back);
+        }
+        if self.id == back {
+            (self.o, self.clipboard) = mine;
+            self.fix_state();
+        }
+        Ok(r)
     }
 
     /// A working copy for a script to run on. The script's result is taken over with
@@ -381,12 +564,16 @@ impl Engine {
         e.undo = self.undo.clone();
         e.redo = self.redo.clone();
         e.halt = Some(halt);
+        e.id = self.id;
+        e.roster = Some(self.tab_list());
+        e.blank = self.blank;
         e
     }
 
     /// Take over the state a script left in its working copy, as one undo step.
     pub fn adopt(&mut self, s: Engine) {
         let (modified, reset) = (s.modified, s.was_reset);
+        self.blank = s.blank;
         let _ = self.group(|e| {
             e.doc = s.doc;
             e.o = s.o;
@@ -579,6 +766,7 @@ impl Engine {
             bg: self.o.bg,
             tiles_dirty: self.tiles_dirty,
             reset_history: self.reset_history,
+            blank: self.blank,
         }
     }
 
@@ -590,6 +778,7 @@ impl Engine {
         self.o.bg = s.bg;
         self.tiles_dirty = s.tiles_dirty;
         self.reset_history = s.reset_history;
+        self.blank = s.blank;
     }
 
     fn begin_top(&mut self) -> Option<Snapshot> {
@@ -669,6 +858,12 @@ impl Engine {
         }
         if cmd.kind == Kind::Read {
             let r = guarded(|| (cmd.run)(self, &args));
+            self.rev += 1;
+            return r.map_err(|e| format!("{name}: {e}"));
+        }
+        if cmd.kind == Kind::Tab {
+            // Outside any undo step: each document keeps its own history.
+            let r = self.tabs_free().and_then(|_| guarded(|| (cmd.run)(self, &args)));
             self.rev += 1;
             return r.map_err(|e| format!("{name}: {e}"));
         }

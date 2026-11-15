@@ -66,8 +66,8 @@ pub fn base64(data: &[u8]) -> String {
 pub fn tools() -> Value {
     json!([
         { "name": "get_info",
-          "description": "Summary of the open document: size, layers, palette size, tile set, selection, current colours, file path, and whether you are attached to the live app ('gui') or a headless document.",
-          "inputSchema": { "type": "object", "properties": {} } },
+          "description": "Summary of the open document: size, layers, palette size, tile set, selection, current colours, file path, which of the open documents (tabs) it is, and whether you are attached to the live app ('gui') or a headless document. Several documents can be open: tools work on the active tab unless you pass 'document' (see the tab_* commands).",
+          "inputSchema": { "type": "object", "properties": { "document": { "type": "integer", "description": "Work on this open document (an id from tab_list) instead of the active tab; the user's view does not change" } } } },
         { "name": "list_commands",
           "description": "Reference for the editor's commands (every feature of the app is a command). Call with no arguments for everything, or narrow it down.",
           "inputSchema": { "type": "object", "properties": {
@@ -78,16 +78,19 @@ pub fn tools() -> Value {
           "description": "Run one editor command, e.g. command='draw_rect', params={x:4,y:4,w:16,h:8,color:12,filled:true}. Atomic; one undo step.",
           "inputSchema": { "type": "object", "required": ["command"], "properties": {
               "command": { "type": "string", "description": "Command name from list_commands" },
-              "params": { "type": "object", "description": "Named parameters for the command" } } } },
+              "params": { "type": "object", "description": "Named parameters for the command" },
+              "document": { "type": "integer", "description": "Work on this open document (an id from tab_list) instead of the active tab; the user's view does not change" } } } },
         { "name": "batch",
           "description": "Run several commands in order as one atomic change and one undo step. If any command fails the document is rolled back (files already written by save/export commands stay).",
           "inputSchema": { "type": "object", "required": ["commands"], "properties": {
               "commands": { "type": "array", "description": "Commands to run in order", "items": { "type": "object", "required": ["command"], "properties": {
-                  "command": { "type": "string" }, "params": { "type": "object" } } } } } } },
+                  "command": { "type": "string" }, "params": { "type": "object" } } } },
+              "document": { "type": "integer", "description": "Work on this open document (an id from tab_list) instead of the active tab; the user's view does not change" } } } },
         { "name": "run_lua",
           "description": format!("Run a Lua script against the document.\n{}", script::LUA_HELP),
           "inputSchema": { "type": "object", "required": ["code"], "properties": {
-              "code": { "type": "string", "description": "Lua source" } } } },
+              "code": { "type": "string", "description": "Lua source" },
+              "document": { "type": "integer", "description": "Work on this open document (an id from tab_list) instead of the active tab; the user's view does not change" } } } },
         { "name": "screenshot",
           "description": "Render the document (or a region or single layer) to a PNG image so you can see it.",
           "inputSchema": { "type": "object", "properties": {
@@ -97,7 +100,8 @@ pub fn tools() -> Value {
               "h": { "type": "integer", "description": "Region height (default: to the bottom edge)" },
               "scale": { "type": "integer", "description": "Integer upscale 1-16 (default: chosen so the image is roughly 512-1024 px)" },
               "layer": { "type": ["integer", "string"], "description": "Render only this layer (index or name)" },
-              "background": { "type": "string", "enum": ["checker", "transparent"], "description": "What shows behind transparent pixels (default checker)" } } } }
+              "background": { "type": "string", "enum": ["checker", "transparent"], "description": "What shows behind transparent pixels (default checker)" },
+              "document": { "type": "integer", "description": "Work on this open document (an id from tab_list) instead of the active tab; the user's view does not change" } } } }
     ])
 }
 
@@ -127,10 +131,38 @@ fn screenshot(e: &Engine, m: &Map<String, Value>) -> Result<ToolOut, String> {
     })
 }
 
-/// Execute one MCP tool call against an engine.
+/// Execute one MCP tool call against an engine: on the active document, or on the one the
+/// caller names with `document`, which is put back behind the active tab afterwards.
 pub fn call_tool(e: &mut Engine, name: &str, args: &Value) -> ToolOut {
     let empty = Map::new();
     let m = args.as_object().unwrap_or(&empty);
+    let on_document = name != "list_commands";
+    let wanted = match m.get("document").filter(|v| !v.is_null() && on_document) {
+        None => None,
+        Some(v) => match v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f <= u32::MAX as f64) {
+            Some(f) => Some(f as u32),
+            None => return fail("'document' must be the id of an open document (see tab_list)"),
+        },
+    };
+    let tab_command = name == "execute_command"
+        && m.get("command").and_then(|v| v.as_str()).and_then(commands::find).is_some_and(|c| c.kind == commands::Kind::Tab || c.name == "tab_list");
+    if let Some(id) = wanted.filter(|&id| id != e.id) {
+        if tab_command {
+            return fail("tab commands say which document they mean with their own 'id'; leave 'document' out");
+        }
+        return e.on_tab(id, |e| tool(e, name, m)).unwrap_or_else(fail);
+    }
+    let mut out = tool(e, name, m);
+    // With several documents open and none named, say which one this was, so a client is
+    // never moved from one document to another without being told.
+    if on_document && wanted.is_none() && !tab_command && e.tab_list().len() > 1 {
+        out.content.push(json!({"type": "text", "text": format!(
+            "(worked on document {} \"{}\", the active tab of {}; pass \"document\": {} to stay on it if the user changes tabs)", e.id, e.title(), e.tab_list().len(), e.id)}));
+    }
+    out
+}
+
+fn tool(e: &mut Engine, name: &str, m: &Map<String, Value>) -> ToolOut {
     let r: Result<ToolOut, String> = guarded(|| match name {
         "get_info" => Ok(text(commands::info(e).to_string())),
         "list_commands" => {

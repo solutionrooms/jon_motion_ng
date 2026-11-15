@@ -808,6 +808,206 @@ fn deluxe_paint_keys() {
     }
 }
 
+// ---------------------------------------------------------------- tabs
+
+#[test]
+fn several_documents_open_as_tabs() {
+    use crate::app::{answer, request, Pending};
+    let mut e = eng(32, 32);
+    let tabs = |e: &Engine| e.tab_list().iter().map(|t| format!("{}{}{}", t["id"], if t["active"] == true { "!" } else { "" }, if t["modified"] == true { "*" } else { "" })).collect::<Vec<_>>().join(" ");
+    assert_eq!((tabs(&e), e.exec("get_info", &json!({})).unwrap()["open_documents"].as_i64()), ("1!".to_string(), Some(1)));
+
+    // Each document keeps its own pixels, undo history, file, selection, view, colours and animations.
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 4, "h": 4, "color": 9, "filled": true})).unwrap();
+    e.exec("select_rect", &json!({"x": 0, "y": 0, "w": 8, "h": 8})).unwrap();
+    e.exec("set_colors", &json!({"fg": 9})).unwrap();
+    e.exec("set_options", &json!({"tool": "line", "brush_size": 5})).unwrap();
+    e.exec("set_view", &json!({"zoom": 8, "grid": true})).unwrap();
+    e.exec("anim_set", &json!({"name": "a", "frame_w": 8, "frame_h": 8})).unwrap();
+    e.exec("copy", &json!({})).unwrap();
+    let (undo_a, rev_a) = (e.undo.len(), e.rev);
+    let v = e.exec("tab_new", &json!({"width": 64, "height": 16, "palette": "gameboy"})).unwrap();
+    assert_eq!((v["id"].as_i64(), tabs(&e), e.doc.w, e.undo.len(), e.modified, e.doc.selection.is_some(), e.doc.anims.len()), (Some(2), "1* 2!".to_string(), 64, 0, false, false, 0));
+    assert!(e.rev > rev_a, "the window sees a different document");
+    // The tool in hand comes along; the colours are the new document's own.
+    let o = e.exec("get_options", &json!({})).unwrap();
+    assert_eq!((o["tool"].as_str(), o["brush_size"].as_i64(), e.o.fg), (Some("line"), Some(5), 15.min(e.doc.palette.colors.len() as u32 - 1)));
+    assert!(e.view.zoom != 8.0 || e.view.fit, "its own view");
+    // The clipboard comes along too, and a paste keeps its look in the other palette.
+    e.exec("paste", &json!({"x": 0, "y": 0})).unwrap();
+    assert!(pixel(&mut e, 1, 1) >= 0 && e.modified);
+    e.exec("undo", &json!({})).unwrap();
+    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 2, "h": 2, "color": 1, "filled": true})).unwrap();
+    e.exec("tab_select", &json!({"id": 1})).unwrap();
+    assert_eq!((tabs(&e), e.doc.w, e.undo.len(), pixel(&mut e, 1, 1), e.o.fg, e.view.zoom, e.doc.anims.len(), e.doc.sel_bounds()), ("1!* 2*".to_string(), 32, undo_a, 9, 9, 8.0, 1, Some((0, 0, 7, 7))));
+    // Undo in one tab does not touch the other.
+    e.exec("undo", &json!({})).unwrap();
+    e.exec("tab_select", &json!({"id": 2})).unwrap();
+    assert_eq!((pixel(&mut e, 1, 1), e.undo.len()), (1, 1));
+    assert!(e.exec("tab_select", &json!({"id": 99})).is_err());
+    assert_eq!(e.exec("get_info", &json!({})).unwrap()["document"], json!({"id": 2, "name": "Untitled"}));
+
+    // Files: a new tab per file; the same project twice shows the tab it is in.
+    let (pa, pb) = (tmp("tab_a.jmn"), tmp("tab_b.jmn"));
+    e.exec("save_document", &json!({"path": pb})).unwrap();
+    e.exec("tab_select", &json!({"id": 1})).unwrap();
+    e.exec("save_document", &json!({"path": pa})).unwrap();
+    assert_eq!(tabs(&e), "1! 2");
+    let v = e.exec("tab_open", &json!({"path": pb})).unwrap();
+    assert_eq!((v["id"].as_i64(), v["already_open"].as_bool(), tabs(&e)), (Some(2), Some(true), "1 2!".to_string()));
+    e.exec("tab_close", &json!({})).unwrap();
+    assert_eq!(tabs(&e), "1!");
+    let v = e.exec("tab_open", &json!({"path": pb})).unwrap();
+    assert_eq!((v["id"].as_i64(), tabs(&e), e.doc.w, e.title()), (Some(3), "1 3!".to_string(), 64, "tab_b.jmn".to_string()));
+    assert!(e.exec("tab_open", &json!({"path": tmp("missing.jmn")})).is_err() && tabs(&e) == "1 3!");
+    // open_document and new_document still replace the active document, with the same rule as before.
+    e.exec("draw_rect", &json!({"x": 5, "y": 5, "w": 1, "h": 1, "color": 2, "filled": true})).unwrap();
+    assert!(e.exec("open_document", &json!({"path": pa})).is_err() && e.exec("new_document", &json!({"width": 4, "height": 4})).is_err());
+    // A document with unsaved changes is not closed unless the caller says so; the last one leaves a blank.
+    assert!(e.exec("tab_close", &json!({})).unwrap_err().contains("unsaved"));
+    assert!(e.exec("tab_close", &json!({"id": 7})).is_err());
+    e.exec("tab_close", &json!({"id": 1})).unwrap();
+    assert_eq!(tabs(&e), "3!*");
+    e.exec("tab_close", &json!({"force": true})).unwrap();
+    assert!(tabs(&e) == "4!" && e.pristine() && e.parked.is_empty());
+    // A blank document nobody has touched can be reused instead of piling up tabs.
+    assert_eq!(e.exec("tab_open", &json!({"path": pa, "reuse_blank": true})).unwrap()["reused"], true);
+    assert_eq!((tabs(&e), e.doc.w), ("4!".to_string(), 32));
+    assert_eq!(e.exec("tab_new", &json!({"reuse_blank": true})).unwrap()["id"], 5, "an opened file is not blank");
+    // There is a limit.
+    while e.order.len() < MAX_TABS {
+        e.exec("tab_new", &json!({"width": 2, "height": 2})).unwrap();
+    }
+    assert!(e.exec("tab_new", &json!({})).unwrap_err().contains("limit") && e.exec("tab_open", &json!({"path": pb})).is_err());
+    assert_eq!((e.order.len(), e.parked.len()), (MAX_TABS, MAX_TABS - 1));
+    for id in e.order.clone().into_iter().filter(|&id| id > 5) {
+        e.exec("tab_close", &json!({"id": id})).unwrap();
+    }
+    assert_eq!(tabs(&e), "4 5!");
+
+    // A script or batch works on one document from start to finish: it cannot change tabs, and
+    // what it did lands on the document it started on.
+    let out = script::run_lua(&mut e, "local n = #jm.tab_list().tabs jm.draw_rect{ x = 0, y = 0, w = 1, h = 1, color = 3, filled = true } return n");
+    assert_eq!((out.error, out.result, e.id, pixel(&mut e, 0, 0)), (None, json!(2), 5, 3));
+    for code in ["jm.tab_select{ id = 4 }", "jm.tab_new{}", "jm.tab_close{ id = 4 }", "jm.tab_open{ path = 'x.jmn' }"] {
+        let out = script::run_lua(&mut e, code);
+        assert!(out.error.unwrap().contains("one document") && tabs(&e) == "4 5!*", "{code}");
+    }
+    let r = crate::remote::call_tool(&mut e, "batch", &json!({"commands": [{"command": "tab_select", "params": {"id": 4}}]}));
+    assert!(r.is_error && e.id == 5);
+    // Nor under an open brush stroke.
+    e.stroke_begin(e.paint_opts(false, false)).unwrap();
+    assert!(e.exec("tab_select", &json!({"id": 4})).is_err() && e.exec("tab_new", &json!({})).is_err() && e.id == 5);
+    e.stroke_end();
+
+    // An AI client can name the document it is working on; the user's tab does not change.
+    let text = |o: &crate::remote::ToolOut| o.content.iter().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n");
+    let r = crate::remote::call_tool(&mut e, "execute_command", &json!({"command": "draw_rect", "params": {"x": 5, "y": 5, "w": 1, "h": 1, "color": 5, "filled": true}, "document": 4}));
+    assert_eq!((r.is_error, e.id, e.tab(4).unwrap().modified, pixel(&mut e, 5, 5) != 5), (false, 5, true, true), "{}", text(&r));
+    let r = crate::remote::call_tool(&mut e, "get_info", &json!({"document": 4}));
+    assert!(text(&r).contains("\"id\":4") && !text(&r).contains("worked on document"));
+    let r = crate::remote::call_tool(&mut e, "run_lua", &json!({"code": "return jm.get_pixel{ x = 5, y = 5 }.color", "document": 4}));
+    assert!(text(&r).contains("result: 5") && e.id == 5, "{}", text(&r));
+    assert!(!crate::remote::call_tool(&mut e, "screenshot", &json!({"document": 4})).is_error && e.id == 5);
+    // Without one, the call works on the active tab and says which that was.
+    let r = crate::remote::call_tool(&mut e, "execute_command", &json!({"command": "get_pixel", "params": {"x": 0, "y": 0}}));
+    assert!(text(&r).contains("worked on document 5") && text(&r).contains("\"document\": 5"), "{}", text(&r));
+    for bad in [json!({"document": 77}), json!({"document": "4"}), json!({"document": -1}), json!({"document": 1.5})] {
+        assert!(crate::remote::call_tool(&mut e, "get_info", &bad).is_error && e.id == 5, "{bad}");
+    }
+    assert!(crate::remote::call_tool(&mut e, "execute_command", &json!({"command": "tab_close", "params": {"id": 5}, "document": 4})).is_error);
+    let r = crate::remote::call_tool(&mut e, "execute_command", &json!({"command": "tab_list"}));
+    assert!(!r.is_error && !text(&r).contains("worked on document"));
+    // With one document open nothing is added to the answers.
+    let mut solo = eng(8, 8);
+    assert_eq!(crate::remote::call_tool(&mut solo, "execute_command", &json!({"command": "get_pixel", "params": {"x": 0, "y": 0}})).content.len(), 1);
+
+    // ---- the window: closing a tab or quitting asks about every document with unsaved changes
+    let mut g = Gui::new();
+    e.exec("save_document", &json!({"path": tmp("tab_five.jmn")})).unwrap();
+    assert_eq!(tabs(&e), "4* 5!");
+    request(&mut e, &mut g, Pending::CloseTab(4));
+    assert!(matches!(g.pending, Some(Pending::CloseTab(4))) && tabs(&e) == "4!* 5", "the document in question is shown, and nothing is closed yet");
+    answer(&mut e, &mut g, 2);
+    assert!(g.pending.is_none() && tabs(&e) == "4!* 5", "cancel");
+    request(&mut e, &mut g, Pending::CloseTab(5));
+    assert!(g.pending.is_none() && tabs(&e) == "4!*", "a saved document just closes");
+    request(&mut e, &mut g, Pending::CloseTab(4));
+    answer(&mut e, &mut g, 0);
+    assert!(tabs(&e).ends_with('!') && e.pristine() && !crate::io::load_doc(std::path::Path::new(&pa)).unwrap().layers.is_empty(), "save, then close; the last tab leaves a blank");
+    assert_eq!(pixel(&mut e, 0, 0), -1);
+    let reopened = { let mut t = Engine::new("headless"); t.exec("open_document", &json!({"path": pa})).unwrap(); pixel(&mut t, 5, 5) };
+    assert_eq!(reopened, 5, "what the other tab held was written by Save");
+
+    // Quit: three documents, two with unsaved changes, the active one clean.
+    let mut e = Engine::new("headless");
+    for (name, dirty) in [("q1.jmn", true), ("q2.jmn", false), ("q3.jmn", true)] {
+        e.exec("tab_new", &json!({"width": 8, "height": 8, "reuse_blank": true})).unwrap();
+        e.exec("save_document", &json!({"path": tmp(name)})).unwrap();
+        if dirty {
+            e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": 4, "filled": true})).unwrap();
+        }
+    }
+    e.exec("tab_select", &json!({"id": 2})).unwrap();
+    assert_eq!(tabs(&e), "1* 2! 3*");
+    request(&mut e, &mut g, Pending::Quit);
+    assert!(matches!(g.pending, Some(Pending::Quit)) && tabs(&e) == "1!* 2 3*" && !g.allow_close);
+    answer(&mut e, &mut g, 1);
+    assert!(matches!(g.pending, Some(Pending::Quit)) && tabs(&e) == "1* 2 3!*" && !g.allow_close, "not saving one moves on to the next; it is not closed or changed");
+    answer(&mut e, &mut g, 2);
+    assert!(g.pending.is_none() && !g.allow_close && tabs(&e) == "1* 2 3!*", "cancel stops the quit with everything still open");
+    request(&mut e, &mut g, Pending::Quit);
+    assert!(tabs(&e) == "1* 2 3!*", "asking again starts with the document on show, and asks about the first again later");
+    answer(&mut e, &mut g, 0);
+    assert!(tabs(&e) == "1!* 2 3" && matches!(g.pending, Some(Pending::Quit)) && !g.allow_close);
+    answer(&mut e, &mut g, 1);
+    assert!(g.pending.is_none() && g.allow_close, "every document has been dealt with");
+    let mut clean = Engine::new("headless");
+    let mut g = Gui::new();
+    request(&mut clean, &mut g, Pending::Quit);
+    assert!(g.allow_close && g.pending.is_none());
+
+    // A quit answer meant for one document never waves another through: if the document on
+    // show changed while the question was up, the question is asked again.
+    let mut e = Engine::new("headless");
+    for name in ["w1.jmn", "w2.jmn"] {
+        e.exec("tab_new", &json!({"width": 8, "height": 8, "reuse_blank": true})).unwrap();
+        e.exec("save_document", &json!({"path": tmp(name)})).unwrap();
+        e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": 4, "filled": true})).unwrap();
+    }
+    let mut g = Gui::new();
+    request(&mut e, &mut g, Pending::Quit);
+    assert_eq!((tabs(&e), g.quit_asked), ("1* 2!*".to_string(), 2));
+    e.exec("tab_select", &json!({"id": 1})).unwrap();
+    answer(&mut e, &mut g, 1);
+    assert!(g.quit_skip.is_empty() && !g.allow_close && matches!(g.pending, Some(Pending::Quit)), "nothing was waved through");
+    answer(&mut e, &mut g, 1);
+    answer(&mut e, &mut g, 1);
+    assert!(g.allow_close && g.quit_skip.len() == 2, "each document was asked about once it was the one on show");
+
+    // A remote call on a background document leaves the user's tools and clipboard as they were.
+    e.exec("set_options", &json!({"tool": "rect", "brush_size": 7})).unwrap();
+    e.exec("select_rect", &json!({"x": 0, "y": 0, "w": 2, "h": 2})).unwrap();
+    e.exec("copy", &json!({})).unwrap();
+    let (me, other) = (e.id, if e.id == 1 { 2 } else { 1 });
+    let clip = e.clipboard.as_ref().map(|c| (c.w, c.h));
+    for (cmd, params) in [("set_options", json!({"tool": "fill", "brush_size": 2})), ("select_all", json!({})), ("copy", json!({}))] {
+        assert!(!crate::remote::call_tool(&mut e, "execute_command", &json!({"command": cmd, "params": params, "document": other})).is_error, "{cmd}");
+    }
+    assert_eq!((e.id, e.o.tool, e.o.brush_size, e.clipboard.as_ref().map(|c| (c.w, c.h))), (me, Tool::Rect, 7, clip));
+
+    // One file, one tab: a document is not opened or saved over a file another tab holds.
+    let held = e.tab(other).unwrap().path.clone().unwrap();
+    let err = e.exec("open_document", &json!({"path": held, "force": true})).unwrap_err();
+    assert!(err.contains("open in another tab"), "{err}");
+    let err = e.exec("save_document", &json!({"path": held})).unwrap_err();
+    assert!(err.contains("open in another tab"), "{err}");
+    let r = script::run_lua(&mut e, &format!("return (pcall(jm.save_document, {{ path = {:?} }}))", held.display().to_string()));
+    assert_eq!((r.result, r.error), (json!(false), None), "a script is refused the same way");
+    e.exec("save_document", &json!({})).unwrap();
+    assert!(e.exec("open_document", &json!({"path": e.path.clone().unwrap()})).is_ok(), "reloading a document's own file is still allowed");
+}
+
 // ---------------------------------------------------------------- animation
 
 #[test]
@@ -1473,51 +1673,53 @@ fn recent_files_and_settings() {
     assert_eq!(g2.recent, vec![std::fs::canonicalize(&a).unwrap()]);
     assert_eq!(read_settings(&abs("no_such_settings.json")), (None, vec![]));
 
-    // Opening from the list asks about unsaved changes first, exactly like File > Open.
+    // Opening from the list puts the file in its own tab, so unsaved work is never in the way.
     let mut e = eng(16, 16);
     e.exec("draw_rect", &json!({"x": 1, "y": 1, "w": 1, "h": 1, "color": 9, "filled": true})).unwrap();
     e.exec("save_document", &json!({"path": sa})).unwrap();
     e.exec("new_document", &json!({"width": 8, "height": 8, "force": true})).unwrap();
     e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": 3, "filled": true})).unwrap();
     let mut g = Gui::new();
+    let widths = |e: &Engine| e.tab_list().iter().map(|t| t["width"].as_i64().unwrap()).collect::<Vec<_>>();
     assert!(e.modified);
     request(&mut e, &mut g, Pending::OpenFile(a.clone()));
-    assert!(matches!(g.pending, Some(Pending::OpenFile(_))) && e.doc.w == 8, "nothing is replaced until the prompt is answered");
-    assert!(g.recent.is_empty());
-    g.pending = None;
-    e.modified = false;
-    request(&mut e, &mut g, Pending::OpenFile(a.clone()));
     let real = if cfg!(unix) { std::fs::canonicalize(&a).unwrap() } else { a.clone() };
-    assert_eq!((e.doc.w, pixel(&mut e, 1, 1), g.recent.clone()), (16, 9, vec![real.clone()]), "opened, and remembered");
-    // A file that has gone is an error in the status bar; the document stays as it was.
+    assert!(g.pending.is_none() && widths(&e) == [8, 16] && e.doc.w == 16 && pixel(&mut e, 1, 1) == 9 && !e.modified, "opened beside the unsaved document");
+    assert!(e.parked[0].modified && e.parked[0].doc.w == 8, "which is untouched");
+    assert_eq!(g.recent, vec![real.clone()], "and remembered");
+    // The same project again shows its tab instead of loading a second copy.
+    e.exec("tab_select", &json!({"id": 1})).unwrap();
+    request(&mut e, &mut g, Pending::OpenFile(a.clone()));
+    assert!(widths(&e) == [8, 16] && e.doc.w == 16 && g.status.contains("already open"));
+    // A file that has gone is an error in the status bar; nothing else changes.
     request(&mut e, &mut g, Pending::OpenFile(abs("gone.jmn")));
-    assert!(g.status_err && e.doc.w == 16 && g.recent == vec![real]);
+    assert!(g.status_err && e.doc.w == 16 && widths(&e) == [8, 16] && g.recent == vec![real]);
+    e.exec("tab_close", &json!({"id": 1, "force": true})).unwrap();
 
-    // Dropping a project on the window is the same request (prompt first if unsaved); a dropped
-    // PNG asks whether to open it or add it as a layer.
+    // Dropping a project on the window is the same request; a dropped PNG asks whether to open
+    // it or add it as a layer.
     let drop = |e: &mut Engine, g: &mut Gui, paths: &[&Path]| {
         let dropped_files = paths.iter().map(|p| egui::DroppedFile { path: Some(p.to_path_buf()), ..Default::default() }).collect();
         let _ = egui::Context::default().run(egui::RawInput { dropped_files, ..Default::default() }, |ctx| crate::app::dropped(ctx, e, g));
     };
     let real = g.recent.clone();
     let png = abs("dropped.PNG");
-    e.exec("new_document", &json!({"width": 12, "height": 6, "force": true})).unwrap();
+    let mut e = eng(12, 6);
     e.exec("export_png", &json!({"path": png.to_str().unwrap()})).unwrap();
     e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": 3, "filled": true})).unwrap();
     g.info("");
     drop(&mut e, &mut g, &[]);
     assert!(g.pending.is_none() && !g.status_err && e.doc.w == 12, "no drop, nothing happens");
+    // While a question is on screen a drop is refused.
+    g.pending = Some(Pending::Quit);
     drop(&mut e, &mut g, &[&a]);
-    assert!(matches!(&g.pending, Some(Pending::OpenFile(p)) if *p == a) && e.doc.w == 12, "unsaved changes are asked about first");
-    drop(&mut e, &mut g, &[&png]);
-    assert!(g.status_err && matches!(&g.pending, Some(Pending::OpenFile(p)) if *p == a), "a drop during the prompt is refused");
+    assert!(g.status_err && matches!(g.pending, Some(Pending::Quit)) && widths(&e) == [12], "a drop during a prompt is refused");
     assert!(matches!(g.dialog, Dialog::None));
     g.pending = None;
-    e.modified = false;
     for (bad, why) in [(vec![a.as_path(), png.as_path()], "one file at a time"), (vec![Path::new("/tmp/notes.txt")], "neither"), (vec![Path::new("/tmp")], "neither"), (vec![Path::new("/tmp/\u{202e}gnp.jmn")], "cannot be shown")] {
         g.info("");
         drop(&mut e, &mut g, &bad);
-        assert!(g.status_err && g.status.contains(why) && e.doc.w == 12 && g.pending.is_none() && g.recent == real, "{bad:?}: {}", g.status);
+        assert!(g.status_err && g.status.contains(why) && widths(&e) == [12] && g.pending.is_none() && g.recent == real, "{bad:?}: {}", g.status);
         assert!(!g.status.contains('\u{202e}'));
     }
     #[cfg(unix)]
@@ -1525,15 +1727,14 @@ fn recent_files_and_settings() {
         use std::os::unix::ffi::OsStrExt;
         g.info("");
         drop(&mut e, &mut g, &[Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff.jmn"))]);
-        assert!(g.status_err && g.status.contains("cannot be shown") && e.doc.w == 12);
+        assert!(g.status_err && g.status.contains("cannot be shown") && widths(&e) == [12]);
     }
     // A PNG only asks; nothing changes until the user picks.
-    e.exec("draw_rect", &json!({"x": 0, "y": 0, "w": 1, "h": 1, "color": 3, "filled": true})).unwrap();
     g.info("");
     drop(&mut e, &mut g, &[&png]);
     assert!(matches!(&g.dialog, Dialog::Dropped(p) if *p == png) && g.pending.is_none() && !g.status_err && e.doc.layers.len() == 1 && g.recent == real);
     drop(&mut e, &mut g, &[&a]);
-    assert!(g.status_err && matches!(&g.dialog, Dialog::Dropped(p) if *p == png) && g.pending.is_none(), "a drop while a dialog is open is refused");
+    assert!(g.status_err && matches!(&g.dialog, Dialog::Dropped(p) if *p == png) && widths(&e) == [12], "a drop while a dialog is open is refused");
     g.dialog = Dialog::None;
     // As a layer: added to this document, one undo step, and not listed as an opened file.
     g.info("");
@@ -1543,17 +1744,17 @@ fn recent_files_and_settings() {
     assert_eq!(e.doc.layers.len(), 1);
     use_dropped(&mut e, &mut g, &abs("gone.png"), true);
     assert!(g.status_err && e.doc.layers.len() == 1);
-    // As a document: the usual prompt, then opened and remembered.
-    use_dropped(&mut e, &mut g, &png, false);
-    assert!(matches!(&g.pending, Some(Pending::OpenFile(p)) if *p == png) && e.modified);
-    g.pending = None;
-    e.modified = false;
+    // As a document: its own tab, and remembered.
     g.info("");
     use_dropped(&mut e, &mut g, &png, false);
-    assert!(!g.status_err && e.doc.w == 12 && e.doc.h == 6 && !e.modified && e.path.is_none(), "{}", g.status);
+    assert!(!g.status_err && g.pending.is_none() && widths(&e) == [12, 12] && e.doc.h == 6 && !e.modified && e.path.is_none(), "{}", g.status);
     assert_eq!(g.recent.len(), 2, "a dropped file is remembered like any other the user opened");
     drop(&mut e, &mut g, &[&a]);
-    assert_eq!((e.doc.w, pixel(&mut e, 1, 1), g.recent.len()), (16, 9, 2), "a project opens straight away");
+    assert_eq!((widths(&e), e.doc.w, pixel(&mut e, 1, 1), g.recent.len()), (vec![12, 12, 16], 16, 9, 2), "a project opens straight away, in a third tab");
+    // An untouched blank document is not kept around: the first file opened takes its place.
+    let mut blank = Engine::new("headless");
+    request(&mut blank, &mut g, Pending::OpenFile(a.clone()));
+    assert!(widths(&blank) == [16] && blank.id == 1);
 
     // The menu lists file names, tells same-named files apart by folder, and offers Clear.
     let other = std::env::temp_dir().join("jmn_recent_other");

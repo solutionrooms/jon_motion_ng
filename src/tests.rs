@@ -2068,38 +2068,72 @@ fn recent_files_and_settings() {
     assert_eq!(view(&mut t), (5, 5, 5, 5));
 
     // The grid is drawn once its smaller side is four screen pixels. Switched on, or resized,
-    // while it is finer than that, the window says so once - and not just for changing tabs.
+    // while it is finer than that, the window says so. The note follows the zoom while it is
+    // what the status line shows, and goes when it stops being true.
     use crate::app::grid_note;
     let mut n = eng(64, 64);
     let mut ng = Gui::new();
     let note = |n: &Engine, ng: &mut Gui| {
-        ng.status.clear();
         grid_note(n, ng);
         ng.status.clone()
     };
     n.view.zoom = 3.0;
     assert_eq!((n.view.grid_zoom(), n.view.grid_hidden(), note(&n, &mut ng)), (4.0, None, String::new()));
-    assert_eq!(note(&n, &mut ng), "");
     n.view.grid = true;
     assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 300% now)");
-    assert_eq!(note(&n, &mut ng), "", "said once");
-    n.view.zoom = 4.0;
+    assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 300% now)", "it stays while it is true");
+    n.view.zoom = 2.0;
+    assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 200% now)", "and follows the zoom");
+    n.view.zoom = 8.0;
+    assert_eq!((n.view.grid_hidden(), note(&n, &mut ng)), (None, String::new()), "zoomed in, the grid shows and the note goes");
+    n.view.zoom = 2.0;
+    assert_eq!(note(&n, &mut ng), "", "zooming out again is not switching the grid on");
+    // Switching the grid off removes it too, and so does making the grid coarse enough.
     n.view.grid = false;
     assert_eq!(note(&n, &mut ng), "");
     n.view.grid = true;
-    assert_eq!((n.view.grid_hidden(), note(&n, &mut ng)), (None, String::new()), "drawn at 4x");
-    (n.view.grid_w, n.view.grid_h, n.view.zoom) = (16, 1, 0.25);
-    assert_eq!(note(&n, &mut ng), "The 16x1 grid shows from 400% zoom (it is 25% now)", "the finer side decides");
+    assert_eq!(note(&n, &mut ng), "The 1x1 grid shows from 400% zoom (it is 200% now)");
+    n.view.grid = false;
+    assert_eq!(note(&n, &mut ng), "");
+    n.view.grid = true;
+    assert!(!note(&n, &mut ng).is_empty());
+    (n.view.grid_w, n.view.grid_h) = (2, 2);
+    assert_eq!(note(&n, &mut ng), "", "2x2 shows at 200%");
+    // Another message is never removed or overwritten by it, an error included.
+    (n.view.grid_w, n.view.grid_h) = (1, 1);
+    assert!(!note(&n, &mut ng).is_empty());
+    ng.info("Saved somewhere");
+    n.view.zoom = 8.0;
+    assert_eq!(note(&n, &mut ng), "Saved somewhere");
+    n.view.zoom = 2.0;
+    assert_eq!(note(&n, &mut ng), "Saved somewhere");
+    n.view.grid = false;
+    grid_note(&n, &mut ng);
+    n.view.grid = true;
+    assert!(note(&n, &mut ng).starts_with("The 1x1 grid"));
+    ng.error("The 1x1 grid shows from 400% zoom (it is 200% now)");
+    n.view.zoom = 8.0;
+    assert!(ng.status_err && !note(&n, &mut ng).is_empty(), "an error with the same words is not the note");
+    ng.status.clear();
+    // The finer side decides, and the zoom named is one that shows it.
+    n.view.grid = false;
+    grid_note(&n, &mut ng);
+    (n.view.grid, n.view.grid_w, n.view.grid_h, n.view.zoom) = (true, 16, 1, 0.25);
+    assert_eq!(note(&n, &mut ng), "The 16x1 grid shows from 400% zoom (it is 25% now)");
     (n.view.grid_w, n.view.grid_h) = (16, 16);
     assert_eq!((n.view.grid_zoom(), note(&n, &mut ng)), (0.25, String::new()));
     (n.view.grid_w, n.view.grid_h, n.view.zoom) = (3, 3, 1.0);
     assert_eq!(note(&n, &mut ng), "The 3x3 grid shows from 134% zoom (it is 100% now)");
+    // Another document coming on show takes the note away, and is not itself a change to a grid.
     n.exec("tab_new", &json!({})).unwrap();
     n.view.grid = true;
     n.view.zoom = 1.0;
-    assert_eq!(note(&n, &mut ng), "", "another document coming on show is not a change to its grid");
+    assert_eq!(note(&n, &mut ng), "");
+    assert_eq!(note(&n, &mut ng), "");
     n.view.grid_w = 2;
     assert_eq!(note(&n, &mut ng), "The 2x1 grid shows from 400% zoom (it is 100% now)");
+    n.exec("tab_select", &json!({"id": 1})).unwrap();
+    assert_eq!(note(&n, &mut ng), "");
 
     // A script's change counts as well, and tiles still set the grid to their size.
     assert_eq!(script::run_lua(&mut t, "jm.set_view{grid_w=2, grid_h=2, grid_default=true}").error, None);

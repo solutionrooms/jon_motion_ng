@@ -80,6 +80,8 @@ pub struct Gui {
     /// The document on show and its grid setting when last looked at, so the user is told
     /// once when they switch on (or resize) a grid that is too fine to draw at this zoom.
     pub grid_seen: (u32, bool, u32, u32),
+    /// The too-fine-grid note, while it is what was last put in the status line.
+    pub grid_hint: Option<String>,
     pub last_pos: Option<egui::Pos2>,
     pub zoom_accum: f32,
     pub canvas_rect: egui::Rect,
@@ -146,6 +148,7 @@ impl Gui {
             saved_keymap: None,
             saved_grid: crate::engine::GRID_DEFAULT,
             grid_seen: (0, false, 0, 0),
+            grid_hint: None,
             tex: None,
             tex_key: (0, 0, -1),
             tile_tex: None,
@@ -752,13 +755,24 @@ pub fn write_settings(p: &Path, keymap: Keymap, grid: Option<(u32, u32)>, recent
 
 /// Say so when the grid was just switched on, or resized, and is too fine to be drawn at
 /// this zoom: otherwise nothing on screen changes and it looks as if the grid did not work.
+/// While that note is still what the status line shows it follows the zoom, and it goes
+/// once it stops being true: the grid is drawn, was switched off, or another document is on show.
 pub fn grid_note(e: &Engine, g: &mut Gui) {
     let now = (e.id, e.view.grid, e.view.grid_w, e.view.grid_h);
     let before = std::mem::replace(&mut g.grid_seen, now);
-    // Not on changing tabs: that document's grid was not just touched.
-    if before != now && before.0 == now.0 {
-        if let Some(why) = e.view.grid_hidden() {
-            g.info(why);
+    // Only a status line that still holds the note is touched: a later message stays.
+    let showing = !g.status_err && g.grid_hint.as_ref().is_some_and(|h| *h == g.status);
+    let hidden = e.view.grid_hidden().filter(|_| before.0 == now.0 && (before != now || showing));
+    match hidden {
+        Some(why) => {
+            g.info(why.clone());
+            g.grid_hint = Some(why);
+        }
+        None => {
+            if showing {
+                g.status.clear();
+            }
+            g.grid_hint = None;
         }
     }
 }

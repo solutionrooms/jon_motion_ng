@@ -93,6 +93,12 @@ Help > Keyboard Shortcuts lists the keys. Help > Keyboard Preset switches the si
 standard set and **Deluxe Paint** keys (`d` draw, `v` line, `r`/`R` rectangle, `[` `]` colours, `F1`-`F8` modes...);
 the choice is remembered in `~/.jon_motion/settings.json`.
 
+View > Grid (`Cmd/Ctrl+G`) draws a grid over the image from 4x zoom. It starts at one pixel per cell; set Grid size in
+the View menu for a coarser one (making tiles sets it to the tile size). Each document has its own grid size.
+View > Use as Default Grid Size makes the current size the one new documents start with, remembered in the same
+settings file as `"grid_default": [width, height]`; scripts and AI clients do the same with `set_view grid_default=true`.
+A new animation's frame size starts from the tile size, else the grid size, else 16x16 while the grid is single pixels.
+
 **Tabs** - several documents can be open at once (up to 32), each in its own tab with its own undo history,
 file, selection, view, colours and animations; the tool in hand and the clipboard go with you from tab to tab,
 so you can copy in one and paste in another. File > New, Open, Open Recent and a dropped file each open in a new tab

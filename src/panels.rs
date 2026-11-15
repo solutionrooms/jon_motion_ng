@@ -848,7 +848,7 @@ pub fn animate_selection(e: &mut Engine, g: &mut Gui) {
         None => (0, 0, e.doc.w, e.doc.h),
     };
     // Start from the frame size in use, shrunk if the region is smaller than one frame.
-    let (fw, fh) = e.anim().and_then(|a| a.grid()).map(|a| (a.fw, a.fh)).or(g.anim_size).unwrap_or((e.view.grid_w, e.view.grid_h));
+    let (fw, fh) = e.anim().and_then(|a| a.grid()).map(|a| (a.fw, a.fh)).or(g.anim_size).unwrap_or(e.default_frame());
     let name = crate::commands::fresh_anim_name(&e.doc);
     let p = json!({ "name": name, "x": x, "y": y, "w": w, "h": h, "frame_w": fw.clamp(1, w), "frame_h": fh.clamp(1, h) });
     if let Some(v) = g.run(e, "anim_set", p) {
@@ -872,7 +872,7 @@ pub fn animation(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
     let Some(a) = e.anim().cloned() else {
         ui.label("Plays part of the image as an animation. Select the frames on the canvas and set the size of one frame; they are read left to right, then top to bottom.");
         ui.add_space(4.0);
-        let mut size = g.anim_size.unwrap_or((e.view.grid_w, e.view.grid_h));
+        let mut size = g.anim_size.unwrap_or(e.default_frame());
         ui.horizontal(|ui| {
             ui.label("Frame size");
             let mut changed = ui.add(egui::DragValue::new(&mut size.0).range(1..=MAX_DIM)).changed();

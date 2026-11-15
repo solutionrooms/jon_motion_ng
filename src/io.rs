@@ -1,7 +1,6 @@
 //! Native project files (.jmn) and PNG import/export.
 
 use crate::doc::*;
-use crate::quant;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::io::{Read, Write};
@@ -42,7 +41,14 @@ pub fn save_doc(doc: &Doc, path: &Path) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+#[cfg(test)]
 pub fn load_doc(path: &Path) -> Result<Doc, String> {
+    load_doc_noting(path).map(|(d, _)| d)
+}
+
+/// The project, and whether it is a true-colour one written by 0.1.0-0.1.2. Those used the
+/// indexed file marker; saving one from here writes it under the true-colour marker.
+pub fn load_doc_noting(path: &Path) -> Result<(Doc, bool), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let head = bytes.get(..MAGIC.len());
     let rgba = head == Some(MAGIC_RGBA);
@@ -58,16 +64,17 @@ pub fn load_doc(path: &Path) -> Result<Doc, String> {
     // The document re-serialises to exactly the bytes it was read from, which locates the chunks after it.
     let used = bincode::serialized_size(&d).map_err(|e| e.to_string())? as usize;
     read_chunks(&mut d, raw.get(used..).unwrap_or(&[]));
+    let opacity: Vec<u8> = d.layers.iter().map(|l| l.opacity).collect();
     validate(&mut d)?;
     if rgba != d.rgba() && rgba {
         return Err("corrupt project file: a true-colour file holding an indexed document".into());
     }
-    if !rgba && d.rgba() {
-        // A true-colour project from 0.1.0-0.1.2, which is opened as an indexed document.
-        to_indexed(&mut d);
+    let legacy = !rgba && d.rgba();
+    if legacy {
+        legacy_opacity(&mut d, &opacity);
     }
     tidy_cells(&mut d);
-    Ok(d)
+    Ok((d, legacy))
 }
 
 /// Data added after 0.1.3 follows the document as tagged chunks: a four-byte tag, a
@@ -286,24 +293,22 @@ pub fn anims_from_json(v: &Value, w: u32, h: u32) -> Result<Vec<Result<Anim, Str
         .collect())
 }
 
-/// Convert a true-colour project written by 0.1.x: its cells are packed RGBA
-/// (little-endian r, g, b, a). It gets a generated palette of up to 256 colours.
-fn to_indexed(d: &mut Doc) {
-    let px = |cells: &[Cell]| -> Vec<[u8; 4]> { cells.iter().map(|c| c.to_le_bytes()).collect() };
-    let layers: Vec<Vec<[u8; 4]>> = d.layers.iter().map(|l| px(&l.data)).collect();
-    let tiles: Vec<Vec<[u8; 4]>> = d.tileset.iter().flat_map(|t| t.tiles.iter()).map(|t| px(t)).collect();
-    d.palette = quant::palette_for(layers.iter().chain(&tiles).flatten(), 256);
-    let (w, h) = (d.w as usize, d.h as usize);
-    for (l, p) in d.layers.iter_mut().zip(&layers) {
-        l.data = Arc::new(quant::to_indexed(p, w, h, &d.palette, quant::Dither::None));
-    }
-    if let Some(ts) = &mut d.tileset {
-        let (tw, th) = (ts.tw as usize, ts.th as usize);
-        for (t, p) in ts.tiles.iter_mut().zip(&tiles) {
-            *t = Arc::new(quant::to_indexed(p, tw, th, &d.palette, quant::Dither::None));
+/// A true-colour project written by 0.1.0-0.1.2 holds the same packed colours (with alpha 0
+/// for a transparent pixel, which `tidy_cells` turns into `TRANSP`), but its layers could be
+/// part transparent as a whole. Layers are always opaque now, so that opacity goes into each
+/// pixel's alpha, the way those versions applied it when they drew the layer: the picture
+/// looks the same. A tile-mapped layer shows its tiles, which other layers may share, so it
+/// is left alone and becomes fully opaque.
+fn legacy_opacity(d: &mut Doc, opacity: &[u8]) {
+    for (l, &o) in d.layers.iter_mut().zip(opacity) {
+        if o == 255 || l.map.is_some() {
+            continue;
+        }
+        for c in Arc::make_mut(&mut l.data).iter_mut() {
+            let [r, g, b, a] = c.to_le_bytes();
+            *c = u32::from_le_bytes([r, g, b, (a as u32 * o as u32 / 255) as u8]);
         }
     }
-    d.mode = ColorMode::Indexed;
 }
 
 /// Make every pixel a value its kind of document can hold: an index or `TRANSP` in an

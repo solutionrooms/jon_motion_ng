@@ -739,7 +739,8 @@ fn document_cmds(b: &mut B) {
         Edit,
         "path:str A .jmn project or a .png image; mode:str? For a PNG: indexed (default) or truecolor; force:bool? Discard unsaved changes",
         "Open a project file, or a PNG as a new document. An indexed PNG keeps its palette; a true-colour PNG is converted to a generated palette of up to 256 colours \
-         unless mode=truecolor, which opens any PNG as a true-colour document with every pixel exactly as it is. A project opens as the kind of document it was saved as. Clears undo history.",
+         unless mode=truecolor, which opens any PNG as a true-colour document with every pixel exactly as it is. A project opens as the kind of document it was saved as \
+         (legacy_truecolor is true for a true-colour project from 0.1.0-0.1.2: saving it writes a file those versions and 0.1.3-0.1.4 cannot open). Clears undo history.",
         |e, a| {
             check_discard(e, a)?;
             let p = PathBuf::from(a.s("path")?);
@@ -757,9 +758,15 @@ fn document_cmds(b: &mut B) {
                     return Err("'mode' is for PNG files; a project opens as the kind of document it was saved as (convert_mode changes it afterwards)".into());
                 }
                 e.path_free(&p)?;
-                install_doc(e, io::load_doc(&p)?, Some(p), false);
+                let (d, legacy) = io::load_doc_noting(&p)?;
+                install_doc(e, d, Some(p), false);
+                let mut v = info(e);
+                if legacy {
+                    // Saving it writes the true-colour form, which the version that made it cannot open.
+                    v["legacy_truecolor"] = json!(true);
+                }
+                return Ok(v);
             }
-            Ok(info(e))
         },
     );
     b.add(
@@ -2433,14 +2440,14 @@ fn tab_cmds(b: &mut B) {
             }
             if a.b("reuse_blank")? && e.pristine() {
                 let v = e.exec("open_document", &open)?;
-                return Ok(json!({"id": e.id, "reused": true, "converted_to_indexed": v["converted_to_indexed"] == true}));
+                return Ok(json!({"id": e.id, "reused": true, "converted_to_indexed": v["converted_to_indexed"] == true, "legacy_truecolor": v["legacy_truecolor"] == true}));
             }
             if e.order.len() >= MAX_TABS {
                 return Err(format!("{MAX_TABS} documents are open, which is the limit; close one first"));
             }
             let mut t = Engine::new(e.host);
             let v = t.exec("open_document", &open)?;
-            Ok(json!({"id": e.tab_add(t)?, "converted_to_indexed": v["converted_to_indexed"] == true}))
+            Ok(json!({"id": e.tab_add(t)?, "converted_to_indexed": v["converted_to_indexed"] == true, "legacy_truecolor": v["legacy_truecolor"] == true}))
         },
     );
     b.add("tabs", "tab_select", Tab, "id:int The document's id (see tab_list)", "Make another open document the active one. Its own undo history, selection, view and colours come with it.", |e, a| {

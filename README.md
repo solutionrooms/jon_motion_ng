@@ -82,7 +82,12 @@ writes `dist/*.zip`, cross-compiling Windows with `rustup target add x86_64-pc-w
   colours, palette usage. Image > Convert to Indexed... turns it into a palette image (part-transparent pixels become
   opaque or transparent); both conversions are one undo step, and nothing else ever changes a document's kind.
   True-colour projects are saved in a form that versions 0.1.4 and older refuse to open, rather than opening them
-  wrongly; indexed projects are written exactly as before. Layers have no opacity setting in either kind.
+  wrongly; indexed projects are written exactly as before. That is why Image > Convert to True Colour... asks first:
+  the next Save rewrites the project file in that form. A true-colour project made by 0.1.0-0.1.2 opens as true
+  colour with its pixels as they were (the status line says so, and `open_document` answers `legacy_truecolor`);
+  saving it also writes the new form, so use Save As to keep the original for the old version. Layers have no
+  opacity setting in either kind: where such an old project had a part-transparent layer, that opacity goes into the
+  layer's pixels so the picture looks the same (a tile-mapped layer becomes fully opaque instead).
 
 Help > Keyboard Shortcuts lists the keys. Help > Keyboard Preset switches the single-key shortcuts between the
 standard set and **Deluxe Paint** keys (`d` draw, `v` line, `r`/`R` rectangle, `[` `]` colours, `F1`-`F8` modes...);

@@ -236,12 +236,15 @@ fn everything_is_indexed() {
     e.exec("export_png", &json!({"path": tmp("full.png")})).unwrap();
     assert!(is_indexed(&tmp("full.png")));
 
-    // A true-colour project written by 0.1.x is converted when it is opened, and
-    // layer opacity (also gone) is reset.
+    // A true-colour project written by 0.1.0-0.1.2 opens as true colour with its pixels as
+    // they were. Layer opacity (gone) goes into the pixels, so the picture looks the same.
     let mut d = Doc::new(4, 4, Palette::preset("pico8").unwrap());
     d.mode = ColorMode::Rgba;
     d.layers[0].opacity = 100;
     d.layers[0].data = std::sync::Arc::new((0..16u32).map(|i| if i == 0 { 0 } else { u32::from_le_bytes([200, (i * 10) as u8, 30, 255]) }).collect());
+    let solid = d.new_layer("solid");
+    d.layers.push(solid);
+    d.layers[1].data = std::sync::Arc::new((0..16u32).map(|i| if i < 8 { 5 } else { u32::from_le_bytes([1, 2, 3, 77]) }).collect());
     let old = tmp("old_rgba.jmn");
     io::save_doc(&d, std::path::Path::new(&old)).unwrap();
     // 0.1.0-0.1.2 wrote true colour under the same file marker as indexed documents.
@@ -249,11 +252,29 @@ fn everything_is_indexed() {
     assert_eq!(bytes[4], 2);
     bytes[4] = 1;
     std::fs::write(&old, bytes).unwrap();
-    e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
-    assert_eq!((e.doc.mode, e.doc.layers[0].opacity), (ColorMode::Indexed, 255));
+    let v = e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    assert_eq!((v["mode"].as_str(), v["legacy_truecolor"].as_bool()), (Some("truecolor"), Some(true)));
+    assert_eq!((e.doc.mode, e.doc.layers[0].opacity), (ColorMode::Rgba, 255));
+    assert_eq!(e.doc.palette, Palette::preset("pico8").unwrap(), "the swatches are kept");
     assert_eq!(e.doc.layers[0].data[0], TRANSP);
-    assert_eq!(e.doc.to_rgba(e.doc.layers[0].data[5]), [200, 50, 30, 255]);
-    assert_eq!(e.exec("get_info", &json!({})).unwrap()["mode"], "indexed");
+    assert_eq!(unpack(e.doc.layers[0].data[5]), [200, 50, 30, 100], "alpha 255 at layer opacity 100");
+    // A layer that was fully opaque is untouched, apart from alpha 0 becoming the one transparent value.
+    assert_eq!((e.doc.layers[1].data[0], unpack(e.doc.layers[1].data[8])), (TRANSP, [1, 2, 3, 77]));
+    // Saved from here it is an ordinary true-colour project, which opens the same and is no longer "legacy".
+    let before = e.doc.clone();
+    e.exec("save_document", &json!({})).unwrap();
+    assert_eq!(std::fs::read(&old).unwrap()[4], 2);
+    let v = e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    assert!(v.get("legacy_truecolor").is_none() && e.doc.layers == before.layers);
+    // An old indexed project is not affected: no flag, and its layer opacity is simply dropped.
+    let mut d = Doc::new(4, 4, Palette::preset("pico8").unwrap());
+    d.layers[0].opacity = 100;
+    d.layers[0].data = std::sync::Arc::new(vec![3; 16]);
+    let old = tmp("old_indexed.jmn");
+    io::save_doc(&d, std::path::Path::new(&old)).unwrap();
+    let v = e.exec("open_document", &json!({"path": old, "force": true})).unwrap();
+    assert!(v.get("legacy_truecolor").is_none());
+    assert_eq!((e.doc.mode, e.doc.layers[0].opacity, e.doc.layers[0].data[0]), (ColorMode::Indexed, 255, 3));
 }
 
 #[test]

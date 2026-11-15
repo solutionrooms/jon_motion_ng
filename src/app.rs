@@ -39,6 +39,8 @@ pub enum Dialog {
     Mcp,
     /// A PNG was dropped on the window: open it, or add it as a layer?
     Dropped(PathBuf),
+    /// Convert this indexed document to true colour? Asked first, because of what Save then writes.
+    ToTrue,
 }
 
 pub enum Pending {
@@ -326,7 +328,12 @@ impl App {
                 open_atlas(&mut gui, &f);
             } else {
                 match engine.exec("open_document", &json!({ "path": f.display().to_string() })) {
-                    Ok(_) => gui.remember(&f),
+                    Ok(v) => {
+                        if v["legacy_truecolor"] == true {
+                            gui.info(legacy_note(&f));
+                        }
+                        gui.remember(&f);
+                    }
                     Err(e) => gui.error(e),
                 }
             }
@@ -416,12 +423,21 @@ fn open(e: &mut Engine, g: &mut Gui) {
     }
 }
 
+/// What is said when a true-colour project from 0.1.0-0.1.2 is opened: Save changes its form.
+fn legacy_note(p: &Path) -> String {
+    // Short, with the file's name only, so it fits the status bar.
+    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    format!("Opened {name}, an older true-colour project: Save rewrites it so 0.1.4 and older cannot open it (Save As keeps the original)")
+}
+
 /// Open a file the user chose, in a new tab (or in place of an untouched blank document). A
 /// project that is already open is shown instead of being loaded a second time.
 fn open_path(e: &mut Engine, g: &mut Gui, p: &Path) {
     if let Some(v) = g.run(e, "tab_open", json!({ "path": p.display().to_string(), "reuse_blank": true })) {
         g.info(if v["already_open"] == true {
             format!("{} is already open", p.display())
+        } else if v["legacy_truecolor"] == true {
+            legacy_note(p)
         } else if v["converted_to_indexed"] == true {
             format!("Opened {} as a {}-colour palette image (File > Open as True Colour keeps every colour)", p.display(), e.doc.palette.colors.len())
         } else {
@@ -1108,8 +1124,8 @@ fn menu_bar(ui: &mut egui::Ui, e: &mut Engine, g: &mut Gui) {
                 if item(ui, "Reduce Colours...", "") {
                     g.dialog = Dialog::Reduce { colors: e.doc.palette.colors.len().min(256) as u32, dither: 0, generate: true };
                 }
-                if item(ui, "Convert to True Colour", "") && g.run(e, "convert_mode", json!({ "mode": "truecolor" })).is_some() {
-                    g.info("This document is now true colour: pixels are colours and the palette is a set of swatches (Edit > Undo goes back)");
+                if item(ui, "Convert to True Colour...", "") {
+                    g.dialog = Dialog::ToTrue;
                 }
             }
             ui.separator();
@@ -1383,6 +1399,26 @@ pub fn dialogs(ctx: &egui::Context, e: &mut Engine, g: &mut Gui) {
                 }
                 close |= choice.is_some();
             });
+        }),
+        Dialog::ToTrue => window(ctx, "Convert to True Colour", |ui| {
+            ui.label("Convert this document to true colour?");
+            ui.weak("Every pixel becomes its own colour and the palette becomes a set of swatches. Edit > Undo goes back.");
+            ui.add_space(4.0);
+            ui.label(match &e.path {
+                Some(p) => format!(
+                    "Saving afterwards rewrites \"{}\" as a true-colour project, which Jon Motion 0.1.4 and older cannot open.",
+                    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                ),
+                None => "A true-colour project is saved in a form that Jon Motion 0.1.4 and older cannot open.".to_string(),
+            });
+            let (ok, cancel) = buttons(ui, "Convert");
+            if ok {
+                if g.run(e, "convert_mode", json!({ "mode": "truecolor" })).is_some() {
+                    g.info("This document is now true colour (Edit > Undo goes back)");
+                }
+                close = true;
+            }
+            close |= cancel;
         }),
         Dialog::Scale { w, h } => window(ctx, "Scale Image", |ui| {
             size_fields(ui, w, h);
@@ -1680,7 +1716,7 @@ impl eframe::App for App {
                 g.quit_skip.clear();
                 g.status = "The document on show changed, so the question was cancelled".into();
             }
-            if matches!(g.dialog, Dialog::Resize { .. } | Dialog::Scale { .. } | Dialog::Reduce { .. } | Dialog::Dropped(_)) {
+            if matches!(g.dialog, Dialog::Resize { .. } | Dialog::Scale { .. } | Dialog::Reduce { .. } | Dialog::Dropped(_) | Dialog::ToTrue) {
                 g.dialog = Dialog::None;
                 g.status = "The document on show changed, so the dialog was closed".into();
             }
